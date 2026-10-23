@@ -1,0 +1,812 @@
+! Copyright (c) 2013,  Los Alamos National Security, LLC (LANS)
+! and the University Corporation for Atmospheric Research (UCAR).
+!
+! Unless noted otherwise source code is licensed under the BSD license.
+! Additional copyright and license information can be found in the LICENSE file
+! distributed with this code, or at http://mpas-dev.github.com/license.html
+!
+! Hierarchical time stepping for the MPAS-Atmosphere split-explicit integrator.
+! See docs/hts/DESIGN.md. config_hts = false does not touch the prognostic state.
+
+module mpas_atm_hts
+
+   use mpas_kind_types
+   use mpas_derived_types
+   use mpas_pool_routines
+   use mpas_dmpar
+   use mpas_log
+   use mpas_constants
+
+   implicit none
+
+   public :: atm_hts_setup, atm_hts_finalize
+   public :: atm_hts_begin_intervals, atm_hts_apply_interpolation, atm_hts_restore_above
+   public :: atm_hts_sync_finer, atm_hts_accumulate_flux, atm_hts_prepare_targets
+   public :: atm_hts_clear_consumed, atm_hts_correct_mass
+
+   logical, public :: hts_enabled = .false.
+   logical, public :: hts_masking = .false.
+   logical, public :: hts_impose = .false.
+   integer, public :: hts_active_level = 0
+   integer, public :: hts_tick = 0
+   integer, public :: hts_max_level_used = 0
+
+   integer, public, allocatable :: hts_cell_level(:)
+   integer, public, allocatable :: hts_edge_level(:)
+   logical, public, allocatable :: hts_edge_interface(:)
+   logical, public, allocatable :: hts_impose_edge(:)
+   real (kind=RKIND), public, allocatable :: hts_ru_target(:,:)
+
+   integer, parameter :: hts_level_cap = 8
+
+   real (kind=R8KIND), allocatable :: hts_flux_sum(:,:)
+
+   real (kind=RKIND), allocatable :: snap_rho(:,:,:), delta_rho(:,:,:)
+   real (kind=RKIND), allocatable :: snap_theta(:,:,:), delta_theta(:,:,:)
+   real (kind=RKIND), allocatable :: snap_w(:,:,:), delta_w(:,:,:)
+   real (kind=RKIND), allocatable :: snap_rw(:,:,:), delta_rw(:,:,:)
+   real (kind=RKIND), allocatable :: snap_u(:,:,:), delta_u(:,:,:)
+
+   logical, allocatable :: hts_level_started(:)
+   integer :: hts_nCells, hts_nEdges, hts_nVert
+   integer :: hts_correct_logs
+   real (kind=RKIND) :: hts_max_flux_resid
+
+   contains
+
+
+   subroutine atm_hts_setup(domain)
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+
+      type (block_type), pointer :: block
+      type (mpas_pool_type), pointer :: mesh
+      logical, pointer :: config_hts
+      integer, pointer :: config_hts_max_level
+      integer, pointer :: nCells, nCellsSolve, nEdges, nEdgesSolve, nVertLevels
+      integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      real (kind=RKIND), dimension(:), pointer :: meshDensity
+      integer :: iCell, iEdge, iNbr, cell1, cell2, L, nbr
+      integer :: nBlocks
+      integer, dimension(0:hts_level_cap) :: localCount, globalCount
+      integer :: localIface, globalIface, globalOwned
+      real (kind=RKIND) :: mdMin, mdMax, mdMinG, mdMaxG, spacing, logtwo
+      logical :: uniform
+
+      hts_enabled = .false.
+      hts_masking = .false.
+      hts_impose = .false.
+      hts_active_level = 0
+      hts_tick = 0
+      hts_max_level_used = 0
+      hts_correct_logs = 0
+      hts_max_flux_resid = 0.0_RKIND
+
+      block => domain % blocklist
+      nBlocks = 0
+      do while (associated(block))
+         nBlocks = nBlocks + 1
+         block => block % next
+      end do
+      block => domain % blocklist
+      if (nBlocks /= 1) then
+         call mpas_log_write('HTS expects one block per MPI task; found $i.', &
+                             intArgs=(/nBlocks/), messageType=MPAS_LOG_WARN)
+      end if
+
+      call mpas_pool_get_config(block % configs, 'config_hts', config_hts)
+      call mpas_pool_get_config(block % configs, 'config_hts_max_level', config_hts_max_level)
+      hts_enabled = config_hts
+
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nEdges', nEdges)
+      call mpas_pool_get_dimension(mesh, 'nEdgesSolve', nEdgesSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'meshDensity', meshDensity)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+
+      hts_nCells = nCells
+      hts_nEdges = nEdges
+      hts_nVert = nVertLevels
+
+      if (allocated(hts_cell_level)) deallocate(hts_cell_level)
+      if (allocated(hts_edge_level)) deallocate(hts_edge_level)
+      if (allocated(hts_edge_interface)) deallocate(hts_edge_interface)
+      if (allocated(hts_impose_edge)) deallocate(hts_impose_edge)
+      if (allocated(hts_ru_target)) deallocate(hts_ru_target)
+      if (allocated(hts_flux_sum)) deallocate(hts_flux_sum)
+
+      allocate(hts_cell_level(nCells+1))
+      allocate(hts_edge_level(nEdges+1))
+      allocate(hts_edge_interface(nEdges+1))
+      allocate(hts_impose_edge(nEdges+1))
+      hts_cell_level(:) = 0
+      hts_edge_level(:) = 0
+      hts_edge_interface(:) = .false.
+      hts_impose_edge(:) = .false.
+
+      mdMin = meshDensity(1)
+      mdMax = meshDensity(1)
+      do iCell = 1, nCellsSolve
+         mdMin = min(mdMin, meshDensity(iCell))
+         mdMax = max(mdMax, meshDensity(iCell))
+      end do
+      call mpas_dmpar_min_real(domain % dminfo, mdMin, mdMinG)
+      call mpas_dmpar_max_real(domain % dminfo, mdMax, mdMaxG)
+      mdMin = mdMinG
+      mdMax = mdMaxG
+      uniform = (mdMin <= 0.0_RKIND) .or. (mdMax <= mdMin * (1.0_RKIND + 1.0e-5_RKIND))
+
+      logtwo = log(2.0_RKIND)
+      L = config_hts_max_level
+      if (L < 0) L = 0
+      if (L > hts_level_cap) L = hts_level_cap
+
+      do iCell = 1, nCells
+         if (uniform .or. meshDensity(iCell) <= 0.0_RKIND) then
+            hts_cell_level(iCell) = 0
+         else
+            spacing = meshDensity(iCell) ** (-0.25_RKIND)
+            if (spacing < 1.0_RKIND) spacing = 1.0_RKIND
+            hts_cell_level(iCell) = nint(log(spacing) / logtwo)
+            if (hts_cell_level(iCell) < 0) hts_cell_level(iCell) = 0
+            if (hts_cell_level(iCell) > L) hts_cell_level(iCell) = L
+         end if
+      end do
+      hts_cell_level(nCells+1) = 0
+
+      ! A cell that touches a finer neighbor is pulled down to that neighbor's
+      ! level only at the edge. Cell levels stay as binned. Edges take the finer cell.
+      do iEdge = 1, nEdges
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         if (cell1 < 1 .or. cell1 > nCells) cell1 = nCells + 1
+         if (cell2 < 1 .or. cell2 > nCells) cell2 = nCells + 1
+         hts_edge_level(iEdge) = min(hts_cell_level(cell1), hts_cell_level(cell2))
+         hts_edge_interface(iEdge) = hts_cell_level(cell1) /= hts_cell_level(cell2)
+      end do
+
+      localCount(:) = 0
+      do iCell = 1, nCellsSolve
+         localCount(hts_cell_level(iCell)) = localCount(hts_cell_level(iCell)) + 1
+      end do
+      do L = 0, hts_level_cap
+         call mpas_dmpar_sum_int(domain % dminfo, localCount(L), globalCount(L))
+      end do
+      localIface = 0
+      do iEdge = 1, nEdgesSolve
+         if (hts_edge_interface(iEdge)) localIface = localIface + 1
+      end do
+      call mpas_dmpar_sum_int(domain % dminfo, localIface, globalIface)
+      call mpas_dmpar_sum_int(domain % dminfo, nCellsSolve, globalOwned)
+
+      hts_max_level_used = 0
+      do L = 0, hts_level_cap
+         if (globalCount(L) > 0) hts_max_level_used = L
+      end do
+
+      call mpas_log_write('')
+      call mpas_log_write('--- hierarchical time stepping ---')
+      if (hts_enabled) then
+         call mpas_log_write(' config_hts = true, config_hts_max_level = $i', intArgs=(/config_hts_max_level/))
+      else
+         call mpas_log_write(' config_hts = false (integrator is unchanged)')
+      end if
+      call mpas_log_write(' owned cells = $i', intArgs=(/globalOwned/))
+      do L = 0, hts_max_level_used
+         call mpas_log_write(' level $i cells = $i', intArgs=(/L, globalCount(L)/))
+      end do
+      call mpas_log_write(' interface edges = $i', intArgs=(/globalIface/))
+      if (uniform) then
+         call mpas_log_write(' meshDensity does not vary; every cell is level 0')
+      end if
+      call mpas_log_write('----------------------------------')
+
+      if (.not. hts_enabled) return
+
+#ifdef MPAS_OPENACC
+      call mpas_log_write('config_hts is not supported in an OpenACC build.', messageType=MPAS_LOG_CRIT)
+#endif
+
+      if (hts_max_level_used == 0) then
+         call mpas_log_write('HTS enabled with a single level; masked integrator, no subcycling')
+         return
+      end if
+
+      allocate(hts_ru_target(nVertLevels, nEdges+1))
+      allocate(hts_flux_sum(nVertLevels, nEdges+1))
+      hts_ru_target(:, :) = 0.0_RKIND
+      hts_flux_sum(:, :) = 0.0_R8KIND
+
+      allocate(snap_rho(nVertLevels, nCells+1, hts_max_level_used))
+      allocate(delta_rho(nVertLevels, nCells+1, hts_max_level_used))
+      allocate(snap_theta(nVertLevels, nCells+1, hts_max_level_used))
+      allocate(delta_theta(nVertLevels, nCells+1, hts_max_level_used))
+      allocate(snap_w(nVertLevels+1, nCells+1, hts_max_level_used))
+      allocate(delta_w(nVertLevels+1, nCells+1, hts_max_level_used))
+      allocate(snap_rw(nVertLevels+1, nCells+1, hts_max_level_used))
+      allocate(delta_rw(nVertLevels+1, nCells+1, hts_max_level_used))
+      allocate(snap_u(nVertLevels, nEdges+1, hts_max_level_used))
+      allocate(delta_u(nVertLevels, nEdges+1, hts_max_level_used))
+      allocate(hts_level_started(hts_max_level_used))
+      snap_rho = 0.0_RKIND
+      delta_rho = 0.0_RKIND
+      snap_theta = 0.0_RKIND
+      delta_theta = 0.0_RKIND
+      snap_w = 0.0_RKIND
+      delta_w = 0.0_RKIND
+      snap_rw = 0.0_RKIND
+      delta_rw = 0.0_RKIND
+      snap_u = 0.0_RKIND
+      delta_u = 0.0_RKIND
+      hts_level_started(:) = .false.
+
+      ! Silence unused-variable warnings on builds that do not walk neighbors here.
+      iNbr = nEdgesOnCell(1)
+      nbr = cellsOnCell(1, 1)
+      if (iNbr < 0 .or. nbr < 0) call mpas_log_write('HTS neighbor tables are empty', messageType=MPAS_LOG_WARN)
+
+   end subroutine atm_hts_setup
+
+
+   subroutine atm_hts_finalize(domain)
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+
+      ! domain is unused; arrays are process-local
+      if (associated(domain % blocklist)) then
+         continue
+      end if
+
+      if (allocated(hts_cell_level)) deallocate(hts_cell_level)
+      if (allocated(hts_edge_level)) deallocate(hts_edge_level)
+      if (allocated(hts_edge_interface)) deallocate(hts_edge_interface)
+      if (allocated(hts_impose_edge)) deallocate(hts_impose_edge)
+      if (allocated(hts_ru_target)) deallocate(hts_ru_target)
+      if (allocated(hts_flux_sum)) deallocate(hts_flux_sum)
+      if (allocated(snap_rho)) deallocate(snap_rho)
+      if (allocated(delta_rho)) deallocate(delta_rho)
+      if (allocated(snap_theta)) deallocate(snap_theta)
+      if (allocated(delta_theta)) deallocate(delta_theta)
+      if (allocated(snap_w)) deallocate(snap_w)
+      if (allocated(delta_w)) deallocate(delta_w)
+      if (allocated(snap_rw)) deallocate(snap_rw)
+      if (allocated(delta_rw)) deallocate(delta_rw)
+      if (allocated(snap_u)) deallocate(snap_u)
+      if (allocated(delta_u)) deallocate(delta_u)
+      if (allocated(hts_level_started)) deallocate(hts_level_started)
+
+   end subroutine atm_hts_finalize
+
+
+   subroutine hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
+                               rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
+                               pressure_p, exner, exner_base, rtheta_base, rho_base, zz, &
+                               ru, ru_save, rw, rw_save, rho_edge)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
+
+      type (mpas_pool_type), pointer :: state, diag, mesh
+
+      nullify(state, diag, mesh)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+
+      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(state, 'theta_m', th1, 1)
+      call mpas_pool_get_array(state, 'theta_m', th2, 2)
+      call mpas_pool_get_array(state, 'w', w1, 1)
+      call mpas_pool_get_array(state, 'w', w2, 2)
+      call mpas_pool_get_array(state, 'u', u1, 1)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+
+      call mpas_pool_get_array(diag, 'rho_p', rho_p)
+      call mpas_pool_get_array(diag, 'rho_p_save', rho_p_save)
+      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
+      call mpas_pool_get_array(diag, 'rtheta_p_save', rtheta_p_save)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'exner_base', exner_base)
+      call mpas_pool_get_array(diag, 'rtheta_base', rtheta_base)
+      call mpas_pool_get_array(diag, 'rho_base', rho_base)
+      call mpas_pool_get_array(diag, 'ru', ru)
+      call mpas_pool_get_array(diag, 'ru_save', ru_save)
+      call mpas_pool_get_array(diag, 'rw', rw)
+      call mpas_pool_get_array(diag, 'rw_save', rw_save)
+      call mpas_pool_get_array(diag, 'rho_edge', rho_edge)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+
+   end subroutine hts_fetch_fields
+
+
+   subroutine hts_diagnostics_from_state(k, iCell, rho_zz, theta_m, rho_base, rtheta_base, zz, &
+                                         exner_base, rho_p, rtheta_p, exner, pressure_p)
+
+      implicit none
+
+      integer, intent(in) :: k, iCell
+      real (kind=RKIND), intent(in) :: rho_zz, theta_m, rho_base, rtheta_base, zz, exner_base
+      real (kind=RKIND), intent(out) :: rho_p, rtheta_p, exner, pressure_p
+      real (kind=RKIND) :: rcv, p0, rtheta_tot
+
+      rcv = rgas / (cp - rgas)
+      p0 = 1.0e5_RKIND
+      rho_p = rho_zz - rho_base
+      rtheta_tot = theta_m * rho_zz
+      rtheta_p = rtheta_tot - rtheta_base
+      exner = (zz * (rgas / p0) * rtheta_tot) ** rcv
+      pressure_p = zz * rgas * (exner * rtheta_p + rtheta_base * (exner - exner_base))
+
+      ! iCell is part of the signature so callers can pass the column index
+      ! without a dummy local. The column is horizontally local.
+      if (iCell < 0) pressure_p = pressure_p
+
+   end subroutine hts_diagnostics_from_state
+
+
+   subroutine atm_hts_begin_intervals(block)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
+      integer :: L, iCell, iEdge, k, ratio
+
+      if (hts_max_level_used < 1) return
+
+      call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
+                            rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
+                            pressure_p, exner, exner_base, rtheta_base, rho_base, zz, &
+                            ru, ru_save, rw, rw_save, rho_edge)
+
+      do L = 1, hts_max_level_used
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) /= 0) cycle
+
+         if (.not. hts_level_started(L)) then
+            do iCell = 1, hts_nCells
+               if (hts_cell_level(iCell) /= L) cycle
+               do k = 1, hts_nVert
+                  snap_rho(k, iCell, L) = rho1(k, iCell)
+                  snap_theta(k, iCell, L) = th1(k, iCell)
+                  delta_rho(k, iCell, L) = 0.0_RKIND
+                  delta_theta(k, iCell, L) = 0.0_RKIND
+               end do
+               do k = 1, hts_nVert + 1
+                  snap_w(k, iCell, L) = w1(k, iCell)
+                  snap_rw(k, iCell, L) = rw(k, iCell)
+                  delta_w(k, iCell, L) = 0.0_RKIND
+                  delta_rw(k, iCell, L) = 0.0_RKIND
+               end do
+            end do
+            do iEdge = 1, hts_nEdges
+               if (hts_edge_level(iEdge) /= L) cycle
+               do k = 1, hts_nVert
+                  snap_u(k, iEdge, L) = u1(k, iEdge)
+                  delta_u(k, iEdge, L) = 0.0_RKIND
+               end do
+            end do
+            hts_level_started(L) = .true.
+         else
+            do iCell = 1, hts_nCells
+               if (hts_cell_level(iCell) /= L) cycle
+               do k = 1, hts_nVert
+                  delta_rho(k, iCell, L) = rho1(k, iCell) - snap_rho(k, iCell, L)
+                  delta_theta(k, iCell, L) = th1(k, iCell) - snap_theta(k, iCell, L)
+                  snap_rho(k, iCell, L) = rho1(k, iCell)
+                  snap_theta(k, iCell, L) = th1(k, iCell)
+               end do
+               do k = 1, hts_nVert + 1
+                  delta_w(k, iCell, L) = w1(k, iCell) - snap_w(k, iCell, L)
+                  delta_rw(k, iCell, L) = rw(k, iCell) - snap_rw(k, iCell, L)
+                  snap_w(k, iCell, L) = w1(k, iCell)
+                  snap_rw(k, iCell, L) = rw(k, iCell)
+               end do
+            end do
+            do iEdge = 1, hts_nEdges
+               if (hts_edge_level(iEdge) /= L) cycle
+               do k = 1, hts_nVert
+                  delta_u(k, iEdge, L) = u1(k, iEdge) - snap_u(k, iEdge, L)
+                  snap_u(k, iEdge, L) = u1(k, iEdge)
+               end do
+            end do
+         end if
+      end do
+
+   end subroutine atm_hts_begin_intervals
+
+
+   subroutine atm_hts_apply_interpolation(block, activeLevel)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: activeLevel
+
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      type (mpas_pool_type), pointer :: mesh
+      integer :: L, iCell, iEdge, k, cell1, cell2, ratio
+      real (kind=RKIND) :: alpha, rho_here, th_here, u_here
+
+      if (hts_max_level_used <= activeLevel) return
+
+      call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
+                            rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
+                            pressure_p, exner, exner_base, rtheta_base, rho_base, zz, &
+                            ru, ru_save, rw, rw_save, rho_edge)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+
+      do L = activeLevel + 1, hts_max_level_used
+         ratio = ishft(1, L)
+         ! Midpoint of the fine step that is about to run, as a fraction of this level's step.
+         alpha = (real(mod(hts_tick, ratio), RKIND) + 0.5_RKIND) / real(ratio, RKIND)
+         do iCell = 1, hts_nCells
+            if (hts_cell_level(iCell) /= L) cycle
+            do k = 1, hts_nVert
+               rho_here = snap_rho(k, iCell, L) + alpha * delta_rho(k, iCell, L)
+               th_here = snap_theta(k, iCell, L) + alpha * delta_theta(k, iCell, L)
+               rho1(k, iCell) = rho_here
+               rho2(k, iCell) = rho_here
+               th1(k, iCell) = th_here
+               th2(k, iCell) = th_here
+               call hts_diagnostics_from_state(k, iCell, rho_here, th_here, rho_base(k, iCell), &
+                    rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                    rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+               rho_p_save(k, iCell) = rho_p(k, iCell)
+               rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+            end do
+            do k = 1, hts_nVert + 1
+               w1(k, iCell) = snap_w(k, iCell, L) + alpha * delta_w(k, iCell, L)
+               w2(k, iCell) = w1(k, iCell)
+               rw(k, iCell) = snap_rw(k, iCell, L) + alpha * delta_rw(k, iCell, L)
+               rw_save(k, iCell) = rw(k, iCell)
+            end do
+         end do
+      end do
+      do iEdge = 1, hts_nEdges
+         L = hts_edge_level(iEdge)
+         if (L <= activeLevel .or. L > hts_max_level_used) cycle
+         ratio = ishft(1, L)
+         alpha = (real(mod(hts_tick, ratio), RKIND) + 0.5_RKIND) / real(ratio, RKIND)
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         do k = 1, hts_nVert
+            u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+            u1(k, iEdge) = u_here
+            u2(k, iEdge) = u_here
+            ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
+            ru_save(k, iEdge) = ru(k, iEdge)
+            rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+         end do
+      end do
+
+   end subroutine atm_hts_apply_interpolation
+
+
+   subroutine atm_hts_restore_above(block, activeLevel)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: activeLevel
+
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      type (mpas_pool_type), pointer :: mesh
+      integer :: L, iCell, iEdge, k, cell1, cell2
+
+      if (hts_max_level_used <= activeLevel) return
+
+      call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
+                            rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
+                            pressure_p, exner, exner_base, rtheta_base, rho_base, zz, &
+                            ru, ru_save, rw, rw_save, rho_edge)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+
+      do L = activeLevel + 1, hts_max_level_used
+         do iCell = 1, hts_nCells
+            if (hts_cell_level(iCell) /= L) cycle
+            do k = 1, hts_nVert
+               rho1(k, iCell) = snap_rho(k, iCell, L)
+               rho2(k, iCell) = snap_rho(k, iCell, L)
+               th1(k, iCell) = snap_theta(k, iCell, L)
+               th2(k, iCell) = snap_theta(k, iCell, L)
+               call hts_diagnostics_from_state(k, iCell, snap_rho(k, iCell, L), snap_theta(k, iCell, L), &
+                    rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                    rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+               rho_p_save(k, iCell) = rho_p(k, iCell)
+               rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+            end do
+            do k = 1, hts_nVert + 1
+               w1(k, iCell) = snap_w(k, iCell, L)
+               w2(k, iCell) = snap_w(k, iCell, L)
+               rw(k, iCell) = snap_rw(k, iCell, L)
+               rw_save(k, iCell) = snap_rw(k, iCell, L)
+            end do
+         end do
+      end do
+      do iEdge = 1, hts_nEdges
+         L = hts_edge_level(iEdge)
+         if (L <= activeLevel .or. L > hts_max_level_used) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         do k = 1, hts_nVert
+            u1(k, iEdge) = snap_u(k, iEdge, L)
+            u2(k, iEdge) = snap_u(k, iEdge, L)
+            ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * snap_u(k, iEdge, L)
+            ru_save(k, iEdge) = ru(k, iEdge)
+            rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+         end do
+      end do
+
+   end subroutine atm_hts_restore_above
+
+
+   subroutine atm_hts_sync_finer(block, activeLevel)
+
+      ! Make levels that already advanced this tick look like a consistent
+      ! current state to the coarser solve (time level 1 matches time level 2).
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: activeLevel
+
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
+      integer :: iCell, iEdge, k
+
+      call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
+                            rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
+                            pressure_p, exner, exner_base, rtheta_base, rho_base, zz, &
+                            ru, ru_save, rw, rw_save, rho_edge)
+
+      do iCell = 1, hts_nCells
+         if (hts_cell_level(iCell) >= activeLevel) cycle
+         do k = 1, hts_nVert
+            rho1(k, iCell) = rho2(k, iCell)
+            th1(k, iCell) = th2(k, iCell)
+            rho_p_save(k, iCell) = rho_p(k, iCell)
+            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+         end do
+         do k = 1, hts_nVert + 1
+            w1(k, iCell) = w2(k, iCell)
+            rw_save(k, iCell) = rw(k, iCell)
+         end do
+      end do
+      do iEdge = 1, hts_nEdges
+         if (hts_edge_level(iEdge) >= activeLevel) cycle
+         do k = 1, hts_nVert
+            u1(k, iEdge) = u2(k, iEdge)
+            ru_save(k, iEdge) = ru(k, iEdge)
+         end do
+      end do
+
+   end subroutine atm_hts_sync_finer
+
+
+   subroutine atm_hts_accumulate_flux(block, level, dt)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+      real (kind=RKIND), intent(in) :: dt
+
+      type (mpas_pool_type), pointer :: diag
+      real (kind=RKIND), dimension(:,:), pointer :: ruAvg
+      integer :: iEdge, k
+
+      if (.not. allocated(hts_flux_sum)) return
+
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
+
+      do iEdge = 1, hts_nEdges
+         if (hts_edge_level(iEdge) /= level) cycle
+         if (.not. hts_edge_interface(iEdge)) cycle
+         do k = 1, hts_nVert
+            hts_flux_sum(k, iEdge) = hts_flux_sum(k, iEdge) + real(ruAvg(k, iEdge), R8KIND) * real(dt, R8KIND)
+         end do
+      end do
+
+   end subroutine atm_hts_accumulate_flux
+
+
+   subroutine atm_hts_prepare_targets(block, level, dt_level)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+      real (kind=RKIND), intent(in) :: dt_level
+
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      type (mpas_pool_type), pointer :: mesh
+      integer :: iEdge, k, cell1, cell2, coarse
+
+      hts_impose_edge(:) = .false.
+      if (.not. allocated(hts_ru_target)) return
+      hts_ru_target(:, :) = 0.0_RKIND
+
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+
+      do iEdge = 1, hts_nEdges
+         if (.not. hts_edge_interface(iEdge)) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         if (cell1 < 1 .or. cell1 > hts_nCells .or. cell2 < 1 .or. cell2 > hts_nCells) cycle
+         coarse = max(hts_cell_level(cell1), hts_cell_level(cell2))
+         if (coarse /= level) cycle
+         if (hts_edge_level(iEdge) >= level) cycle
+         hts_impose_edge(iEdge) = .true.
+         do k = 1, hts_nVert
+            hts_ru_target(k, iEdge) = real(hts_flux_sum(k, iEdge) / real(dt_level, R8KIND), RKIND)
+         end do
+      end do
+
+      ! block is used through mesh; silence unused if a compiler cannot see it
+      if (.false.) call mpas_log_write('prepare targets on level $i', intArgs=(/level/))
+
+   end subroutine atm_hts_prepare_targets
+
+
+   subroutine atm_hts_clear_consumed(level)
+
+      implicit none
+
+      integer, intent(in) :: level
+
+      integer :: iEdge, k
+
+      if (.not. allocated(hts_flux_sum)) return
+
+      ! Impose flags mark exactly the edges this level consumes.
+      ! `level` selects the caller; the flags were built for that level.
+      if (level < 0) return
+      do iEdge = 1, hts_nEdges
+         if (.not. hts_impose_edge(iEdge)) cycle
+         do k = 1, hts_nVert
+            hts_flux_sum(k, iEdge) = 0.0_R8KIND
+         end do
+         hts_impose_edge(iEdge) = .false.
+      end do
+
+   end subroutine atm_hts_clear_consumed
+
+
+   subroutine atm_hts_correct_mass(block, level, dt_level)
+
+      ! If the acoustic impose did not land on the accumulated fine flux,
+      ! patch the coarse column so the committed horizontal flux matches.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+      real (kind=RKIND), intent(in) :: dt_level
+
+      type (mpas_pool_type), pointer :: mesh, diag, state
+      integer, dimension(:,:), pointer :: cellsOnEdge, edgesOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nCellsSolve
+      real (kind=RKIND), dimension(:,:), pointer :: edgesOnCell_sign
+      real (kind=RKIND), dimension(:), pointer :: dvEdge, invAreaCell
+      real (kind=RKIND), dimension(:,:), pointer :: ruAvg, ru, rho_p, rtheta_p, pressure_p, exner, exner_base
+      real (kind=RKIND), dimension(:,:), pointer :: rtheta_base, rho_base, zz, rho2, th2, u2
+      integer :: iCell, iEdge, i, k, cell1, cell2
+      real (kind=RKIND) :: drho, theta_edge, resid, residMax
+      real (kind=RKIND) :: rcv, p0, rtheta_tot
+
+      if (.not. allocated(hts_ru_target)) return
+
+      residMax = 0.0_RKIND
+      rcv = rgas / (cp - rgas)
+      p0 = 1.0e5_RKIND
+
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'edgesOnCell_sign', edgesOnCell_sign)
+      call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
+      call mpas_pool_get_array(mesh, 'invAreaCell', invAreaCell)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
+      call mpas_pool_get_array(diag, 'ru', ru)
+      call mpas_pool_get_array(diag, 'rho_p', rho_p)
+      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'exner_base', exner_base)
+      call mpas_pool_get_array(diag, 'rtheta_base', rtheta_base)
+      call mpas_pool_get_array(diag, 'rho_base', rho_base)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(state, 'theta_m', th2, 2)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+
+      ! Re-mark impose edges; clear_consumed has not run yet, but prepare
+      ! may have been followed by the solve which does not clear the flags.
+      do iEdge = 1, hts_nEdges
+         if (.not. hts_impose_edge(iEdge)) cycle
+         do k = 1, hts_nVert
+            resid = abs(ruAvg(k, iEdge) - hts_ru_target(k, iEdge))
+            if (resid > residMax) residMax = resid
+         end do
+      end do
+      if (residMax > hts_max_flux_resid) hts_max_flux_resid = residMax
+
+      do iCell = 1, nCellsSolve
+         if (hts_cell_level(iCell) /= level) cycle
+         do i = 1, nEdgesOnCell(iCell)
+            iEdge = edgesOnCell(i, iCell)
+            if (.not. hts_impose_edge(iEdge)) cycle
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            do k = 1, hts_nVert
+               drho = -edgesOnCell_sign(i, iCell) * dvEdge(iEdge) * invAreaCell(iCell) * dt_level &
+                      * (hts_ru_target(k, iEdge) - ruAvg(k, iEdge))
+               theta_edge = 0.5_RKIND * (th2(k, cell1) + th2(k, cell2))
+               rho2(k, iCell) = rho2(k, iCell) + drho
+               rho_p(k, iCell) = rho_p(k, iCell) + drho
+               rtheta_p(k, iCell) = rtheta_p(k, iCell) + theta_edge * drho
+               rtheta_tot = rtheta_p(k, iCell) + rtheta_base(k, iCell)
+               if (rho2(k, iCell) /= 0.0_RKIND) then
+                  th2(k, iCell) = rtheta_tot / rho2(k, iCell)
+               end if
+               exner(k, iCell) = (zz(k, iCell) * (rgas / p0) * rtheta_tot) ** rcv
+               pressure_p(k, iCell) = zz(k, iCell) * rgas * (exner(k, iCell) * rtheta_p(k, iCell) &
+                    + rtheta_base(k, iCell) * (exner(k, iCell) - exner_base(k, iCell)))
+               ruAvg(k, iEdge) = hts_ru_target(k, iEdge)
+               ru(k, iEdge) = hts_ru_target(k, iEdge)
+               u2(k, iEdge) = 2.0_RKIND * ru(k, iEdge) / (rho2(k, cell1) + rho2(k, cell2))
+            end do
+         end do
+      end do
+
+      hts_correct_logs = hts_correct_logs + 1
+      if (hts_correct_logs <= 3 .or. residMax > 1.0e-3_RKIND) then
+         call mpas_log_write('HTS level $i flux residual max $r', &
+                             intArgs=(/level/), realArgs=(/residMax/))
+      end if
+
+   end subroutine atm_hts_correct_mass
+
+
+end module mpas_atm_hts

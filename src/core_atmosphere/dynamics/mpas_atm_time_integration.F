@@ -34,7 +34,9 @@ module atm_time_integration
 #endif
 
    use mpas_atm_boundaries, only : nSpecZone, nRelaxZone, nBdyZone, mpas_atm_get_bdy_state, mpas_atm_get_bdy_tend  ! regional_MPAS addition
-   
+
+   use mpas_atm_hts
+
    use mpas_atm_iau  
    use mpas_atm_dissipation_models
 
@@ -524,6 +526,8 @@ module atm_time_integration
 
       MPAS_ACC_TIMER_STOP('mpas_dynamics_init [ACC_data_xfer]')
 #endif
+
+      call atm_hts_setup(domain)
 
    end subroutine mpas_atm_dynamics_init
 
@@ -1783,7 +1787,96 @@ module atm_time_integration
       !$acc exit data delete(deformation_coef_s)
 #endif
 
+      call atm_hts_finalize(domain)
+
    end subroutine mpas_atm_dynamics_finalize
+
+
+   subroutine hts_refresh_wind()
+
+      ! Rebuild cell-centered winds from the current time-level-2 edge velocity.
+
+      implicit none
+
+      type (mpas_pool_type), pointer :: state, diag, mesh
+      real (kind=RKIND), dimension(:,:), pointer :: u
+      real (kind=RKIND), dimension(:,:), pointer :: uReconstructX, uReconstructY, uReconstructZ
+      real (kind=RKIND), dimension(:,:), pointer :: uReconstructZonal, uReconstructMeridional
+
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(state, 'u', u, 2)
+      call mpas_pool_get_array(diag, 'uReconstructX', uReconstructX)
+      call mpas_pool_get_array(diag, 'uReconstructY', uReconstructY)
+      call mpas_pool_get_array(diag, 'uReconstructZ', uReconstructZ)
+      call mpas_pool_get_array(diag, 'uReconstructZonal', uReconstructZonal)
+      call mpas_pool_get_array(diag, 'uReconstructMeridional', uReconstructMeridional)
+      call mpas_reconstruct(mesh, u, uReconstructX, uReconstructY, uReconstructZ, &
+                            uReconstructZonal, uReconstructMeridional, lACC=.true.)
+
+   end subroutine hts_refresh_wind
+
+
+   subroutine atm_hts_advance(domain, dt, itimestep, exchange_halo_group)
+
+      ! Advance one fine step. Coarser levels advance on the fine tick that
+      ! closes their interval, after the finer levels have subcycled.
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+      real (kind=RKIND), intent(in) :: dt
+      integer, intent(in) :: itimestep
+      procedure (halo_exchange_routine) :: exchange_halo_group
+
+      integer :: L, ratio
+      real (kind=RKIND) :: dt_level
+
+      if (hts_max_level_used <= 0) then
+         hts_masking = .true.
+         hts_active_level = 0
+         hts_impose = .false.
+         call atm_srk3(domain, dt, itimestep, exchange_halo_group)
+         hts_masking = .false.
+         return
+      end if
+
+      call atm_hts_begin_intervals(block)
+
+      hts_masking = .true.
+      hts_impose = .false.
+      hts_active_level = 0
+      call atm_hts_apply_interpolation(block, 0)
+      call hts_refresh_wind()
+      call atm_srk3(domain, dt, itimestep, exchange_halo_group)
+      call atm_hts_restore_above(block, 0)
+      call atm_hts_accumulate_flux(block, 0, dt)
+
+      do L = 1, hts_max_level_used
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) /= ratio - 1) cycle
+         dt_level = dt * real(ratio, RKIND)
+         call atm_hts_sync_finer(block, L)
+         call atm_hts_prepare_targets(block, L, dt_level)
+         hts_active_level = L
+         hts_impose = .true.
+         call atm_hts_apply_interpolation(block, L)
+         call hts_refresh_wind()
+         call atm_srk3(domain, dt_level, itimestep, exchange_halo_group)
+         call atm_hts_restore_above(block, L)
+         call atm_hts_correct_mass(block, L, dt_level)
+         call atm_hts_accumulate_flux(block, L, dt_level)
+         call atm_hts_clear_consumed(L)
+         hts_impose = .false.
+      end do
+
+      call hts_refresh_wind()
+      hts_masking = .false.
+      hts_active_level = 0
+      hts_tick = hts_tick + 1
+
+   end subroutine atm_hts_advance
 
 
    subroutine atm_timestep(domain, dt, nowTime, itimestep, exchange_halo_group)
@@ -1826,7 +1919,11 @@ module atm_time_integration
 
       call mpas_atm_pre_dynamics(domain)
       if (trim(config_time_integration) == 'SRK3') then
-         call atm_srk3(domain, dt, itimestep, exchange_halo_group)
+         if (hts_enabled) then
+            call atm_hts_advance(domain, dt, itimestep, exchange_halo_group)
+         else
+            call atm_srk3(domain, dt, itimestep, exchange_halo_group)
+         end if
       else
          call mpas_log_write('Unknown time integration option '//trim(config_time_integration), messageType=MPAS_LOG_ERR)
          call mpas_log_write('Currently, only ''SRK3'' is supported.', messageType=MPAS_LOG_CRIT)
@@ -3142,6 +3239,11 @@ module atm_time_integration
       !$acc parallel default(present)
       !$acc loop gang worker
       do iEdge = edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_edge_level(iEdge) /= hts_active_level) cycle
+         end if
+#endif
          !$acc loop vector
          do k = 1,nVertLevels
             ru_save(k,iEdge) = ru(k,iEdge)
@@ -3151,6 +3253,11 @@ module atm_time_integration
 
       !$acc loop gang worker
       do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_cell_level(iCell) /= hts_active_level) cycle
+         end if
+#endif
          !$acc loop vector
          do k = 1,nVertLevels
             rtheta_p_save(k,iCell) = rtheta_p(k,iCell)
@@ -3163,6 +3270,11 @@ module atm_time_integration
 
       !$acc loop gang worker
       do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_cell_level(iCell) /= hts_active_level) cycle
+         end if
+#endif
          !$acc loop vector
          do k = 1,nVertLevels+1
             rw_save(k,iCell) = rw(k,iCell)
@@ -3172,6 +3284,11 @@ module atm_time_integration
 
       !$acc loop gang worker
       do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_cell_level(iCell) /= hts_active_level) cycle
+         end if
+#endif
          !$acc loop vector collapse(2)
          do k = 1,nVertLevels
             do j = 1,num_scalars
@@ -3899,6 +4016,19 @@ module atm_time_integration
 
            ! update edges for block-owned cells
            if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
+#ifndef MPAS_OPENACC
+              if (hts_masking) then
+                 if (hts_edge_level(iEdge) /= hts_active_level) then
+                    if (hts_impose .and. hts_impose_edge(iEdge)) then
+                       do k = 1, nVertLevels
+                          ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                          ruAvg(k,iEdge) = ruAvg(k,iEdge) + ru_p(k,iEdge)
+                       end do
+                    end if
+                    cycle
+                 end if
+              end if
+#endif
 
 !DIR$ IVDEP
               !$acc loop vector
@@ -3932,6 +4062,19 @@ module atm_time_integration
 
            ! update edges for block-owned cells
            if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
+#ifndef MPAS_OPENACC
+              if (hts_masking) then
+                 if (hts_edge_level(iEdge) /= hts_active_level) then
+                    if (hts_impose .and. hts_impose_edge(iEdge)) then
+                       do k = 1, nVertLevels
+                          ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                          ruAvg(k,iEdge) = ru_p(k,iEdge)
+                       end do
+                    end if
+                    cycle
+                 end if
+              end if
+#endif
 
 !DIR$ IVDEP
               !$acc loop vector
@@ -3976,6 +4119,21 @@ module atm_time_integration
       !$acc parallel default(present)
       !$acc loop gang worker private(ts,rs)
       do iCell=cellSolveStart,cellSolveEnd  ! loop over all owned cells to solve
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_cell_level(iCell) /= hts_active_level) then
+               if (small_step == 1) then
+                  do k = 1, nVertLevels
+                     rho_pp(k,iCell) = 0.0_RKIND
+                     rtheta_pp(k,iCell) = 0.0_RKIND
+                     rw_p(k,iCell) = 0.0_RKIND
+                  end do
+                  rw_p(nVertLevels+1,iCell) = 0.0_RKIND
+               end if
+               cycle
+            end if
+         end if
+#endif
 
          if(small_step == 1) then  ! initialize here on first small timestep.
             !$acc loop vector
@@ -4166,6 +4324,11 @@ module atm_time_integration
 
          ! update edges for block-owned cells
          if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_edge_level(iEdge) /= hts_active_level) cycle
+            end if
+#endif
 
 !DIR$ IVDEP
             !$acc loop vector
@@ -4399,6 +4562,11 @@ module atm_time_integration
       !$acc parallel default(present)
       !$acc loop gang worker
       do iCell=cellStart,cellEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_cell_level(iCell) /= hts_active_level) cycle
+         end if
+#endif
 
 !DIR$ IVDEP
          !$acc loop vector
@@ -4431,6 +4599,11 @@ module atm_time_integration
          !$acc parallel default(present)
          !$acc loop collapse(2)
          do iCell=cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
 !DIR$ IVDEP
             do k = 1, nVertLevels
                rtheta_p(k,iCell) = rtheta_p_save(k,iCell) + rtheta_pp(k,iCell) &
@@ -4447,6 +4620,11 @@ module atm_time_integration
          !$acc parallel default(present)
          !$acc loop collapse(2)
          do iCell=cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
 !DIR$ IVDEP
             do k = 1, nVertLevels
                rtheta_p(k,iCell) = rtheta_p_save(k,iCell) + rtheta_pp(k,iCell)
@@ -4465,6 +4643,13 @@ module atm_time_integration
       !$acc parallel default(present)
       !$acc loop gang worker
       do iEdge=edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_edge_level(iEdge) /= hts_active_level) then
+               if (.not. (hts_impose .and. hts_impose_edge(iEdge))) cycle
+            end if
+         end if
+#endif
 
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
@@ -4484,6 +4669,11 @@ module atm_time_integration
       !$acc parallel default(present)
       !$acc loop gang worker
       do iCell=cellStart,cellEnd
+#ifndef MPAS_OPENACC
+         if (hts_masking) then
+            if (hts_cell_level(iCell) /= hts_active_level) cycle
+         end if
+#endif
 
          !  finish recovering w from (rho*omega)_p.  as when we formed (rho*omega)_p from u and w, we need
          !  to use the same flux-divergence operator as is used for the horizontal theta transport
@@ -7736,6 +7926,11 @@ module atm_time_integration
          !$acc parallel default(present)
          !$acc loop gang worker
          do iEdge = edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_edge_level(iEdge) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels
                ru_save(k,iEdge) = ru(k,iEdge)
@@ -7746,6 +7941,11 @@ module atm_time_integration
 
          !$acc loop gang worker
          do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels
                rtheta_p_save(k,iCell) = rtheta_p(k,iCell)
@@ -7757,6 +7957,11 @@ module atm_time_integration
 
          !$acc loop gang worker
          do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels+1
                rw_save(k,iCell) = rw(k,iCell)
@@ -7770,6 +7975,13 @@ module atm_time_integration
          !$acc parallel default(present)
          !$acc loop gang worker
          do iEdge = edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_edge_level(iEdge) /= hts_active_level) then
+                  if (.not. (hts_impose .and. hts_impose_edge(iEdge))) cycle
+               end if
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels
                ruAvg_split(k,iEdge) = ruAvg(k,iEdge)
@@ -7777,6 +7989,11 @@ module atm_time_integration
          end do
          !$acc loop gang worker
          do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels+1
                wwAvg_split(k,iCell) = wwAvg(k,iCell)
@@ -7787,6 +8004,13 @@ module atm_time_integration
          !$acc parallel default(present)
          !$acc loop gang worker
          do iEdge = edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_edge_level(iEdge) /= hts_active_level) then
+                  if (.not. (hts_impose .and. hts_impose_edge(iEdge))) cycle
+               end if
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels
                ruAvg_split(k,iEdge) = ruAvg(k,iEdge) + ruAvg_split(k,iEdge)
@@ -7794,6 +8018,11 @@ module atm_time_integration
          end do
          !$acc loop gang worker
          do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels+1
                wwAvg_split(k,iCell) = wwAvg(k,iCell) + wwAvg_split(k,iCell)
@@ -7806,6 +8035,13 @@ module atm_time_integration
          !$acc parallel default(present)
          !$acc loop gang worker
          do iEdge = edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_edge_level(iEdge) /= hts_active_level) then
+                  if (.not. (hts_impose .and. hts_impose_edge(iEdge))) cycle
+               end if
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels
                ruAvg(k,iEdge) = ruAvg_split(k,iEdge) * inv_dynamics_split
@@ -7813,6 +8049,11 @@ module atm_time_integration
          end do
          !$acc loop gang worker
          do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
             do k = 1,nVertLevels+1
                wwAvg(k,iCell) = wwAvg_split(k,iCell) * inv_dynamics_split
@@ -7820,8 +8061,13 @@ module atm_time_integration
          end do
          !$acc loop gang worker
          do iCell = cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+#endif
             !$acc loop vector
-            do k = 1,nVertLevels           
+            do k = 1,nVertLevels
                rho_zz_1(k,iCell) = rho_zz_old_split(k,iCell)
             end do
          end do

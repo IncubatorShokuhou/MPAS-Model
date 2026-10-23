@@ -24,6 +24,10 @@
 #   MPAS_RUNS   where case directories are created
 #   MPAS_NP     MPI ranks (default 4). A graph.info.part.${MPAS_NP} must exist.
 #   MPAS_OUTPUT_INTERVAL  history interval (default 1_00:00:00, one file per day)
+#   MPAS_HTS / MPAS_HTS_MAX_LEVEL   hierarchical time stepping (default false / 1)
+#   MPAS_SPLIT / MPAS_SCALAR_ADVECTION / MPAS_DYN_SPLIT_STEPS
+#   MPAS_UNIFORM_NAME / MPAS_VARIABLE_NAME   run directory names
+#       (defaults keep the phase-1 baseline directories)
 
 set -euo pipefail
 
@@ -86,9 +90,11 @@ write_atm_namelist() {
     config_dt = ${dt}
     config_start_time = '0000-01-01_00:00:00'
     config_run_duration = '${DURATION}'
-    config_split_dynamics_transport = false
+    config_split_dynamics_transport = ${MPAS_SPLIT:-false}
     config_number_of_sub_steps = 6
-    config_dynamics_split_steps = 1
+    config_dynamics_split_steps = ${MPAS_DYN_SPLIT_STEPS:-1}
+    config_hts = ${MPAS_HTS:-false}
+    config_hts_max_level = ${MPAS_HTS_MAX_LEVEL:-1}
     config_h_mom_eddy_visc2    = 0.0
     config_h_mom_eddy_visc4    = 0.0
     config_v_mom_eddy_visc2    = 0.0
@@ -103,7 +109,7 @@ write_atm_namelist() {
     config_scalar_vadv_order = 3
     config_theta_adv_order   = 3
     config_scalar_adv_order  = 3
-    config_scalar_advection  = false
+    config_scalar_advection  = ${MPAS_SCALAR_ADVECTION:-false}
     config_positive_definite = false
     config_coef_3rd_order = 1.0
     config_monotonic = false
@@ -259,9 +265,12 @@ run_case() {
     cat "$dest/time.init.txt" "$dest/time.model.txt"
 }
 
+UNIFORM_NAME=${MPAS_UNIFORM_NAME:-jw_uniform_120km}
+VARIABLE_NAME=${MPAS_VARIABLE_NAME:-jw_variable_240_48km}
+
 case "$WHICH" in
     uniform|both)
-        prepare_case jw_uniform_120km \
+        prepare_case "$UNIFORM_NAME" \
             "$MPAS_DATA/jw/jw_baroclinic_wave/x1.40962.grid.nc" \
             "$MPAS_DATA/jw/jw_baroclinic_wave" \
             x1.40962 \
@@ -274,7 +283,7 @@ case "$WHICH" in
         # dt and len_disp follow the finest nominal spacing (48 km).
         # 120 km archive uses dt=450 s and len_disp=120000 m.
         # 450 * (48/120) = 180 s; len_disp = nominalMinDc * earth radius = 48000 m.
-        prepare_case jw_variable_240_48km \
+        prepare_case "$VARIABLE_NAME" \
             "$MPAS_DATA/meshes/x5.30210.grid.nc" \
             "$MPAS_DATA/meshes" \
             x5.30210 \
@@ -284,11 +293,11 @@ case "$WHICH" in
 esac
 
 case "$WHICH" in
-    uniform) run_case jw_uniform_120km ;;
-    variable) run_case jw_variable_240_48km ;;
+    uniform) run_case "$UNIFORM_NAME" ;;
+    variable) run_case "$VARIABLE_NAME" ;;
     both)
-        run_case jw_uniform_120km
-        run_case jw_variable_240_48km
+        run_case "$UNIFORM_NAME"
+        run_case "$VARIABLE_NAME"
         ;;
     *)
         echo "Usage: $0 [uniform|variable|both] [duration]" >&2

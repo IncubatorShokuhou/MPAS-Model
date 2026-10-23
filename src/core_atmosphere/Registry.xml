@@ -73,8 +73,18 @@
 
                 <nml_option name="config_dt" type="real" default_value="720.0"
                      units="s"
-                     description="Model time step, seconds"
+                     description="Model time step, seconds. With hierarchical time stepping this is the fine-level step."
                      possible_values="Positive real values"/>
+
+                <nml_option name="config_hts" type="logical" default_value="false"
+                     units="-"
+                     description="Enable hierarchical time stepping. False leaves the integrator unchanged."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_max_level" type="integer" default_value="1"
+                     units="-"
+                     description="Largest power-of-two time-step level (0 = fine only). Level L advances by config_dt * 2^L."
+                     possible_values="Integers from 0 through 8"/>
 
                 <nml_option name="config_calendar_type" type="character" default_value="gregorian" in_defaults="false"
                      units="-"
