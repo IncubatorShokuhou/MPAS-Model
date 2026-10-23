@@ -450,7 +450,7 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
       type (mpas_pool_type), pointer :: mesh
-      integer :: L, iCell, iEdge, k, cell1, cell2, ratio
+      integer :: L, iCell, iEdge, k, cell1, cell2
       real (kind=RKIND) :: alpha, rho_here, th_here, u_here
 
       if (hts_max_level_used <= activeLevel) return
@@ -462,10 +462,12 @@ module mpas_atm_hts
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
 
+      ! Hold coarser levels at the start-of-interval snapshot while a finer
+      ! level steps. Extrapolating the previous increment fed the coarse
+      ! acoustic transient back into the fine flux and the next coarse step
+      ! amplified it.
       do L = activeLevel + 1, hts_max_level_used
-         ratio = ishft(1, L)
-         ! Midpoint of the fine step that is about to run, as a fraction of this level's step.
-         alpha = (real(mod(hts_tick, ratio), RKIND) + 0.5_RKIND) / real(ratio, RKIND)
+         alpha = 0.0_RKIND
          do iCell = 1, hts_nCells
             if (hts_cell_level(iCell) /= L) cycle
             do k = 1, hts_nVert
@@ -492,8 +494,7 @@ module mpas_atm_hts
       do iEdge = 1, hts_nEdges
          L = hts_edge_level(iEdge)
          if (L <= activeLevel .or. L > hts_max_level_used) cycle
-         ratio = ishft(1, L)
-         alpha = (real(mod(hts_tick, ratio), RKIND) + 0.5_RKIND) / real(ratio, RKIND)
+         alpha = 0.0_RKIND
          cell1 = cellsOnEdge(1, iEdge)
          cell2 = cellsOnEdge(2, iEdge)
          do k = 1, hts_nVert
@@ -730,10 +731,12 @@ module mpas_atm_hts
       integer :: iCell, iEdge, i, k, cell1, cell2
       real (kind=RKIND) :: drho, theta_edge, resid, residMax
       real (kind=RKIND) :: rcv, p0, rtheta_tot
+      real (kind=RKIND) :: residOwned
 
       if (.not. allocated(hts_ru_target)) return
 
       residMax = 0.0_RKIND
+      residOwned = 0.0_RKIND
       rcv = rgas / (cp - rgas)
       p0 = 1.0e5_RKIND
 
@@ -765,9 +768,14 @@ module mpas_atm_hts
       ! may have been followed by the solve which does not clear the flags.
       do iEdge = 1, hts_nEdges
          if (.not. hts_impose_edge(iEdge)) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
          do k = 1, hts_nVert
             resid = abs(ruAvg(k, iEdge) - hts_ru_target(k, iEdge))
             if (resid > residMax) residMax = resid
+            if ((cell1 <= nCellsSolve .or. cell2 <= nCellsSolve) .and. resid > residOwned) then
+               residOwned = resid
+            end if
          end do
       end do
       if (residMax > hts_max_flux_resid) hts_max_flux_resid = residMax
@@ -801,9 +809,9 @@ module mpas_atm_hts
       end do
 
       hts_correct_logs = hts_correct_logs + 1
-      if (hts_correct_logs <= 3 .or. residMax > 1.0e-3_RKIND) then
-         call mpas_log_write('HTS level $i flux residual max $r', &
-                             intArgs=(/level/), realArgs=(/residMax/))
+      if (hts_correct_logs <= 3 .or. residOwned > 1.0e-3_RKIND) then
+         call mpas_log_write('HTS level $i owned flux residual max $r (halo residual $r)', &
+                             intArgs=(/level/), realArgs=(/residOwned, residMax/))
       end if
 
    end subroutine atm_hts_correct_mass

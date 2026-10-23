@@ -2159,6 +2159,11 @@ module atm_time_integration
       if (.not. config_scalar_advection ) call mpas_log_write(' scalar advection turned off ')
 
       number_of_sub_steps = config_number_of_sub_steps
+      ! Match the fine acoustic step on coarser levels. A longer acoustic step
+      ! put the w error on the interface cells and the solution later became NaN.
+      if (hts_masking .and. hts_active_level > 0) then
+         number_of_sub_steps = number_of_sub_steps * ishft(1, hts_active_level)
+      end if
 
       if(config_time_integration_order == 3) then
 

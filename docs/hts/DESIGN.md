@@ -1,10 +1,12 @@
 # Hierarchical time stepping for MPAS-Atmosphere
 
-Phase 1 design, written against unmodified MPAS-Atmosphere **v8.4.2**
+Design for MPAS-Atmosphere **v8.4.2**
 (`f34984b2c89353cf31c235b08d3b4acd96b37bb3`, upstream tag `v8.4.2`,
 4 September 2026). The fork's `master` is left at the 2024 v8.2.2 history.
-No HTS code is in the model yet. Baseline numbers from the unmodified
-dynamical core are in [BASELINE.md](BASELINE.md).
+Phase 2 implements the dry scheme in `src/core_atmosphere/dynamics/mpas_atm_hts.F`
+and in masked loops inside `mpas_atm_time_integration.F`. Baseline numbers
+from the unmodified dynamical core are in [BASELINE.md](BASELINE.md).
+Measured HTS gates are in [PHASE2.md](PHASE2.md).
 
 This scheme is designed for MPAS-A's split-explicit RK integrator. It is
 informed by ClusterTech CPAS (Sze et al. 2022, doi:10.1029/2022EA002342;
@@ -74,7 +76,7 @@ dx = nominalMinDc * sphere_radius / meshDensity^(1/4)
 L  = nint(log2(max(dx / dx_min, 1)))
 ```
 
-clamped to a namelist maximum (`config_hts_max_level`, default 2 so the first implementation is three levels, ratio 4). The 2019 `x1.40962` grid used for the uniform baseline has no `nominalMinDc` variable (init warns and continues). `meshDensity` is present and is identically 1, so that mesh is one level either way. Level assignment should key off `meshDensity` and treat a missing `nominalMinDc` as "all cells level 0 when `meshDensity` does not vary." An edge's level is the finer (smaller) of its two `cellsOnEdge` levels: the acoustic CFL at that edge is set by the shorter adjacent spacing. An edge whose cells differ in `L` is an interface edge.
+clamped to `config_hts_max_level` (registry default 1, hard cap 8). The default is 1 so the first variable-mesh test is two levels; raise it to 2 for the three-level run. The 2019 `x1.40962` grid used for the uniform baseline has no `nominalMinDc` variable (init warns and continues). `meshDensity` is present and is identically 1, so that mesh is one level either way. Level assignment keys off `meshDensity` and treats a missing `nominalMinDc`, or a mesh whose density does not vary, as "all cells level 0." An edge's level is the finer (smaller) of its two `cellsOnEdge` levels: the acoustic CFL at that edge is set by the shorter adjacent spacing. An edge whose cells differ in `L` is an interface edge.
 
 Power-of-two bins are required so a coarse step contains an integer number of fine steps. A mesh whose refinement ratio is not a power of two (the 5× tutorial mesh) is binned conservatively: a 230 km cell on a 48 km mesh lands in `L = 2` (`4 dt`, not `5 dt`) and is integrated slightly more often than its own CFL limit. On `x5.30210` that assignment is:
 
@@ -88,39 +90,58 @@ Interface edges (the two cells have different `L`) are 1223 of 90624 (1.3%). The
 
 Uniform meshes have `meshDensity = 1` everywhere, so every cell is level 0. That is the regression test: HTS enabled with one level must reproduce the baseline.
 
-### Time march (two levels first, then N)
+### Time march
 
-For a coarse step `dt_c = 2^L dt_f` the coarse region is idle while the finer region subcycles. The phase-2 driver wraps the existing stage routines rather than forking a second copy of `atm_srk3`.
+`config_hts = false` calls the unmodified `atm_srk3`. `config_hts = true` calls `atm_hts_advance` once per fine clock tick. The outer clock still advances by `config_dt`.
 
-1. Save the coarse prognostic state at `t_n` (`u`, `w`, `rho_zz` / `theta_m`, and the diagnostic pressure the fine solver reads in the halo).
-2. For each fine substep `s = 1 .. 2^L`:
-   - Write a time-interpolated coarse state into cells that are halos of the fine region (see below).
-   - Advance level-0 (and any level whose substep is due) with the existing RK + acoustic routines, masked so coarser cells are not updated.
-   - On interface edges, accumulate the mass flux the fine acoustic step actually used. The quantity to accumulate is the same edge flux that becomes `ruAvg` (and `wwAvg` where a vertical face is involved). Sum in double precision even though the model default is single.
-3. When a coarser level is due, advance it with the same routines, but on each interface edge replace the flux the coarse acoustic divergence would compute with the accumulated fine flux divided by the coarse step. After the update, set the interface `ru` / `u` from that flux so the two sides store one edge state.
+On a tick, level L is at the start of its interval when `mod(tick, 2^L) = 0` and is due to advance when `mod(tick, 2^L) = 2^L - 1`. The advance is `dt * 2^L` through one call to the existing RK3 integrator, masked to that level. With one level (`hts_max_level_used = 0`) there is a single masked call and the coarse machinery is not allocated.
 
-N levels are the same loop with a bit-reversed or fine-to-coarse schedule: a level-L region advances when `s` is a multiple of `2^L`. Phase 2 implements `L = 0` and `L = 1` only, with the data structures sized for N, and only then turns on `L = 2` on `x5.30210`.
+Order on a tick with more than one level:
 
-### Time interpolation at the interface
+1. Snapshot any level whose interval is opening (`mod(tick, 2^L) = 0`). The snapshot is the time-level-1 state at the start of that level's step. The previous-step increment is stored but not applied (see below).
+2. Write that snapshot into every cell and edge coarser than the level about to run, on both time levels and on the diagnostics the acoustic solver reads. Reconstruct the horizontal wind, then call `atm_srk3` masked to the active level.
+3. Restore every coarser cell and edge to its snapshot, so the fine call cannot commit the extrapolant.
+4. Add `ruAvg * dt` on level-0 interface edges into a double-precision accumulator.
+5. For each coarser level that is due, from fine to coarse: copy the finer time-level-2 state back onto time level 1 and onto the saved acoustic base state; set the imposed `ruAvg` target to (accumulated flux) / `dt_L` on interface edges whose coarser cell is this level; hold levels coarser than L at their snapshot; call `atm_srk3` with `dt_L`; restore those coarser levels; patch any flux residual (below); accumulate this level's own outgoing interface flux; clear the accumulator entries this level consumed.
 
-Phase 2 uses linear interpolation of the coarse prognostic state to the fine substep time, applied to coarse cells that border a finer cell. That is the same idea as `mpas_atm_get_bdy_state`, which already interpolates a driving state to an arbitrary offset inside a large step.
+A rejected alternative was a predictor: integrate the coarse region once to get the interval endpoint, interpolate, then integrate it again with the fine region. That integrates the coarse region twice and spends the speedup. Linear extrapolation of the previous coarse increment (`alpha = (mod(tick, 2^L) + 0.5) / 2^L`) was implemented and rejected after the two-level test: the coarse acoustic transient was extrapolated into the fine flux, and the next coarse step amplified it until `w` became NaN within about two hours. The fine region with the coarse state held at the start-of-interval snapshot is stable. The coarse state is therefore held fixed for the fine substeps and advanced once, at the end of its interval. The lag is one coarse step. It is the phase-2 coupling.
 
-Linear interpolation does not match the RK stage abscissae. It is acceptable for the first correctness tests and is a known source of interface error. If the day-10 comparison shows noise localized on the interface, the next change is to interpolate at RK nodes (store the coarse stage states, not only the step endpoints) rather than to change the flux accumulator.
+### Interface state and the imposed flux
 
-The fine acoustic solver must see the interpolated neighbor pressure and `rho_pp` at the start of each acoustic substep. Implementation rule: perform the existing full-domain halo exchange (so ranks stay in lockstep), then overwrite coarse-owned cells that are fine halos with the interpolated state. The exchange is wasteful on ranks that own only coarse cells. It is deadlock-free. Per-level exchange groups are a phase-3 optimization, not a phase-2 requirement.
+The held snapshot is written into both time levels and into the diagnostics the acoustic pressure gradient reads (`rho_p`, `rtheta_p`, `exner`, `pressure_p`, `ru`, `rw`). It covers every coarser cell, not only the interface band, because the slow tendency loop is unmasked and would otherwise differentiate a stale neighbor. After the call, those cells are put back.
+
+On an imposed edge the acoustic loop does not compute a pressure gradient. Each acoustic substep sets `ru_p = target − ru_save` and folds that into `ruAvg`, so the recovered `ruAvg = ru_save + mean(ru_p)` equals the target. Divergence damping is skipped on edges that are not the active level, including imposed edges, so damping cannot move `ru_p` off the target. Recovery updates `ru`, `u`, and `ruAvg` on imposed edges and skips other inactive edges.
+
+On level L, `config_number_of_sub_steps` is multiplied by `2^L`, so the acoustic step stays the fine acoustic step. A coarse step at the nominal substep count (acoustic step `2^L` times longer) put the `w` error on the interface cells; that configuration was still growing at 2 hours and had become NaN within a few hours. Matching the acoustic step removed that growth. It also spends the acoustic-work part of the speedup: a coarse cell does as many acoustic updates per unit time as a fine cell. The tendency loop is still unmasked and the halo exchange is still global, so the two-level run is slower than all-fine. The profile, the acoustic-CFL check, and the interface-versus-interior `w` breakdown are in [PHASE2.md](PHASE2.md).
+
+Inactive cells zero `rho_pp` and `rtheta_pp` on the first acoustic substep and then skip the column update. The active edge therefore sees a neighbor acoustic perturbation of zero and a neighbor exner from the held snapshot. That is a known source of interface acoustic noise. Do not hide it by adding diffusion. A fine-region run with the coarse state frozen and the coarse advance skipped stays at the all-fine `w`. The noise that remains is in the coarse advance.
+
+Halo exchanges stay on the existing full-domain groups. Every rank participates. Per-level groups are phase 3.
 
 ### Where the mask goes
 
-Preferred phase-2 edit, option B: an integer `cellLevel` / `edgeLevel` array, and a cycle test at the top of the `*_work` loops (`atm_advance_acoustic_step_work`, `atm_compute_dyn_tend_work`, `atm_recover_large_step_variables_work`, `atm_compute_solve_diagnostics_work`, scalar transport). Cells whose level is not due this substep are skipped. This touches many routines but each change is local, and there is one integrator left to compare against the baseline.
+The mask is a cycle at the top of the loops that commit a level's state:
+
+- `atm_rk_integration_setup` (so a second `atm_srk3` on the same tick does not copy an inactive time level 1 over the state just advanced)
+- both acoustic edge loops and the acoustic cell loop
+- `atm_divergence_damping_3d`
+- `atm_recover_large_step_variables_work`
+- `atm_rk_dynamics_substep_finish`, including the `rho_zz` time-level-1 restore
+
+`atm_compute_dyn_tend` and `atm_compute_solve_diagnostics` are not masked. They recompute tendencies and diagnostics from whatever prognostics are in the pools. On the measured two-level run those full-domain tendency evaluations, plus global halo exchanges around a masked acoustic loop, outweigh the cells that skip the acoustic update. The 1.44× ceiling counts cell updates, not this split. The six-hour profile is in [PHASE2.md](PHASE2.md): with this loop structure the variable mesh is slower than all-fine.
+
+The mask is inside `#ifndef MPAS_OPENACC`. An OpenACC build that sets `config_hts` aborts in setup. `config_hts = false` does not enter the masked bodies.
 
 Rejected for phase 2:
 
-- A second copy of `atm_srk3` (it will diverge from upstream the first time the dynamical core changes).
-- Separate fine and coarse domain blocks in the style of ocean LTS. That is the right MPI structure once the numerics are trusted, and it is phase 3 work because the halo groups, the block loop, and the partition file all change together.
+- A second copy of `atm_srk3`.
+- Separate fine and coarse domain blocks. That is phase 3, with the halo groups and the partition.
 
 ### Conservation
 
-Dry air mass on this mesh lives in `rho` (physical density) over the cell volume `areaCell * (zgrid(k+1) - zgrid(k))`, and the flux form the acoustic step actually conserves is the `rho_zz` tendency driven by the edge mass flux. Global mass is conserved if and only if each interface edge contributes one number to both adjacent cells over a coarse step: the fine side's sum of substep fluxes, and the same sum used as the coarse flux. The coarse solver must not recompute a second flux from a coarse `u` on that edge.
+Dry air mass lives in `rho` over `areaCell * (zgrid(k+1) − zgrid(k))`. The acoustic step's horizontal density change is `−dt * div(ruAvg)`, because the horizontal part of `tend_rho` is frozen from the start-of-step `ru` and the acoustic update adds `div(ru_p)`, with `ruAvg = ru_save + mean(ru_p)`. Vertical fluxes move mass inside the column. Matching `ruAvg` on an interface edge therefore matches the two cells' horizontal mass budgets. The Jablonowski–Williamson mesh has flat `zgrid`, so that is the dry-mass integral.
+
+The coarse acoustic step is asked to land on the accumulated fine flux. If it does not, `atm_hts_correct_mass` adds the missing divergence to the coarse column's `rho_zz` (and the matching `theta_m` / pressure diagnostics) and sets `ru`, `u`, and `ruAvg` to the target. The sign is the same as the acoustic divergence: `drho_zz = −edgesOnCell_sign * dvEdge * invAreaCell * dt * (target − ruAvg)`. The first three coarse steps, and any step whose residual exceeds `1e-3`, log the max `|ruAvg − target|`.
 
 Checks:
 
@@ -174,7 +195,7 @@ Speed, same binary family, 4 ranks, `x5.30210`, 10 days:
 ## 4. Risks
 
 - The vertically implicit acoustic solve is per column, but the horizontal pressure gradient reads neighbors. A mask that skips the neighbor update without refreshing the interpolated halo will either deadlock, drift, or radiate acoustic noise from the interface.
-- Linear time interpolation of the coarse state is formally lower order than RK2/RK3. Expect a local error at the interface. Do not "fix" it by adding diffusion.
+- The coarse boundary seen by the fine step is the start-of-interval state, held fixed, formally lower order than RK2/RK3. Extrapolating the previous increment was unstable on `x5.30210`. Expect a local error at the interface. Do not "fix" it by adding diffusion.
 - Single-precision flux accumulation.
 - `config_split_dynamics_transport = true` (the registry default, off in the JW namelist) accumulates transport fluxes across several dynamics substeps. HTS has to define that average on interface edges or the scalar and the continuity equation will use different fluxes. Phase 2 keeps the split off until the unsplit case is clean.
 - Physics packages that key off the step index rather than the clock will fire at the wrong rate on coarse columns.
@@ -237,13 +258,12 @@ Phase 2 is dry dynamics only. Physics stays `none`. Scalar transport stays off u
 
 Order of work:
 
-1. Registry switches: `config_hts` (logical, default false), `config_hts_max_level` (integer, default 1 for the first tests). Default false must be a no-op so the phase-1 baseline namelists do not change.
-2. Level arrays filled in `mpas_atm_dynamics_init`, plus a log line with the cell count per level. No behavior change while `config_hts` is false.
-3. Mask the `*_work` loops. Uniform mesh, one level, 1-day then 10-day comparison against BASELINE.md. This is the gate. Do not go on if the uniform L2 is above the target.
-4. Two-level flux accumulation and linear coarse-state interpolation. Test on `x5.30210` by capping `config_hts_max_level` at 1 (so the 230 km cells run at `2 dt`, not `4 dt`). Compare mass, `w` rms at the interface, and day-10 `u` / surface pressure against a fresh all-fine reference produced by the same binary with `config_hts = false`.
-5. Raise the cap to 2. Repeat the same metrics. Record wall time against the 1.44× ceiling. A speedup well below the ceiling with a clean solution is still a successful phase 2; the remaining gap is the phase-3 partition and halo work.
-6. Only after that, turn `config_split_dynamics_transport` back on and repeat the uniform regression.
+1. Registry switches: `config_hts` (logical, default false), `config_hts_max_level` (integer, default 1). Default false is a no-op so phase-1 namelists do not change. Done.
+2. Level arrays filled in `mpas_atm_dynamics_init`, with a log line of the cell count per level. Done.
+3. Mask the committing loops. Uniform mesh, one level, comparison against BASELINE.md. Done: day 1 and day 10 are bit-identical to the all-fine history of the same binary and to the phase-1 baseline.
+4. Two-level flux accumulation and the held snapshot above. Test on `x5.30210` with `config_hts_max_level = 1` (230 km cells run at `2 dt`). Compare mass, interface `w`, and fields against an all-fine run of the same binary. Done for 6 hours and 1 day. The profile and the `w` breakdown are in [PHASE2.md](PHASE2.md). Wall time is about 1.65× the all-fine run. A third level was not started: the same acoustic-step rule and the same full-domain tendency and halo calls would add cost.
+5. Scalar transport and `config_split_dynamics_transport` stay off until a design exists that can be faster than all-fine. The uniform regression for that configuration was not run.
 
-Files expected to change: `Registry.xml`, `mpas_atm_core.F` (init and the per-step call), `mpas_atm_time_integration.F` (masks and flux replacement), a new `mpas_atm_hts.F` for level assignment, interpolation, and the double-precision accumulator. Halo-group definitions stay as they are in phase 2.
+The driver lives in `mpas_atm_time_integration.F` (`atm_hts_advance`) so it can call `atm_srk3` without a module cycle. Level assignment, the held snapshot, the flux accumulator, and the mass patch are in `mpas_atm_hts.F`. Halo-group definitions are unchanged.
 
-Out of phase 2: physics, weighted partitions, per-level halo groups, regional LBCs, GPU.
+Out of phase 2: physics coupling, weighted partitions, per-level halo groups, regional LBCs, GPU.
