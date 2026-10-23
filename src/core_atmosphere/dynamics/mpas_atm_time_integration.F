@@ -13,6 +13,7 @@
 #define MPAS_ACC_TIMER_START(X)
 #define MPAS_ACC_TIMER_STOP(X)
 #endif
+#include "hts_loops.h"
 
 module atm_time_integration
 
@@ -2346,6 +2347,17 @@ module atm_time_integration
                dpdz(k,nCells+1) = 0.0_RKIND
             end do
             !$acc end parallel
+            ! Hyperdiffusion reads delsq on the neighbors of the active level.
+            ! Zero the scratch so a neighbor outside the work list is finite.
+            ! The unmasked pass overwrites every entry it reads.
+            if (hts_masking .and. hts_max_level_used > 0) then
+               delsq_theta(:, :) = 0.0_RKIND
+               delsq_w(:, :) = 0.0_RKIND
+               delsq_divergence(:, :) = 0.0_RKIND
+               delsq_u(:, :) = 0.0_RKIND
+               delsq_vorticity(:, :) = 0.0_RKIND
+               dpdz(:, :) = 0.0_RKIND
+            end if
 
 !$OMP PARALLEL DO
             do thread=1,nThreads
@@ -4014,7 +4026,7 @@ module atm_time_integration
 
         !$acc parallel default(present)
         !$acc loop gang worker
-        do iEdge=edgeStart,edgeEnd ! MGD do we really just need edges touching owned cells?
+        HTS_AC_EDGE_DO
 
            cell1 = cellsOnEdge(1,iEdge)
            cell2 = cellsOnEdge(2,iEdge)
@@ -4060,7 +4072,7 @@ module atm_time_integration
 
         !$acc parallel default(present)
         !$acc loop gang worker
-        do iEdge=edgeStart,edgeEnd ! MGD do we really just need edges touching owned cells?
+        HTS_AC_EDGE_DO
 
            cell1 = cellsOnEdge(1,iEdge)
            cell2 = cellsOnEdge(2,iEdge)
@@ -4121,9 +4133,26 @@ module atm_time_integration
 
 !$OMP BARRIER
 
+#ifndef MPAS_OPENACC
+      ! The owned-cell loop below visits only the active level. Inactive owned
+      ! columns still have to drop their acoustic perturbations on the first
+      ! small step, or an active edge sees a stale neighbor.
+      if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
+         do i = 1, hts_n_off_own(hts_active_level)
+            iCell = hts_off_own(i, hts_active_level)
+            do k = 1, nVertLevels
+               rho_pp(k,iCell) = 0.0_RKIND
+               rtheta_pp(k,iCell) = 0.0_RKIND
+               rw_p(k,iCell) = 0.0_RKIND
+            end do
+            rw_p(nVertLevels+1,iCell) = 0.0_RKIND
+         end do
+      end if
+#endif
+
       !$acc parallel default(present)
       !$acc loop gang worker private(ts,rs)
-      do iCell=cellSolveStart,cellSolveEnd  ! loop over all owned cells to solve
+      HTS_ACTIVE_CELL_SOLVE_DO
 #ifndef MPAS_OPENACC
          if (hts_masking) then
             if (hts_cell_level(iCell) /= hts_active_level) then
@@ -4322,7 +4351,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iEdge=edgeStart,edgeEnd ! MGD do we really just need edges touching owned cells?
+      HTS_AC_EDGE_DO
 
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
@@ -4566,7 +4595,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell=cellStart,cellEnd
+      HTS_ACTIVE_CELL_ALL_DO
 #ifndef MPAS_OPENACC
          if (hts_masking) then
             if (hts_cell_level(iCell) /= hts_active_level) cycle
@@ -4603,7 +4632,7 @@ module atm_time_integration
       if (rk_step == 3) then
          !$acc parallel default(present)
          !$acc loop collapse(2)
-         do iCell=cellStart,cellEnd
+         HTS_ACTIVE_CELL_ALL_DO
 #ifndef MPAS_OPENACC
             if (hts_masking) then
                if (hts_cell_level(iCell) /= hts_active_level) cycle
@@ -4624,7 +4653,7 @@ module atm_time_integration
       else
          !$acc parallel default(present)
          !$acc loop collapse(2)
-         do iCell=cellStart,cellEnd
+         HTS_ACTIVE_CELL_ALL_DO
 #ifndef MPAS_OPENACC
             if (hts_masking) then
                if (hts_cell_level(iCell) /= hts_active_level) cycle
@@ -4642,6 +4671,8 @@ module atm_time_integration
       ! recover time-averaged ruAvg on all edges of owned cells (for upcoming scalar transport).
       ! we solved for these in the acoustic-step loop.
       ! we will compute ru and u here also, given we are here, even though we only need them on nEdgesSolve
+      ! Halo edges that touch no owned cell still have to be recovered: the next
+      ! diagnostic pass reads them before the halo exchange.
 
 !$OMP BARRIER
 
@@ -4673,7 +4704,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell=cellStart,cellEnd
+      HTS_ACTIVE_CELL_ALL_DO
 #ifndef MPAS_OPENACC
          if (hts_masking) then
             if (hts_cell_level(iCell) /= hts_active_level) cycle
@@ -6525,7 +6556,7 @@ module atm_time_integration
 
          !$acc parallel default(present)
          !$acc loop gang worker
-         do iEdge = edgeStart, edgeEnd
+         HTS_WORK_EDGE_ALL_DO
             !$acc loop vector
             do k = 1, nVertLevels
                tend_u_euler(k,iEdge) = 0.0_RKIND
@@ -6550,7 +6581,7 @@ module atm_time_integration
 
                !$acc parallel default(present)
                !$acc loop gang worker
-               do iCell = cellStart, cellEnd
+               HTS_WORK_CELL_ALL_DO
                   !$acc loop vector
                   do k = 1, nVertLevels
                       eddy_visc_horz(k,iCell) = config_h_theta_eddy_visc2
@@ -6586,7 +6617,7 @@ module atm_time_integration
 
             !$acc parallel default(present)
             !$acc loop gang worker
-            do iCell = cellStart,cellEnd
+            HTS_WORK_CELL_ALL_DO
                !
                ! 2nd-order filter for top absorbing layer similar to that in CAM-SE :  WCS 10 May 2017, modified 7 April 2023
                ! From MPAS-CAM V4.0 code, with addition to config-specified coefficient (V4.0_coef = 0.2; SE_coef = 1.0)
@@ -6609,7 +6640,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell=cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
 
          !$acc loop vector
          do k=1,nVertLevels
@@ -6633,7 +6664,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell = cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
          r = invAreaCell(iCell)
          !$acc loop vector
          do k = 1,nVertLevels
@@ -6653,7 +6684,7 @@ module atm_time_integration
 
         !$acc parallel default(present)
         !$acc loop gang worker
-        do iCell = cellStart,cellEnd
+        HTS_WORK_CELL_ALL_DO
 
 !DIR$ IVDEP
           !$acc loop vector
@@ -6674,7 +6705,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker private(wduz, q)
-      do iEdge=edgeSolveStart,edgeSolveEnd
+      HTS_WORK_EDGE_SOLVE_DO
 
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
@@ -6792,7 +6823,6 @@ module atm_time_integration
                                  delsq_u, delsq_vorticity, delsq_divergence,                                  &
                                  u, v, divergence, vorticity, rho_edge, rho_zz, u_init, v_init, ustm, tend_u_euler )
 
-
       end if ! (rk_step 1 test for computing mixing terms)
 
 !$OMP BARRIER
@@ -6814,7 +6844,7 @@ module atm_time_integration
 
          !$acc parallel default(present)
          !$acc loop gang worker
-         do iEdge=edgeSolveStart,edgeSolveEnd
+         HTS_WORK_EDGE_SOLVE_DO
 !DIR$ IVDEP
             !$acc loop vector
             do k=nVertlevels-config_number_rayleigh_damp_u_levels+1,nVertLevels
@@ -6827,7 +6857,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iEdge=edgeSolveStart,edgeSolveEnd
+      HTS_WORK_EDGE_SOLVE_DO
 !DIR$ IVDEP
          !$acc loop vector
          do k=1,nVertLevels
@@ -6846,7 +6876,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker private(ru_edge_w, flux_arr)
-      do iCell=cellSolveStart,cellSolveEnd    ! Technically updating fewer cells than before...
+      HTS_WORK_CELL_SOLVE_DO
 
          !$acc loop vector
          do k=1,nVertLevels+1
@@ -6895,7 +6925,7 @@ module atm_time_integration
 #ifdef CURVATURE
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell = cellSolveStart, cellSolveEnd
+      HTS_WORK_CELL_SOLVE_DO
 !DIR$ IVDEP
          !$acc loop vector
          do k=2,nVertLevels
@@ -6947,7 +6977,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker private(wdwz)
-      do iCell=cellSolveStart,cellSolveEnd
+      HTS_WORK_CELL_SOLVE_DO
 
          wdwz(1) = 0.0
 
@@ -6989,7 +7019,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell = cellSolveStart,cellSolveEnd
+      HTS_WORK_CELL_SOLVE_DO
 !DIR$ IVDEP
          !$acc loop vector
          do k=2,nVertLevels
@@ -7006,7 +7036,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker private(flux_arr)
-      do iCell=cellSolveStart,cellSolveEnd    ! Technically updating fewer cells than before...
+      HTS_WORK_CELL_SOLVE_DO
 
          !$acc loop vector
          do k=1,nVertLevels
@@ -7049,7 +7079,7 @@ module atm_time_integration
 
         !$acc parallel default(present)
         !$acc loop gang worker
-        do iCell=cellSolveStart,cellSolveEnd
+        HTS_WORK_CELL_SOLVE_DO
 
           !$acc loop seq
           do i=1,nEdgesOnCell(iCell) 
@@ -7105,7 +7135,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker private(wdtz)
-      do iCell = cellSolveStart,cellSolveEnd
+      HTS_WORK_CELL_SOLVE_DO
 
          wdtz(1) = 0.0
 
@@ -7136,7 +7166,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell = cellSolveStart,cellSolveEnd
+      HTS_WORK_CELL_SOLVE_DO
 !DIR$ IVDEP
          !$acc loop vector
          do k=1,nVertLevels
@@ -7320,15 +7350,21 @@ module atm_time_integration
       logical, parameter :: hollingsworth=.true.
       real (kind=RKIND) :: ke_fact, efac
       logical :: reconstruct_v
+      logical :: hts_lists_saved
 
 
 
       !
       ! Compute height on cell edges at velocity locations
       !
+      ! Diagnostics are a function of the whole local state, and the next level
+      ! reads them before it recomputes its own. Keep this pass full-domain.
+      hts_lists_saved = hts_lists_work
+      hts_lists_work = .false.
+
       !$acc parallel default(present)
       !$acc loop gang
-      do iEdge=edgeStart,edgeEnd
+      HTS_WORK_EDGE_ALL_DO
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
 !DIR$ IVDEP
@@ -7352,7 +7388,7 @@ module atm_time_integration
       ! Compute circulation and relative vorticity at each vertex
       !
       !$acc loop gang
-      do iVertex=vertexStart,vertexEnd
+      HTS_VERT_ALL_DO
          !$acc loop vector
          do k=1,nVertLevels
             vorticity(k,iVertex) = 0.0_RKIND
@@ -7379,7 +7415,7 @@ module atm_time_integration
       ! Compute the divergence at each cell center
       !
       !$acc loop gang
-      do iCell=cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
          !$acc loop vector
          do k=1,nVertLevels
             divergence(k,iCell) = 0.0_RKIND
@@ -7412,7 +7448,7 @@ module atm_time_integration
       ! compiler will actually allow "float raised to float" operation
       !$acc parallel default(present)
       !$acc loop gang
-      do iCell=cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
          !$acc loop vector
          do k=1,nVertLevels
             ke(k,iCell) = 0.0_RKIND
@@ -7445,7 +7481,7 @@ module atm_time_integration
          ! compiler will actually allow "float raised to float" operation
          !$acc parallel default(present)
          !$acc loop gang
-         do iVertex=vertexStart,vertexEnd
+         HTS_VERT_ALL_DO
             r = 0.25 * invAreaTriangle(iVertex) 
             !$acc loop vector
             do k=1,nVertLevels
@@ -7470,7 +7506,7 @@ module atm_time_integration
 
          !$acc parallel default(present)
          !$acc loop collapse(2)
-         do iCell=cellStart,cellEnd
+         HTS_WORK_CELL_ALL_DO
             do k=1,nVertLevels
                ke(k,iCell) = ke_fact * ke(k,iCell)
             end do
@@ -7478,7 +7514,7 @@ module atm_time_integration
 
 
          !$acc loop gang
-         do iCell=cellStart,cellEnd
+         HTS_WORK_CELL_ALL_DO
             r = invAreaCell(iCell)
             !$acc loop seq
             do i=1,nEdgesOnCell(iCell)
@@ -7507,7 +7543,7 @@ module atm_time_integration
       if (reconstruct_v) then
         !$acc parallel default(present)
         !$acc loop gang
-        do iEdge = edgeStart,edgeEnd
+        HTS_WORK_EDGE_ALL_DO
           !$acc loop vector
           do k = 1,nVertLevels
             v(k,iEdge) = 0.0_RKIND
@@ -7533,7 +7569,7 @@ module atm_time_integration
       ! numerator for the pv_vertex calculation
       !$acc parallel default(present)
       !$acc loop collapse(2)
-      do iVertex = vertexStart,vertexEnd
+      HTS_VERT_ALL_DO
 !DIR$ IVDEP
          do k=1,nVertLevels
 !
@@ -7556,7 +7592,7 @@ module atm_time_integration
       !
       !$acc parallel default(present)
       !$acc loop collapse(2)
-      do iEdge = edgeStart,edgeEnd
+      HTS_WORK_EDGE_ALL_DO
 !DIR$ IVDEP
          do k=1,nVertLevels
             pv_edge(k,iEdge) =  0.5 * (pv_vertex(k,verticesOnEdge(1,iEdge)) + pv_vertex(k,verticesOnEdge(2,iEdge)))
@@ -7573,7 +7609,7 @@ module atm_time_integration
          !
          !$acc parallel default(present)
          !$acc loop gang
-         do iCell=cellStart,cellEnd
+         HTS_WORK_CELL_ALL_DO
             !$acc loop vector
             do k = 1,nVertLevels
                pv_cell(k,iCell) = 0.0_RKIND
@@ -7612,7 +7648,7 @@ module atm_time_integration
          r = config_apvm_upwinding * dt
          !$acc parallel default(present)
          !$acc loop gang
-         do iEdge = edgeStart,edgeEnd
+         HTS_WORK_EDGE_ALL_DO
             r1 = 1.0_RKIND * invDvEdge(iEdge)
             r2 = 1.0_RKIND * invDcEdge(iEdge)
 !DIR$ IVDEP
@@ -7628,6 +7664,7 @@ module atm_time_integration
 
       end if  ! apvm upwinding
 
+      hts_lists_work = hts_lists_saved
 
    end subroutine atm_compute_solve_diagnostics_work
 

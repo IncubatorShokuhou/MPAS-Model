@@ -39,6 +39,44 @@ module mpas_atm_hts
 
    integer, parameter :: hts_level_cap = 8
 
+   ! Index lists. With one thread the hot loops iterate these instead of every
+   ! cell. Work lists are the active level plus a 2-cell ring, because the
+   ! tendency and hyperdiffusion stencils read neighbors. Acoustic state updates
+   ! use the strict active list. hts_ac_edge also contains the interface edges
+   ! a coarse level imposes.
+   integer, public :: hts_nloop = 0
+   integer, public :: hts_ii = 0
+   ! Tendency and dissipation index lists. hts_lists_work false walks the
+   ! original index range. Diagnostics are not on these lists: a partial
+   ! diagnostic write leaves a fringe the other level reads on its next step.
+   logical, public :: hts_lists_work = .true.
+   integer, parameter :: hts_work_rings = 2
+   integer, public :: hts_nCellsSolve = 0
+   integer, public :: hts_nEdgesSolve = 0
+   integer, public :: hts_nVertices = 0
+   integer, public :: hts_nVerticesSolve = 0
+
+   integer, public :: hts_n_work_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_work_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_active_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_active_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_work_edge_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_work_edge_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_ac_edge(0:hts_level_cap) = 0
+   integer, public :: hts_n_off_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_vert_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_vert_own(0:hts_level_cap) = 0
+   integer, public, allocatable :: hts_work_own(:,:)
+   integer, public, allocatable :: hts_work_all(:,:)
+   integer, public, allocatable :: hts_active_own(:,:)
+   integer, public, allocatable :: hts_active_all(:,:)
+   integer, public, allocatable :: hts_work_edge_own(:,:)
+   integer, public, allocatable :: hts_work_edge_all(:,:)
+   integer, public, allocatable :: hts_ac_edge(:,:)
+   integer, public, allocatable :: hts_off_own(:,:)
+   integer, public, allocatable :: hts_vert_all(:,:)
+   integer, public, allocatable :: hts_vert_own(:,:)
+
    real (kind=R8KIND), allocatable :: hts_flux_sum(:,:)
 
    real (kind=RKIND), allocatable :: snap_rho(:,:,:), delta_rho(:,:,:)
@@ -115,6 +153,8 @@ module mpas_atm_hts
       hts_nCells = nCells
       hts_nEdges = nEdges
       hts_nVert = nVertLevels
+      hts_nCellsSolve = nCellsSolve
+      hts_nEdgesSolve = nEdgesSolve
 
       if (allocated(hts_cell_level)) deallocate(hts_cell_level)
       if (allocated(hts_edge_level)) deallocate(hts_edge_level)
@@ -220,6 +260,8 @@ module mpas_atm_hts
          return
       end if
 
+      call atm_hts_build_lists(block)
+
       allocate(hts_ru_target(nVertLevels, nEdges+1))
       allocate(hts_flux_sum(nVertLevels, nEdges+1))
       hts_ru_target(:, :) = 0.0_RKIND
@@ -284,8 +326,236 @@ module mpas_atm_hts
       if (allocated(snap_u)) deallocate(snap_u)
       if (allocated(delta_u)) deallocate(delta_u)
       if (allocated(hts_level_started)) deallocate(hts_level_started)
+      if (allocated(hts_work_own)) deallocate(hts_work_own)
+      if (allocated(hts_work_all)) deallocate(hts_work_all)
+      if (allocated(hts_active_own)) deallocate(hts_active_own)
+      if (allocated(hts_active_all)) deallocate(hts_active_all)
+      if (allocated(hts_work_edge_own)) deallocate(hts_work_edge_own)
+      if (allocated(hts_work_edge_all)) deallocate(hts_work_edge_all)
+      if (allocated(hts_ac_edge)) deallocate(hts_ac_edge)
+      if (allocated(hts_off_own)) deallocate(hts_off_own)
+      if (allocated(hts_vert_all)) deallocate(hts_vert_all)
+      if (allocated(hts_vert_own)) deallocate(hts_vert_own)
 
    end subroutine atm_hts_finalize
+
+
+   subroutine atm_hts_build_lists(block)
+
+      ! Owned and halo index lists for each level. Cell work lists add
+      ! hts_work_rings neighbor rings so a masked tendency still sees its stencil.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: mesh
+      integer, pointer :: nCells, nCellsSolve, nEdges, nEdgesSolve
+      integer, pointer :: nVertices, nVerticesSolve
+      integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell, verticesOnEdge
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer :: iCell, iEdge, i, iPass, L, nbr, cell1, cell2, v1, v2, coarse
+      integer :: nOwn, nAll, nEOwn, nEAll, nAc, nOff, nVAll, nVOwn, nMiss, nExtra
+      logical, allocatable :: mark(:), mark2(:), edgeMark(:), vertMark(:)
+
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nEdges', nEdges)
+      call mpas_pool_get_dimension(mesh, 'nEdgesSolve', nEdgesSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertices', nVertices)
+      call mpas_pool_get_dimension(mesh, 'nVerticesSolve', nVerticesSolve)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'verticesOnEdge', verticesOnEdge)
+
+      hts_nVertices = nVertices
+      hts_nVerticesSolve = nVerticesSolve
+
+      if (allocated(hts_work_own)) deallocate(hts_work_own)
+      if (allocated(hts_work_all)) deallocate(hts_work_all)
+      if (allocated(hts_active_own)) deallocate(hts_active_own)
+      if (allocated(hts_active_all)) deallocate(hts_active_all)
+      if (allocated(hts_work_edge_own)) deallocate(hts_work_edge_own)
+      if (allocated(hts_work_edge_all)) deallocate(hts_work_edge_all)
+      if (allocated(hts_ac_edge)) deallocate(hts_ac_edge)
+      if (allocated(hts_off_own)) deallocate(hts_off_own)
+      if (allocated(hts_vert_all)) deallocate(hts_vert_all)
+      if (allocated(hts_vert_own)) deallocate(hts_vert_own)
+
+      allocate(hts_work_own(nCells, 0:hts_level_cap))
+      allocate(hts_work_all(nCells, 0:hts_level_cap))
+      allocate(hts_active_own(nCells, 0:hts_level_cap))
+      allocate(hts_active_all(nCells, 0:hts_level_cap))
+      allocate(hts_work_edge_own(nEdges, 0:hts_level_cap))
+      allocate(hts_work_edge_all(nEdges, 0:hts_level_cap))
+      allocate(hts_ac_edge(nEdges, 0:hts_level_cap))
+      allocate(hts_off_own(nCells, 0:hts_level_cap))
+      allocate(hts_vert_all(nVertices, 0:hts_level_cap))
+      allocate(hts_vert_own(nVertices, 0:hts_level_cap))
+      hts_n_work_own = 0
+      hts_n_work_all = 0
+      hts_n_active_own = 0
+      hts_n_active_all = 0
+      hts_n_work_edge_own = 0
+      hts_n_work_edge_all = 0
+      hts_n_ac_edge = 0
+      hts_n_off_own = 0
+      hts_n_vert_all = 0
+      hts_n_vert_own = 0
+
+      allocate(mark(nCells), mark2(nCells), edgeMark(nEdges), vertMark(nVertices))
+
+      call mpas_log_write(' HTS work rings = $i', intArgs=(/hts_work_rings/))
+
+      do L = 0, hts_max_level_used
+         mark(:) = .false.
+         do iCell = 1, nCells
+            if (hts_cell_level(iCell) == L) mark(iCell) = .true.
+         end do
+         if (hts_work_rings <= 0) then
+            do iCell = 1, nCells
+               mark(iCell) = .true.
+            end do
+         else
+            do iPass = 1, hts_work_rings
+               mark2(:) = mark(:)
+               do iCell = 1, nCells
+                  if (.not. mark2(iCell)) cycle
+                  do i = 1, nEdgesOnCell(iCell)
+                     nbr = cellsOnCell(i, iCell)
+                     if (nbr >= 1 .and. nbr <= nCells) mark(nbr) = .true.
+                  end do
+               end do
+            end do
+         end if
+
+         nOwn = 0
+         nAll = 0
+         nOff = 0
+         do iCell = 1, nCells
+            if (hts_cell_level(iCell) == L) then
+               nAll = nAll + 1
+               hts_active_all(nAll, L) = iCell
+               if (iCell <= nCellsSolve) then
+                  nOwn = nOwn + 1
+                  hts_active_own(nOwn, L) = iCell
+               end if
+            else if (iCell <= nCellsSolve) then
+               nOff = nOff + 1
+               hts_off_own(nOff, L) = iCell
+            end if
+         end do
+         hts_n_active_all(L) = nAll
+         hts_n_active_own(L) = nOwn
+         hts_n_off_own(L) = nOff
+
+         nOwn = 0
+         nAll = 0
+         do iCell = 1, nCells
+            if (.not. mark(iCell)) cycle
+            nAll = nAll + 1
+            hts_work_all(nAll, L) = iCell
+            if (iCell <= nCellsSolve) then
+               nOwn = nOwn + 1
+               hts_work_own(nOwn, L) = iCell
+            end if
+         end do
+         hts_n_work_all(L) = nAll
+         hts_n_work_own(L) = nOwn
+
+         edgeMark(:) = .false.
+         nEOwn = 0
+         nEAll = 0
+         nAc = 0
+         do iEdge = 1, nEdges
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 < 1 .or. cell1 > nCells) cell1 = 0
+            if (cell2 < 1 .or. cell2 > nCells) cell2 = 0
+            if ((cell1 > 0 .and. mark(cell1)) .or. (cell2 > 0 .and. mark(cell2))) then
+               edgeMark(iEdge) = .true.
+               nEAll = nEAll + 1
+               hts_work_edge_all(nEAll, L) = iEdge
+               if (iEdge <= nEdgesSolve) then
+                  nEOwn = nEOwn + 1
+                  hts_work_edge_own(nEOwn, L) = iEdge
+               end if
+            end if
+            ! Same edges the acoustic loop updates: any edge touching an owned cell.
+            ! A missing neighbor (the garbage cell) still counts.
+            if (.not. ((cell1 >= 1 .and. cell1 <= nCellsSolve) .or. &
+                       (cell2 >= 1 .and. cell2 <= nCellsSolve))) cycle
+            if (hts_edge_level(iEdge) == L) then
+               nAc = nAc + 1
+               hts_ac_edge(nAc, L) = iEdge
+            else if (hts_edge_interface(iEdge) .and. cell1 >= 1 .and. cell2 >= 1) then
+               coarse = max(hts_cell_level(cell1), hts_cell_level(cell2))
+               if (coarse == L) then
+                  nAc = nAc + 1
+                  hts_ac_edge(nAc, L) = iEdge
+               end if
+            end if
+         end do
+         hts_n_work_edge_all(L) = nEAll
+         hts_n_work_edge_own(L) = nEOwn
+         hts_n_ac_edge(L) = nAc
+
+         vertMark(:) = .false.
+         do iEdge = 1, nEdges
+            if (.not. edgeMark(iEdge)) cycle
+            v1 = verticesOnEdge(1, iEdge)
+            v2 = verticesOnEdge(2, iEdge)
+            if (v1 >= 1 .and. v1 <= nVertices) vertMark(v1) = .true.
+            if (v2 >= 1 .and. v2 <= nVertices) vertMark(v2) = .true.
+         end do
+         nVAll = 0
+         nVOwn = 0
+         do i = 1, nVertices
+            if (.not. vertMark(i)) cycle
+            nVAll = nVAll + 1
+            hts_vert_all(nVAll, L) = i
+            if (i <= nVerticesSolve) then
+               nVOwn = nVOwn + 1
+               hts_vert_own(nVOwn, L) = i
+            end if
+         end do
+         hts_n_vert_all(L) = nVAll
+         hts_n_vert_own(L) = nVOwn
+
+         call mpas_log_write(' level $i index lists: active owned $i, work owned $i, edges $i', &
+                             intArgs=(/L, hts_n_active_own(L), hts_n_work_own(L), hts_n_work_edge_own(L)/))
+
+         ! The acoustic list must be the same edges the unmasked loop would update.
+         ! A raw cell id of 0 passes the original "<= nCellsSolve" test.
+         nMiss = 0
+         nExtra = 0
+         do iEdge = 1, nEdges
+            edgeMark(iEdge) = .false.
+         end do
+         do i = 1, nAc
+            edgeMark(hts_ac_edge(i, L)) = .true.
+         end do
+         do iEdge = 1, nEdges
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve) then
+               if (hts_edge_level(iEdge) == L .and. .not. edgeMark(iEdge)) nMiss = nMiss + 1
+            end if
+            if (edgeMark(iEdge) .and. hts_edge_level(iEdge) == L) then
+               if (.not. (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve)) nExtra = nExtra + 1
+            end if
+         end do
+         if (nMiss > 0 .or. nExtra > 0) then
+            call mpas_log_write(' level $i acoustic list mismatch: missed $i extra $i', &
+                                intArgs=(/L, nMiss, nExtra/), messageType=MPAS_LOG_WARN)
+         end if
+      end do
+
+      deallocate(mark, mark2, edgeMark, vertMark)
+
+   end subroutine atm_hts_build_lists
 
 
    subroutine hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
