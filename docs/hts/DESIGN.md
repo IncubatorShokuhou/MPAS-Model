@@ -266,4 +266,20 @@ Order of work:
 
 The driver lives in `mpas_atm_time_integration.F` (`atm_hts_advance`) so it can call `atm_srk3` without a module cycle. Level assignment, the held snapshot, the flux accumulator, and the mass patch are in `mpas_atm_hts.F`. Halo-group definitions are unchanged.
 
-Out of phase 2: physics coupling, weighted partitions, per-level halo groups, regional LBCs, GPU.
+Out of phase 2 as first written: physics coupling, weighted partitions, per-level halo groups, regional LBCs, GPU. Phase 2b did the weighted partition and the index lists. It left the halo groups as they are. The measurements are in [PHASE2B.md](PHASE2B.md).
+
+## 7. Phase 2b
+
+Phase 2b keeps the held state and the matched acoustic step. It changes where the work is done.
+
+- Tendency, dissipation, acoustic, and damping loops walk a per-level index list (`src/core_atmosphere/dynamics/hts_loops.h`). The work list is the active level plus two cell rings. Diagnostics stay on the full local domain: a masked diagnostic leaves a one-stencil fringe, and the next level's first RK tendency reads that fringe before it recomputes diagnostics. Widening the diagnostic ring moved the error outward. A full diagnostic write reproduces the previous HTS history bit for bit.
+- Halo exchanges stay on the existing full-domain groups. Every rank has to enter every collective. After the partition below, every rank owns every level, so a per-level group would still include every rank. The remaining halo cost is the extra call count.
+- The partition is a METIS multi-constraint graph, one constraint per level. `docs/hts/scripts/hts_partition.py` writes it. MPAS reads the plain `*.part.N` file through `config_block_decomp_file_prefix`.
+
+```
+docs/hts/scripts/hts_partition.py GRID.nc GRAPH.info NPARTS --max-level 1
+```
+
+The script writes `GRAPH.info.htsw` with header `n m 10 ncon` and, on each line, `ncon` positive weights (1000 on the cell's own level, 1 on the others) followed by the original 1-based neighbors. It then runs `gpmetis -ptype=kway GRAPH.info.htsw NPARTS`. Copies of the 4-rank files used for the phase 2b timings are in `docs/hts/partitions/`. The weighted graphs are regenerable and are not committed.
+
+A longer acoustic step on long coarse edges was not added. The interface and the short transition edges do not have the CFL room, and the earlier 60 s acoustic step on `x5.30210` put the `w` peak on the interface.

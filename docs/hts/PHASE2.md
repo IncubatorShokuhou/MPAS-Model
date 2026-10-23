@@ -1,6 +1,6 @@
 # Phase 2 results: dry hierarchical time stepping
 
-Phase 2 stops here. The two-level scheme on `x5.30210` is stable for a day once the coarse level uses the fine acoustic step, mass is conserved at the owned interface edges, and the one-level uniform run is bit-identical to all-fine. It is also slower than all-fine. A third level was not run. Physics stays off.
+Phase 2 stops here. The two-level scheme on `x5.30210` is stable for a day once the coarse level uses the fine acoustic step, mass is conserved at the owned interface edges, and the one-level uniform run is bit-identical to all-fine. It is also slower than all-fine. A third level was not run. Physics stays off. Phase 2b tried to remove that slowdown with index lists and a level-balanced partition; the measured result is in [PHASE2B.md](PHASE2B.md).
 
 All runs below are single precision, gfortran, 4 MPI ranks, OpenMP off, physics suite `none`, `config_split_dynamics_transport = false`, `config_number_of_sub_steps = 6`. The variable mesh is `x5.30210` (30210 cells, `dt = 180 s`). The uniform mesh is `x1.40962` (`dt = 450 s`). Relative L2 is `rms(test − reference) / rms(reference)`.
 
