@@ -23,6 +23,7 @@ module mpas_atm_hts
    public :: atm_hts_begin_intervals, atm_hts_apply_interpolation, atm_hts_restore_above
    public :: atm_hts_sync_finer, atm_hts_accumulate_flux, atm_hts_prepare_targets
    public :: atm_hts_clear_consumed, atm_hts_correct_mass
+   public :: hts_restrict_physics_tendencies
 
    logical, public :: hts_enabled = .false.
    logical, public :: hts_masking = .false.
@@ -259,6 +260,8 @@ module mpas_atm_hts
          call mpas_log_write('HTS enabled with a single level; masked integrator, no subcycling')
          return
       end if
+
+      call mpas_log_write(' column physics rates are kept on the active level; microphysics uses that level dt')
 
       call atm_hts_build_lists(block)
 
@@ -1085,6 +1088,51 @@ module mpas_atm_hts
       end if
 
    end subroutine atm_hts_correct_mass
+
+
+   subroutine hts_restrict_physics_tendencies(tend_ru, tend_rtheta, tend_rho)
+
+      ! physics_driver runs once per fine clock tick and fills every column.
+      ! physics_get_tend then copies those per-second rates into the dynamics
+      ! tendencies, and the RK step multiplies by its own dt. On a multi-level
+      ! step, keep the rates only on the active level so a coarse column is
+      ! not forced on a fine tick and a fine column is not forced again over
+      ! the long step. Single-level and all-fine return without writing.
+
+      implicit none
+
+      real (kind=RKIND), intent(inout) :: tend_ru(:,:)
+      real (kind=RKIND), intent(inout) :: tend_rtheta(:,:)
+      real (kind=RKIND), intent(inout) :: tend_rho(:,:)
+
+      integer :: iCell, iEdge, k, nVert, nCells, nEdges
+
+      if (.not. hts_masking) return
+      if (hts_max_level_used <= 0) return
+      if (.not. allocated(hts_cell_level)) return
+      if (.not. allocated(hts_edge_level)) return
+
+      nVert = size(tend_rho, 1)
+      nCells = min(size(tend_rho, 2), size(hts_cell_level))
+      nEdges = min(size(tend_ru, 2), size(hts_edge_level))
+
+      do iCell = 1, nCells
+         if (hts_cell_level(iCell) == hts_active_level) cycle
+         do k = 1, nVert
+            tend_rtheta(k, iCell) = 0.0_RKIND
+            tend_rho(k, iCell) = 0.0_RKIND
+         end do
+      end do
+
+      nVert = min(nVert, size(tend_ru, 1))
+      do iEdge = 1, nEdges
+         if (hts_edge_level(iEdge) == hts_active_level) cycle
+         do k = 1, nVert
+            tend_ru(k, iEdge) = 0.0_RKIND
+         end do
+      end do
+
+   end subroutine hts_restrict_physics_tendencies
 
 
 end module mpas_atm_hts

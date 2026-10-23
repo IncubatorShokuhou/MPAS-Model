@@ -155,12 +155,13 @@ Scalar mass (when `config_scalar_advection` is true) uses the same `ruAvg`. Phas
 
 Phase 2 leaves physics off (`config_physics_suite = 'none'`), which is the JW configuration.
 
-Phase 3 coupling, once the dry scheme holds mass:
+The coupling that landed with phase 3:
 
-- Column physics has no horizontal neighbors. Call it on a column only on that column's level step, and hold the tendencies for the whole coarse step. The dynamics already holds physics tendencies across one large step, so this matches the current contract at each level.
-- `physics_timetracker` / radiation intervals are time strings on the clock (`config_radtlw_interval` and similar), not step counts. The fine clock must keep advancing by `config_dt` so those alarms stay in seconds. Audit `physics_timetracker` for anything that assumes every column is advanced every call.
-- Microphysics sits at the bottom of `atm_srk3` and must become per-level, same as the dynamics mask.
-- Do not run physics on a coarse column during a fine substep. A coarse tendency applied on a fine tick double-counts.
+- `atm_do_timestep` still calls `physics_timetracker` and `physics_driver` once per fine clock tick, on the whole block, before `atm_hts_advance`. Radiation alarms stay on the fine clock. `config_dt` is unchanged.
+- `physics_get_tend` still runs at the start of every `atm_srk3`, including a coarse level. `hts_restrict_physics_tendencies` then zeros `tend_ru_physics`, `tend_rtheta_physics`, and `tend_rho_physics` off the active level. A coarse column is not forced during a fine RK step, and a fine column is not forced again over `dt * 2^L`. The rate a coarse step integrates is the one `physics_driver` wrote on the latest fine tick, held for that level's dt. All-fine and a single level do not enter the zeroing, so those arrays are untouched.
+- Microphysics still sits at the bottom of `atm_srk3`. On a multi-level step it integrates with that level's dt (`dt_dyn` and `dt_microp` are pushed and popped; Thompson keeps its 90 s split), and the columns it writes that are not on the active level are restored. One level and all-fine call it exactly as before.
+
+Measurements are in [PHASE3.md](PHASE3.md).
 
 ### MPI and halos
 

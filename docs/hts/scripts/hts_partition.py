@@ -23,6 +23,12 @@ The weighted graph header is "n m 10 ncon". Each line is ncon positive integer
 weights followed by the 1-based neighbor ids from graph.info. The cell's own
 level has weight 1000 and every other level has weight 1. METIS rejects a zero
 weight. ncon is the number of levels present (max used level + 1).
+
+`--physics-weight N` adds N to every constraint and adds it again, with the
+dynamics weight, on the cell's own level. N = 0 leaves the graph above unchanged.
+Use it when physics_driver is a large share of the fine step: that driver still
+visits every column on every fine tick, so a uniform physics cost belongs on
+every level constraint.
 """
 
 import argparse
@@ -64,6 +70,9 @@ def main():
     p.add_argument("nparts", type=int)
     p.add_argument("--max-level", type=int, default=1)
     p.add_argument("--weight", type=int, default=1000, help="weight on the cell's own level")
+    p.add_argument("--physics-weight", type=int, default=0,
+                   help="per-cell physics cost added on every level constraint; "
+                        "0 keeps the dynamics-only weights")
     p.add_argument("--gpmetis", default="gpmetis")
     args = p.parse_args()
 
@@ -95,9 +104,17 @@ def main():
     with weighted.open("w") as out:
         # fmt 10: vertex weights present, no edge weights. ncon follows.
         out.write(f"{n} {m} 10 {nlev}\n")
+        if args.physics_weight < 0:
+            raise SystemExit("--physics-weight must be >= 0")
+        # physics_weight == 0 is the phase 2b graph: own level `weight`, every
+        # other level 1. A positive value is the cost of physics_driver, which
+        # still runs on every column on every fine tick. It is added to every
+        # constraint, and the masked dynamics cost stays on the cell's own level.
+        # METIS rejects a zero, so the no-physics other-level weight stays 1.
+        other = args.physics_weight if args.physics_weight > 0 else 1
         for i, adj in enumerate(body):
-            weights = [1] * nlev
-            weights[int(level[i])] = args.weight
+            weights = [other] * nlev
+            weights[int(level[i])] = args.weight + args.physics_weight
             out.write(" ".join(str(w) for w in weights))
             adj = adj.strip()
             if adj:
