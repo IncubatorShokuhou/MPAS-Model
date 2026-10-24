@@ -261,7 +261,7 @@ module mpas_atm_hts
          return
       end if
 
-      call mpas_log_write(' column physics rates are kept on the active level; microphysics uses that level dt')
+      call mpas_log_write(' column physics runs on the active level; microphysics skips the other columns')
 
       call atm_hts_build_lists(block)
 

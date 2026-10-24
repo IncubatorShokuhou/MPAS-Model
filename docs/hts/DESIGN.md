@@ -155,13 +155,14 @@ Scalar mass (when `config_scalar_advection` is true) uses the same `ruAvg`. Phas
 
 Phase 2 leaves physics off (`config_physics_suite = 'none'`), which is the JW configuration.
 
-The coupling that landed with phase 3:
+The coupling that landed with phase 3, and the phase 3b column mask:
 
-- `atm_do_timestep` still calls `physics_timetracker` and `physics_driver` once per fine clock tick, on the whole block, before `atm_hts_advance`. Radiation alarms stay on the fine clock. `config_dt` is unchanged.
-- `physics_get_tend` still runs at the start of every `atm_srk3`, including a coarse level. `hts_restrict_physics_tendencies` then zeros `tend_ru_physics`, `tend_rtheta_physics`, and `tend_rho_physics` off the active level. A coarse column is not forced during a fine RK step, and a fine column is not forced again over `dt * 2^L`. The rate a coarse step integrates is the one `physics_driver` wrote on the latest fine tick, held for that level's dt. All-fine and a single level do not enter the zeroing, so those arrays are untouched.
-- Microphysics still sits at the bottom of `atm_srk3`. On a multi-level step it integrates with that level's dt (`dt_dyn` and `dt_microp` are pushed and popped; Thompson keeps its 90 s split), and the columns it writes that are not on the active level are restored. One level and all-fine call it exactly as before.
+- `physics_timetracker` still runs once per fine clock tick, so radiation and convection alarms stay on the fine clock. On one level and with HTS off, `physics_driver` is still that one full-block call.
+- On a multi-level step the driver moves inside the level loop. It sees only the owned cells of the active level (`column_mask_on`, contiguous runs of that mask). `dt_dyn` for that call is the level dt. A radiation or convection alarm that rings on a tick when a coarser level does not step stays latched until that level steps, so the coarse columns are not dropped. One level never sets the mask, and the driver call is the original its:ite.
+- `physics_get_tend` still runs at the start of every `atm_srk3`. `hts_restrict_physics_tendencies` then zeros `tend_ru_physics`, `tend_rtheta_physics`, and `tend_rho_physics` off the active level. All-fine and a single level do not enter the zeroing.
+- Microphysics still sits at the bottom of `atm_srk3` and uses that level's dt (Thompson keeps its 90 s split). The copy loops and the Kessler column loops skip cells that are not on the active level, so those columns are not integrated and not restored. The scheme is column-local, so the mask is the owned active list and not the dynamics work ring. One level and all-fine leave `column_mask_on` false.
 
-Measurements are in [PHASE3.md](PHASE3.md).
+Measurements are in [PHASE3.md](PHASE3.md) and [PHASE3B.md](PHASE3B.md).
 
 ### MPI and halos
 

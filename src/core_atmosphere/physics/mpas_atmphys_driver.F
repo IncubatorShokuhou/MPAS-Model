@@ -26,6 +26,7 @@
  use mpas_atmphys_sfc_diagnostics,only: atmphys_sfc_diagnostics
  use mpas_atmphys_update
  use mpas_atmphys_vars, only: l_camlw,l_conv,l_radtlw,l_radtsw
+ use mpas_atmphys_column_mask, only: column_mask_next_segment
  use mpas_timer
 
  implicit none
@@ -150,6 +151,8 @@
 
  integer:: time_lev
  integer:: thread
+ integer:: cursor, segS, segE
+ logical:: segFound
 
  integer,pointer:: nThreads
  integer,dimension(:),pointer:: cellSolveThreadStart, cellSolveThreadEnd
@@ -204,20 +207,30 @@
     !physics prep step:
     time_lev = 1
 
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
     do thread=1,nThreads
-       call MPAS_to_physics(block%configs,mesh,state,time_lev,diag,diag_physics, &
-                            cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+       cursor = cellSolveThreadStart(thread)
+       do
+          call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+          if (.not. segFound) exit
+          call MPAS_to_physics(block%configs,mesh,state,time_lev,diag,diag_physics, &
+          segS,segE)
+       end do
     end do
 !$OMP END PARALLEL DO
 
     !call to cloud scheme:
     if(l_radtlw .or. l_radtsw) then
        call allocate_cloudiness
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_cloudiness(block%configs,mesh,diag_physics,sfc_input, &
-                                 cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_cloudiness(block%configs,mesh,diag_physics,sfc_input, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
     endif
@@ -226,11 +239,16 @@
     if(l_radtsw) then
        time_lev = 1
        call allocate_radiation_sw(block%configs,xtime_s)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_radiation_sw(itimestep,block%configs,mesh,state,time_lev,diag_physics, &
-                                   atm_input,sfc_input,tend_physics,xtime_s, &
-                                   cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_radiation_sw(itimestep,block%configs,mesh,state,time_lev,diag_physics, &
+             atm_input,sfc_input,tend_physics,xtime_s, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
     endif
@@ -239,21 +257,31 @@
     if(l_radtlw) then
        time_lev = 1
        call allocate_radiation_lw(block%configs,xtime_s)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_radiation_lw(xtime_s,block%configs,mesh,state,time_lev,diag_physics, &
-                                   atm_input,sfc_input,tend_physics, &
-                                   cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_radiation_lw(xtime_s,block%configs,mesh,state,time_lev,diag_physics, &
+             atm_input,sfc_input,tend_physics, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
     endif
 
     !call to accumulate long- and short-wave diagnostics if needed:
      if(config_bucket_update /= 'none' .and. config_bucket_radt .gt. 0._RKIND) then
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call update_radiation_diagnostics(block%configs,mesh,diag_physics, &
-                                            cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call update_radiation_diagnostics(block%configs,mesh,diag_physics, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
      endif
@@ -267,10 +295,15 @@
     !call to surface-layer scheme:
     if(config_sfclayer_scheme .ne. 'off') then
        call allocate_sfclayer(block%configs)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_sfclayer(itimestep,block%configs,mesh,diag_physics,sfc_input, &
-                               cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_sfclayer(itimestep,block%configs,mesh,diag_physics,sfc_input, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
        call deallocate_sfclayer(block%configs)
@@ -283,46 +316,71 @@
     if(config_lsm_scheme .ne. 'off') then
        if(config_lsm_scheme == 'sf_noah') then
           call allocate_lsm
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
           do thread=1,nThreads
-             call driver_lsm(itimestep,block%configs,mesh,diag_physics,sfc_input, &
-                             cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+             cursor = cellSolveThreadStart(thread)
+             do
+                call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+                if (.not. segFound) exit
+                call driver_lsm(itimestep,block%configs,mesh,diag_physics,sfc_input, &
+                segS,segE)
+             end do
           end do
 !$OMP END PARALLEL DO
        call deallocate_lsm
 
        elseif(config_lsm_scheme == 'sf_noahmp') then
           do thread=1,nThreads
-             call driver_lsm_noahmp(block%configs,mesh,state,time_lev,diag,diag_physics,   &
-                                    diag_physics_noahmp,output_noahmp,sfc_input,itimestep, &
-                                    cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
-          enddo
+             cursor = cellSolveThreadStart(thread)
+             do
+                call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+                if (.not. segFound) exit
+                call driver_lsm_noahmp(block%configs,mesh,state,time_lev,diag,diag_physics,   &
+                diag_physics_noahmp,output_noahmp,sfc_input,itimestep, &
+                segS,segE)
+             end do
+          end do
        endif
 
        call allocate_seaice(block%configs)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_seaice(block%configs,diag_physics,sfc_input, &
-                             cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
-       enddo
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_seaice(block%configs,diag_physics,sfc_input, &
+             segS,segE)
+          end do
+       end do
 !$OMP END PARALLEL DO
        call deallocate_seaice(block%configs)
 
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call atmphys_sfc_diagnostics(block%configs,mesh,diag,diag_physics,sfc_input,output_noahmp, &
-                           cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
-       enddo
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call atmphys_sfc_diagnostics(block%configs,mesh,diag,diag_physics,sfc_input,output_noahmp, &
+             segS,segE)
+          end do
+       end do
 !$OMP END PARALLEL DO
     endif
 
     !call to pbl schemes:
     if(config_pbl_scheme .ne. 'off' .and. config_sfclayer_scheme .ne. 'off') then
        call allocate_pbl(block%configs)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_pbl(itimestep,block%configs,mesh,sfc_input,diag_physics,tend_physics, &
-                          cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_pbl(itimestep,block%configs,mesh,sfc_input,diag_physics,tend_physics, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
        call deallocate_pbl(block%configs)
@@ -332,38 +390,58 @@
     !call to gravity wave drag over orography scheme:
     if(config_gwdo_scheme .ne. 'off') then
        call allocate_gwdo(block%configs)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_gwdo(itimestep,block%configs,mesh,sfc_input,ngw_input,diag_physics,       &
-                           tend_physics,cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_gwdo(itimestep,block%configs,mesh,sfc_input,ngw_input,diag_physics,       &
+             tend_physics,segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
        call deallocate_gwdo(block%configs)
     endif
 
     !call to convection scheme:
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
     do thread=1,nThreads
-       call update_convection_step1(block%configs,diag_physics,tend_physics, &
-                            cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+       cursor = cellSolveThreadStart(thread)
+       do
+          call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+          if (.not. segFound) exit
+          call update_convection_step1(block%configs,diag_physics,tend_physics, &
+          segS,segE)
+       end do
     end do
 !$OMP END PARALLEL DO
     if(l_conv) then
        call allocate_convection(block%configs)
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call driver_convection(itimestep,block%configs,mesh,sfc_input,diag_physics,tend_physics, &
-                                 cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call driver_convection(itimestep,block%configs,mesh,sfc_input,diag_physics,tend_physics, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
        call deallocate_convection(block%configs)
     endif
     !update diagnostics:
     if(config_convection_scheme .ne. 'off') then
-!$OMP PARALLEL DO
+!$OMP PARALLEL DO private(cursor,segS,segE,segFound)
        do thread=1,nThreads
-          call update_convection_step2(block%configs,diag_physics, &
-                               cellSolveThreadStart(thread),cellSolveThreadEnd(thread))
+          cursor = cellSolveThreadStart(thread)
+          do
+             call column_mask_next_segment(cursor, cellSolveThreadEnd(thread), segS, segE, segFound)
+             if (.not. segFound) exit
+             call update_convection_step2(block%configs,diag_physics, &
+             segS,segE)
+          end do
        end do
 !$OMP END PARALLEL DO
     end if

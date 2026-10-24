@@ -29,10 +29,13 @@ module atm_time_integration
 
 #ifdef DO_PHYSICS
    use mpas_atmphys_driver_microphysics
+   use mpas_atmphys_driver, only: physics_driver
+   use mpas_atmphys_control, only: moist_physics
    use mpas_atmphys_interface, only: pre_microphysics, post_microphysics
    use mpas_atmphys_todynamics
    use mpas_atmphys_utilities
-   use mpas_atmphys_vars, only : dt_dyn, dt_microp, n_microp
+   use mpas_atmphys_column_mask, only: column_mask_on, column_active
+   use mpas_atmphys_vars, only : dt_dyn, dt_microp, n_microp, l_radtlw, l_radtsw, l_conv
 #endif
 
    use mpas_atm_boundaries, only : nSpecZone, nRelaxZone, nBdyZone, mpas_atm_get_bdy_state, mpas_atm_get_bdy_tend  ! regional_MPAS addition
@@ -114,25 +117,16 @@ module atm_time_integration
    real (kind=RKIND), parameter, private :: seconds_per_day = 86400.0_RKIND
 
 #ifdef DO_PHYSICS
-   ! Snapshot of the fields microphysics writes, so a level step can update
-   ! its own columns and put every other column back. dt_*_save is the
-   ! fine-step value physics_initialize stored; a coarse step temporarily
-   ! replaces it with that level's dt.
-   real (kind=RKIND), allocatable :: hts_mp_theta(:,:)
-   real (kind=RKIND), allocatable :: hts_mp_scalars(:,:,:)
-   real (kind=RKIND), allocatable :: hts_mp_pressure_p(:,:)
-   real (kind=RKIND), allocatable :: hts_mp_exner(:,:)
-   real (kind=RKIND), allocatable :: hts_mp_rtheta_p(:,:)
-   real (kind=RKIND), allocatable :: hts_mp_diabatic(:,:)
-   real (kind=RKIND), allocatable :: hts_mp_psfc(:)
-   real (kind=RKIND), allocatable :: hts_mp_rainnc(:)
-   real (kind=RKIND), allocatable :: hts_mp_snownc(:)
-   real (kind=RKIND), allocatable :: hts_mp_graupelnc(:)
-   integer, allocatable :: hts_mp_i_rainnc(:)
+   ! dt_*_save is the fine-step value physics_initialize stored. A level
+   ! step temporarily replaces it, then puts the fine value back before
+   ! the dynamics RK so only the physics call sees the level dt.
+   real (kind=RKIND) :: hts_physics_xtime_s = 0.0_RKIND
    real (kind=RKIND) :: hts_mp_dt_dyn_save
    real (kind=RKIND) :: hts_mp_dt_microp_save
    integer :: hts_mp_n_microp_save
-   logical :: hts_mp_have_snow = .false.
+   logical :: hts_radlw_due(0:8) = .false.
+   logical :: hts_radsw_due(0:8) = .false.
+   logical :: hts_conv_due(0:8) = .false.
 #endif
 
 
@@ -1873,7 +1867,13 @@ module atm_time_integration
       hts_active_level = 0
       call atm_hts_apply_interpolation(block, 0)
       call hts_refresh_wind()
+#ifdef DO_PHYSICS
+      call hts_level_column_physics(domain, itimestep, 0, dt)
+#endif
       call atm_srk3(domain, dt, itimestep, exchange_halo_group)
+#ifdef DO_PHYSICS
+      call hts_clear_column_mask()
+#endif
       call atm_hts_restore_above(block, 0)
       call atm_hts_accumulate_flux(block, 0, dt)
 
@@ -1887,7 +1887,13 @@ module atm_time_integration
          hts_impose = .true.
          call atm_hts_apply_interpolation(block, L)
          call hts_refresh_wind()
+#ifdef DO_PHYSICS
+         call hts_level_column_physics(domain, itimestep, L, dt_level)
+#endif
          call atm_srk3(domain, dt_level, itimestep, exchange_halo_group)
+#ifdef DO_PHYSICS
+         call hts_clear_column_mask()
+#endif
          call atm_hts_restore_above(block, L)
          call atm_hts_correct_mass(block, L, dt_level)
          call atm_hts_accumulate_flux(block, L, dt_level)
@@ -2945,12 +2951,10 @@ module atm_time_integration
       MPAS_ACC_TIMER_STOP('atm_srk3: physics ACC_data_xfer')
       !call microphysics schemes:
       if (trim(config_microp_scheme) /= 'off')  then
-        ! On a multi-level step, integrate microphysics for this level's dt
-        ! and restore every column that this step does not own. The fine
-        ! clock still calls physics_driver once per config_dt; this is the
-        ! state update, which has to follow the level that advances the column.
+        ! On a multi-level step the copy loops and Kessler skip columns that
+        ! are not on the active level. dt_dyn for this call is the level dt.
+        ! The mask is set by the level driver and stays on through srk3.
         if (hts_masking .and. hts_max_level_used > 0) then
-           call hts_snapshot_microphysics(state, diag, tend, diag_physics)
            call hts_push_microp_dt(block % configs, dt)
         end if
         call pre_microphysics( block % configs, state, diag, 2)
@@ -2964,7 +2968,6 @@ module atm_time_integration
         call mpas_timer_stop('microphysics')
         call post_microphysics( block % configs, state, diag, tend, 2)
         if (hts_masking .and. hts_max_level_used > 0) then
-           call hts_restore_microphysics_off_level(state, diag, tend, diag_physics)
            call hts_pop_microp_dt()
         end if
       end if
@@ -9258,133 +9261,81 @@ module atm_time_integration
    end subroutine summarize_timestep
 
 #ifdef DO_PHYSICS
-   subroutine hts_snapshot_microphysics(state, diag, tend, diag_physics)
+   subroutine hts_note_physics_alarms()
 
-      ! Copy the prognostic and precipitation fields microphysics overwrites.
-      ! The restore puts back columns that are not on the active level.
-
-      implicit none
-
-      type (mpas_pool_type), intent(in) :: state
-      type (mpas_pool_type), intent(in) :: diag
-      type (mpas_pool_type), intent(in) :: tend
-      type (mpas_pool_type), intent(in) :: diag_physics
-
-      real (kind=RKIND), dimension(:,:), pointer :: theta_m, pressure_p, exner, rtheta_p, rt_diabatic
-      real (kind=RKIND), dimension(:), pointer :: psfc, rainnc, snownc, graupelnc
-      integer, dimension(:), pointer :: i_rainnc
-      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
-      integer :: nVert, nCells, nScalars
-
-      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
-      call mpas_pool_get_array(state, 'scalars', scalars, 2)
-      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
-      call mpas_pool_get_array(diag, 'exner', exner)
-      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
-      call mpas_pool_get_array(diag, 'surface_pressure', psfc)
-      call mpas_pool_get_array(tend, 'rt_diabatic_tend', rt_diabatic)
-
-      nVert = size(theta_m, 1)
-      nCells = size(theta_m, 2)
-      nScalars = size(scalars, 1)
-
-      if (.not. allocated(hts_mp_theta)) then
-         allocate(hts_mp_theta(nVert, nCells))
-         allocate(hts_mp_scalars(nScalars, nVert, nCells))
-         allocate(hts_mp_pressure_p(size(pressure_p, 1), size(pressure_p, 2)))
-         allocate(hts_mp_exner(size(exner, 1), size(exner, 2)))
-         allocate(hts_mp_rtheta_p(size(rtheta_p, 1), size(rtheta_p, 2)))
-         allocate(hts_mp_diabatic(size(rt_diabatic, 1), size(rt_diabatic, 2)))
-         allocate(hts_mp_psfc(size(psfc)))
-      end if
-
-      hts_mp_theta = theta_m
-      hts_mp_scalars = scalars
-      hts_mp_pressure_p = pressure_p
-      hts_mp_exner = exner
-      hts_mp_rtheta_p = rtheta_p
-      hts_mp_diabatic = rt_diabatic
-      hts_mp_psfc = psfc
-
-      nullify(rainnc, snownc, graupelnc, i_rainnc)
-      call mpas_pool_get_array(diag_physics, 'rainnc', rainnc)
-      call mpas_pool_get_array(diag_physics, 'snownc', snownc)
-      call mpas_pool_get_array(diag_physics, 'graupelnc', graupelnc)
-      call mpas_pool_get_array(diag_physics, 'i_rainnc', i_rainnc)
-      if (associated(rainnc)) then
-         if (.not. allocated(hts_mp_rainnc)) allocate(hts_mp_rainnc(size(rainnc)))
-         hts_mp_rainnc = rainnc
-      end if
-      hts_mp_have_snow = associated(snownc) .and. associated(graupelnc)
-      if (hts_mp_have_snow) then
-         if (.not. allocated(hts_mp_snownc)) allocate(hts_mp_snownc(size(snownc)))
-         if (.not. allocated(hts_mp_graupelnc)) allocate(hts_mp_graupelnc(size(graupelnc)))
-         hts_mp_snownc = snownc
-         hts_mp_graupelnc = graupelnc
-      end if
-      if (associated(i_rainnc)) then
-         if (.not. allocated(hts_mp_i_rainnc)) allocate(hts_mp_i_rainnc(size(i_rainnc)))
-         hts_mp_i_rainnc = i_rainnc
-      end if
-
-   end subroutine hts_snapshot_microphysics
-
-
-   subroutine hts_restore_microphysics_off_level(state, diag, tend, diag_physics)
+      ! physics_timetracker already reset the clock alarms for this fine tick.
+      ! A coarser level may not step on this tick. Hold the alarm until it does.
 
       implicit none
 
-      type (mpas_pool_type), intent(in) :: state
-      type (mpas_pool_type), intent(in) :: diag
-      type (mpas_pool_type), intent(in) :: tend
-      type (mpas_pool_type), intent(in) :: diag_physics
+      integer :: L
 
-      real (kind=RKIND), dimension(:,:), pointer :: theta_m, pressure_p, exner, rtheta_p, rt_diabatic
-      real (kind=RKIND), dimension(:), pointer :: psfc, rainnc, snownc, graupelnc
-      integer, dimension(:), pointer :: i_rainnc
-      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
-      integer :: iCell, nCells
-
-      if (.not. allocated(hts_mp_theta)) return
-      if (.not. allocated(hts_cell_level)) return
-
-      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
-      call mpas_pool_get_array(state, 'scalars', scalars, 2)
-      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
-      call mpas_pool_get_array(diag, 'exner', exner)
-      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
-      call mpas_pool_get_array(diag, 'surface_pressure', psfc)
-      call mpas_pool_get_array(tend, 'rt_diabatic_tend', rt_diabatic)
-
-      nullify(rainnc, snownc, graupelnc, i_rainnc)
-      call mpas_pool_get_array(diag_physics, 'rainnc', rainnc)
-      call mpas_pool_get_array(diag_physics, 'snownc', snownc)
-      call mpas_pool_get_array(diag_physics, 'graupelnc', graupelnc)
-      call mpas_pool_get_array(diag_physics, 'i_rainnc', i_rainnc)
-
-      nCells = min(size(theta_m, 2), size(hts_cell_level))
-      do iCell = 1, nCells
-         if (hts_cell_level(iCell) == hts_active_level) cycle
-         theta_m(:, iCell) = hts_mp_theta(:, iCell)
-         scalars(:, :, iCell) = hts_mp_scalars(:, :, iCell)
-         if (iCell <= size(pressure_p, 2)) pressure_p(:, iCell) = hts_mp_pressure_p(:, iCell)
-         if (iCell <= size(exner, 2)) exner(:, iCell) = hts_mp_exner(:, iCell)
-         if (iCell <= size(rtheta_p, 2)) rtheta_p(:, iCell) = hts_mp_rtheta_p(:, iCell)
-         if (iCell <= size(rt_diabatic, 2)) rt_diabatic(:, iCell) = hts_mp_diabatic(:, iCell)
-         if (iCell <= size(psfc)) psfc(iCell) = hts_mp_psfc(iCell)
-         if (associated(rainnc) .and. allocated(hts_mp_rainnc)) then
-            if (iCell <= size(hts_mp_rainnc)) rainnc(iCell) = hts_mp_rainnc(iCell)
-         end if
-         if (hts_mp_have_snow .and. associated(snownc) .and. associated(graupelnc)) then
-            if (iCell <= size(hts_mp_snownc)) snownc(iCell) = hts_mp_snownc(iCell)
-            if (iCell <= size(hts_mp_graupelnc)) graupelnc(iCell) = hts_mp_graupelnc(iCell)
-         end if
-         if (associated(i_rainnc) .and. allocated(hts_mp_i_rainnc)) then
-            if (iCell <= size(hts_mp_i_rainnc)) i_rainnc(iCell) = hts_mp_i_rainnc(iCell)
-         end if
+      do L = 0, hts_max_level_used
+         if (l_radtlw) hts_radlw_due(L) = .true.
+         if (l_radtsw) hts_radsw_due(L) = .true.
+         if (l_conv) hts_conv_due(L) = .true.
       end do
 
-   end subroutine hts_restore_microphysics_off_level
+   end subroutine hts_note_physics_alarms
+
+
+   subroutine hts_level_column_physics(domain, itimestep, level, dt_level)
+
+      ! Run column physics on the owned cells of the active level, with that
+      ! level's dt. The mask stays on so microphysics, later in atm_srk3,
+      ! skips the same columns. dt_dyn is restored before the dynamics RK.
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep, level
+      real (kind=RKIND), intent(in) :: dt_level
+
+      integer :: i, iCell, nCells
+
+      if (.not. allocated(hts_cell_level)) return
+      if (.not. allocated(hts_active_own)) return
+
+      nCells = size(hts_cell_level)
+      if (.not. allocated(column_active)) then
+         allocate(column_active(nCells))
+      else if (size(column_active) /= nCells) then
+         deallocate(column_active)
+         allocate(column_active(nCells))
+      end if
+      column_active(:) = .false.
+      do i = 1, hts_n_active_own(hts_active_level)
+         iCell = hts_active_own(i, hts_active_level)
+         if (iCell >= 1 .and. iCell <= nCells) column_active(iCell) = .true.
+      end do
+      column_mask_on = .true.
+
+      call hts_push_microp_dt(block % configs, dt_level)
+      if (moist_physics) then
+         if (level >= 0 .and. level <= 8) then
+            l_radtlw = hts_radlw_due(level)
+            l_radtsw = hts_radsw_due(level)
+            l_conv = hts_conv_due(level)
+         end if
+         call physics_driver(domain, itimestep, hts_physics_xtime_s)
+         if (level >= 0 .and. level <= 8) then
+            hts_radlw_due(level) = .false.
+            hts_radsw_due(level) = .false.
+            hts_conv_due(level) = .false.
+         end if
+      end if
+      call hts_pop_microp_dt()
+
+   end subroutine hts_level_column_physics
+
+
+   subroutine hts_clear_column_mask()
+
+      implicit none
+
+      column_mask_on = .false.
+
+   end subroutine hts_clear_column_mask
 
 
    subroutine hts_push_microp_dt(configs, dt)
