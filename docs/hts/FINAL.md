@@ -25,35 +25,42 @@ Relative L2 is `rms(test − reference) / rms(reference)` on the last history fr
 | `x4.10242`, 6 h, 3 levels, dry | 1.09×10⁻³ | 0.444 | 1.02×10⁻⁵ | 1.61×10⁻⁵ | −8.04×10⁻¹⁰ | −6.98×10⁻¹¹ |
 | `sp8.24755`, 6 h, 4 levels, dry, `dt = 30` s | 7.89×10⁻⁴ | 0.438 | 3.68×10⁻⁵ | 4.39×10⁻⁶ | −1.27×10⁻⁹ | −7.95×10⁻¹¹ |
 | `sp8.24755`, 1 h, 4 levels, Kessler | 6.16×10⁻⁴ | 0.293 | 8.41×10⁻⁶ | 1.28×10⁻⁵ | −6.89×10⁻¹¹ | −9.60×10⁻¹¹ |
-| `sp8.24755`, 30 min, 4 levels, WSM6 | 3.63×10⁻⁴ | 0.486 | 3.67×10⁻⁶ | 1.03×10⁻⁵ | −7.93×10⁻⁹ | −1.31×10⁻¹⁰ |
+| `sp8.24755`, 30 min, 4 levels, WSM6 | 3.63×10⁻⁴ | 0.486 | 3.67×10⁻⁶ | 1.03×10⁻⁵ | −7.91×10⁻⁹ | −1.31×10⁻¹⁰ |
 | `sp8.24755`, 15 min, 4 levels, Thompson | 2.12×10⁻⁴ | 0.300 | 2.34×10⁻⁶ | 6.20×10⁻⁶ | +4.03×10⁻⁹ | −8.70×10⁻¹¹ |
-| `sp8.24755`, 8 min, 4 levels, RRTMG + YSU + Noah + Kessler | 3.66×10⁻⁴ | 0.267 | 2.24×10⁻⁵ | 1.67×10⁻⁴ | −1.47×10⁻¹⁰ | −5.28×10⁻¹¹ |
+| `sp8.24755`, 8 min, 4 levels, RRTMG + YSU + Noah + Kessler | 3.66×10⁻⁴ | 0.267 | 2.24×10⁻⁵ | 1.67×10⁻⁴ | −1.44×10⁻¹⁰ | −5.28×10⁻¹¹ |
 | `x1.40962` real, 6 h, 1 level, `mesoscale_reference` | 0 | 0 | 0 | 0 | −4.31×10⁻¹¹ | −4.31×10⁻¹¹ |
 
 `w` relative L2 is large because the reference `w` is small (about 10⁻⁴ to 10⁻³ m/s on the dry JW runs). The absolute rms difference on `sp8.24755` at 6 hours is 4.6×10⁻⁴ m/s. The largest piece sits on the interface. `u`, `theta`, and `rho` stay at relative 10⁻⁴, 10⁻⁵, and 10⁻⁶. Dry-mass drift on the fast four-level dry run is 1.27×10⁻⁹. The previous full-domain-diagnostic binary on that same frame was 6.96×10⁻¹⁰, and `u` relative L2 between those two HTS histories is 1.21×10⁻⁵.
+
+The held-state skip below does not move the dry 6-hour or Kessler 1-hour history: both match the previous HTS binary bit for bit on `u`, `w`, `theta`, `rho`, and `pressure`. WSM6, Thompson, and the radiation smoke move against that previous HTS history by `u` relative L2 1.96×10⁻⁶, 1.22×10⁻⁶, and 6.93×10⁻⁷. Against all-fine the three significant figures in the table are unchanged. WSM6 dry-mass drift moves from −7.93×10⁻⁹ to −7.91×10⁻⁹, and the radiation smoke from −1.47×10⁻¹⁰ to −1.44×10⁻¹⁰. Thompson stays at +4.03×10⁻⁹. The all-fine side of every pair matches its previous history bit for bit.
 
 `dt = 60` s on `sp8.24755` is omitted from the table. All-fine finished. Every HTS clamp signaled invalid and overflow. The acoustic step stays the fine step. The comparisons below use `dt = 30` s. The CFL numbers are in the next section.
 
 ## Speed against all-fine
 
-Ratio is all-fine / HTS on `time integration`. Higher than 1 is faster. The `sp8.24755` rows are 4 MPI ranks, OpenMP off, `dt = 30` s, on the diagnostic-ring binary. Earlier binaries are labeled.
+Ratio is all-fine / HTS on `time integration`. Higher than 1 is faster. The `sp8.24755` rows are 4 MPI ranks, OpenMP off, `dt = 30` s. The bold rows are this binary. Earlier binaries are labeled. An all-fine history that matches bit for bit can still move by about 2 s between sittings, so each bold ratio uses the paired run from the same sitting.
 
 | case | all-fine | HTS | ratio |
 | --- | ---: | ---: | ---: |
 | `x5.30210`, 6 h, 2 levels, 55% of cells fine | 25.06 s | 27.34 s | 0.92× |
 | `x4.10242`, 6 h, 3 levels, 49% of cells fine | 3.62 s | 4.25 s | 0.85× |
 | `sp8.24755`, 6 h, dry, phase 2c binary | 127.10 s | 104.05 s | 1.221× |
-| `sp8.24755`, 6 h, dry | 120.66 s | 80.66 s | **1.496×** |
+| `sp8.24755`, 6 h, dry, diagnostic-ring binary | 120.66 s | 80.66 s | 1.496× |
+| `sp8.24755`, 6 h, dry | 122.81 s | 66.50 s | **1.847×** |
 | `sp8.24755`, 1 h, Kessler, phase 3 restore | 23.72 s | 23.04 s | 1.029× |
 | `sp8.24755`, 1 h, Kessler, phase 3b column mask | 23.35 s | 19.02 s | 1.227× |
-| `sp8.24755`, 1 h, Kessler | 22.98 s | 14.35 s | **1.601×** |
+| `sp8.24755`, 1 h, Kessler, diagnostic-ring binary | 22.98 s | 14.35 s | 1.601× |
+| `sp8.24755`, 1 h, Kessler | 23.73 s | 11.69 s | **2.031×** |
 | `sp8.24755`, 30 min, WSM6, phase 3b binary | 15.91 s | 10.65 s | 1.494× |
-| `sp8.24755`, 30 min, WSM6 | 16.15 s | 7.69 s | **2.100×** |
-| `sp8.24755`, 15 min, Thompson | 7.32 s | 3.71 s | **1.971×** |
-| `sp8.24755`, 8 min, RRTMG + YSU + Noah + Kessler | 6.49 s | 4.81 s | **1.349×** |
+| `sp8.24755`, 30 min, WSM6, diagnostic-ring binary | 16.15 s | 7.69 s | 2.100× |
+| `sp8.24755`, 30 min, WSM6 | 16.47 s | 6.42 s | **2.567×** |
+| `sp8.24755`, 15 min, Thompson, diagnostic-ring binary | 7.32 s | 3.71 s | 1.971× |
+| `sp8.24755`, 15 min, Thompson | 7.30 s | 3.04 s | **2.398×** |
+| `sp8.24755`, 8 min, RRTMG + YSU + Noah + Kessler, diagnostic-ring binary | 6.49 s | 4.81 s | 1.349× |
+| `sp8.24755`, 8 min, RRTMG + YSU + Noah + Kessler | 6.64 s | 4.26 s | **1.560×** |
 | `x1.40962` real, 6 h, 1 level, full suite, phase 3 binary | 226.16 s | 218.99 s | bit-identical; the 3% is timer scatter |
 
-Wall (`/usr/bin/time`) on the new `sp8` rows: dry 125.47 s / 85.62 s, Kessler 25.34 s / 16.10 s, WSM6 17.53 s / 9.08 s, Thompson 9.12 s / 5.23 s, radiation 7.58 s / 5.95 s.
+Wall (`/usr/bin/time`, all-fine / HTS) on the bold rows: dry 127.72 s / 71 s, Kessler 25.36 s / 13.54 s, WSM6 17.84 s / 7.83 s, Thompson 8.77 s / 5.18 s, radiation 7.77 s / 5.76 s. The dry HTS wall is the log span (15:27:45 to 15:28:56). The others are `/usr/bin/time`.
 
 ## What the timers paid for
 
@@ -61,19 +68,20 @@ Level 0 is 885 of 24755 cells. The spacing ratio is 10×. The large-step tendenc
 
 | 6 h dry | all-fine | HTS | calls |
 | --- | ---: | ---: | ---: |
-| `atm_compute_dyn_tend` | 56.92 s | 12.14 s | 2160 → 4050 |
-| `atm_compute_solve_diagnostics` | 10.07 s | 2.37 s | 2160 → 4050 |
-| `atm_compute_moist_coefficients` | 0.845 s | 0.181 s | 720 → 1350 |
-| `atm_compute_vert_imp_coefs` | 1.102 s | 0.200 s | 720 → 1350 |
-| `small_step_prep` | 2.775 s | 0.527 s | 2160 → 4050 |
-| `atm_advance_acoustic_step` | 27.15 s | 29.42 s | 8640 → 34560 |
-| `physics_get_tend` | 0.542 s | 0.670 s | 720 → 1350 |
+| `atm_compute_dyn_tend` | 57.63 s | 12.28 s | 2160 → 4050 |
+| `atm_compute_solve_diagnostics` | 10.30 s | 2.47 s | 2160 → 4050 |
+| `atm_compute_moist_coefficients` | 0.866 s | 0.179 s | 720 → 1350 |
+| `atm_compute_vert_imp_coefs` | 1.109 s | 0.207 s | 720 → 1350 |
+| `small_step_prep` | 2.837 s | 0.541 s | 2160 → 4050 |
+| `atm_advance_acoustic_step` | 27.53 s | 28.43 s | 8640 → 34560 |
+| `atm_divergence_damping_3d` | 8.20 s | 8.98 s | 8640 → 34560 |
+| `physics_get_tend` | 0.566 s | 0.638 s | 720 → 1350 |
 
 Diagnostics use four rings (rank 0, level 3: 6127 cells of the local domain; levels 0–2 are a few hundred cells). The previous HTS binary spent 16.56 s in diagnostics on this run. Moist coefficients and the vertical implicit coefficients follow the dynamics work list and the active columns. `physics_get_tend` still zeros the full scalar-tendency array and then fills it. Its 6-hour cost is 0.67 s, so that zero stays full-domain: an off-level leftover would persist into the next level.
 
-The acoustic timer stays near 29 s while the call count quadruples, because the acoustic loop was already on the per-level list and the substep count grows by `2^L` to keep `dts = 5` s. The untied remainder of `time integration`, after every direct child timer, is 5.39 s all-fine and 24.34 s with four levels. Those seconds are the halo exchanges and the HTS driver. Every rank enters every collective on the existing full-domain groups. After the level-balanced partition every rank owns every level, so a per-level group would still include every rank. The acoustic parallel efficiency on this partition is 0.96–0.97. Level weights are already in the graph. A rank that skipped a collective would deadlock, and dropping a rank is not available: every rank owns cells of every level.
+The acoustic timer stays near the all-fine floor while the call count quadruples, because the acoustic loop was already on the per-level list and the substep count grows by `2^L` to keep `dts = 5` s. Divergence damping is the same shape: 8.98 s at 34560 calls against 8.20 s at 8640. Both already walk the active-edge list and then skip an edge whose level is not the active one, so an inactive edge is not updated. The untied remainder of `time integration`, after every direct child timer, is 5.78 s all-fine and 9.51 s with four levels. Those seconds are the halo exchanges. Every rank enters every collective on the existing full-domain groups. After the level-balanced partition every rank owns every level, so a per-level group would still include every rank. The acoustic parallel efficiency on this partition is 0.96–0.97. Level weights are already in the graph. A rank that skipped a collective would deadlock, and dropping a rank is not available: every rank owns cells of every level.
 
-`mp_kessler` on the hour is 1.045 s / 0.158 s = 6.61×. `mp_wsm6` on the half hour is 3.734 s / 0.646 s = 5.78×. Both sit on the 6.10× cell-count ceiling. `mp_thompson` on 15 minutes is 1.060 s / 0.350 s = 3.03×. Thompson keeps its 90 s internal substep, and a 15-minute run is short relative to that split.
+`mp_kessler` on the hour is 1.060 s / 0.153 s = 6.93×. `mp_wsm6` on the half hour is 3.704 s / 0.648 s = 5.72×. Both sit on the 6.10× cell-count ceiling. `mp_thompson` on 15 minutes is 1.051 s / 0.349 s = 3.01×. Thompson keeps its 90 s internal substep, and a 15-minute run is short relative to that split.
 
 ## Thompson
 
@@ -84,11 +92,11 @@ The acoustic timer stays near 29 s while the call count quadruples, because the 
 - `MP_THOMPSON_freezeH2O_DATA.DBL`
 - `MP_THOMPSON_QIautQS_DATA.DBL`
 
-They live outside the repo. The 15-minute smoke is `mp_thompson` with convection, PBL, radiation, the surface layer, and the land model off, the same shape as the Kessler namelist. `qi`, `qs`, and `qg` start at zero. IEEE flags are underflow and denormal. `u` stays about ±35 m/s. Integration is **1.971×**. Dry-mass frame difference is +4.12×10⁻⁹.
+They live outside the repo. The 15-minute smoke is `mp_thompson` with convection, PBL, radiation, the surface layer, and the land model off, the same shape as the Kessler namelist. `qi`, `qs`, and `qg` start at zero. IEEE flags are underflow and denormal. `u` stays about ±35 m/s. Integration is **2.398×**. Dry-mass frame difference is +4.12×10⁻⁹.
 
 ## Radiation and PBL
 
-The JW init for `sp8.24755` has blank land use, `ivgtyp = 0`, `isltyp = 0`, `xland = 0`, `ter = 0`, and `smois = 0`. A copy used for this smoke sets USGS water (`ivgtyp = 16`, `isltyp = 14`, `xland = 2`, `mminlu = 'USGS'`), which matches `iswater_lu = 16` on that file. GWDO stays off because `var2d` is zero. Convection stays off. The schemes that run are `rrtmg_lw`, `rrtmg_sw`, `cld_fraction`, `sf_monin_obukhov_rev`, `sf_noah`, `bl_ysu`, and `mp_kessler`. Radiation interval 30 minutes. Duration 8 minutes, so the t = 0 alarm is the only radiation firing. It is latched until each level steps, then cleared. Shortwave time is 1.585 s in one all-fine call and 1.600 s across the masked segments. `bl_ysu` is 0.570 s / 0.068 s = 8.36×.
+The JW init for `sp8.24755` has blank land use, `ivgtyp = 0`, `isltyp = 0`, `xland = 0`, `ter = 0`, and `smois = 0`. A copy used for this smoke sets USGS water (`ivgtyp = 16`, `isltyp = 14`, `xland = 2`, `mminlu = 'USGS'`), which matches `iswater_lu = 16` on that file. GWDO stays off because `var2d` is zero. Convection stays off. The schemes that run are `rrtmg_lw`, `rrtmg_sw`, `cld_fraction`, `sf_monin_obukhov_rev`, `sf_noah`, `bl_ysu`, and `mp_kessler`. Radiation interval 30 minutes. Duration 8 minutes, so the t = 0 alarm is the only radiation firing. It is latched until each level steps, then cleared. Shortwave time is 1.606 s in one all-fine call and 1.613 s across the masked segments. `bl_ysu` is 0.589 s / 0.067 s = 8.84×.
 
 The lowest-layer `theta` on levels 0–2 matches all-fine to about 0.001 K. On level 3 the same layer warms by a mean of 0.266 K (HTS) and 0.299 K (all-fine). The mean difference is −0.034 K and the maximum is 0.38 K, on cells thousands of kilometres from the fine patch. Both runs warm that layer because the filled water static has zero soil moisture. Setting `dt_pbl` to the level `dt` (240 s on level 3) raised that mean difference to 0.093 K and the maximum to 0.44 K on the same pair, so `dt_pbl` stays at the fine step stored at initialization. YSU, Noah, sea ice, and GWDO return a rate normalized by that `dt`, and the level RK multiplies the stored rate by `dt_level`.
 
@@ -102,7 +110,15 @@ Fusing the two layer-1 fields into one `mpas_halo` group is bit-identical on the
 
 Packing only the halo cells an active-level edge reads does cut the bytes. On this 4-rank partition the layer-1 halo is 312–355 cells per rank. The active-edge subset, summed across ranks, is 149, 50, 31, and 1096 cells on levels 0–3. Each level does the same number of acoustic substeps, so the packed volume is a quarter of exchanging the full halo every substep. A timer on that exchange recorded 4.08 s over 69120 calls. Integration was 79.68 s (wall 84.76 s) and the paired all-fine run was 122.82 s (wall 127.68 s). The previous four-level integration was 80.66 s, and all-fine moved from 120.66 s to 122.82 s between sittings, so the 1 s change sits in the timer scatter. The 6-hour state is not the previous HTS history: `u` relative L2 1.29×10⁻⁵, `w` 1.17×10⁻², `theta` 5.92×10⁻⁷, `rho` 3.07×10⁻⁷. Against all-fine on the same binary the dry errors stay at the published values (`u` 7.89×10⁻⁴). The subset exchange was removed with the fused group.
 
-Splitting that timer out left 18.4 s of `time integration` with no child timer, against 24.3 s when the acoustic exchanges were inside the remainder. About 6 s of the old remainder was the acoustic halo. The 18 s is the coarse-state hold. `atm_hts_apply_interpolation` and `atm_hts_restore_above` rewrite every coarser column on each fine step, and `hts_refresh_wind` reconstructs the cell wind. The hold is what stops a fine step from feeding a coarse acoustic transient back into the interface flux. The acoustic compute on the same run is 29.8 s and the 3-d divergence damping is 9.0 s, at 34560 calls, because `dts` stays 5 s.
+Splitting that timer out left 18.4 s of `time integration` with no child timer, against 24.3 s when the acoustic exchanges were inside the remainder. About 6 s of the old remainder was the acoustic halo. The other 18 s was the coarse-state hold. `atm_hts_apply_interpolation` and `atm_hts_restore_above` rewrote every coarser column on each fine step, and `hts_refresh_wind` called `mpas_reconstruct` on the owned domain. Over 6 hours that reconstruction ran once before each of the 2070 level steps and once at the end of every `atm_srk3`.
+
+The value written by the hold is the start-of-interval snapshot (`alpha = 0`). Extrapolating the previous increment fed a coarse acoustic transient back into the interface flux, and that stays out. After the snapshot is written, both time levels match it and stay matched across the time-level shift until that level steps. A finer step does not write those prognostic fields. Copying the snapshot in again is a no-op, so a level with `hts_hold_valid` set is skipped. The flag is cleared only when that level steps, and the next fine step copies the new snapshot into both time levels once per level interval. Cells are written before edges so an edge density sees the updated columns.
+
+The cell wind follows the same rule. `hts_refresh_wind` reconstructs only the owned cells incident to an edge that level just rewrote. The end-of-`atm_srk3` reconstruct on the HTS path does the same for the active level. Cells whose edges did not change keep the previous reconstruction, which is what a full-domain call would have written. The non-HTS path, and a one-level run, still call `mpas_reconstruct` on the owned domain.
+
+On the 6-hour dry run the new timers are `hts_begin_intervals` 0.151 s (720 calls), `hts_apply_interpolation` 0.518 s (1260), `hts_refresh_wind` 0.259 s (360), `hts_restore_above` 0.000 s (1260), and `hts_reconstruct_wind` 0.374 s (1350). Integration is 66.50 s. The dry and Kessler histories match the previous HTS binary bit for bit.
+
+The acoustic step still had one full-domain copy: `rtheta_pp_old` on every cell, and a first-small-step zero of `rho_pp`, `rtheta_pp`, and `rw_p` on every inactive owned cell. Divergence damping reads `rtheta_pp_old` only on the two cells of each active edge, so both loops now walk that cell list. Acoustic time went from 29.42 s to 28.43 s. Damping stayed at 8.98 s. Dropping the damping or the acoustic update on those edges would change the fine-edge flux, and `dts` is already the fine step, so that compute stays. The untied remainder is 9.51 s, down from 24.3 s, and what remains of it is the full-domain halo.
 
 ## Safe step
 
@@ -118,6 +134,6 @@ Uniform 120 km, physics suite `none`, 10 steps, `dt = 450` s. HTS on, HTS off, a
 
 ## Bottom line
 
-On `sp8.24755` at `dt = 30` s, four levels, this binary is **1.496×** dry (6 h), **1.601×** Kessler (1 h), **2.100×** WSM6 (30 min), **1.971×** Thompson (15 min), and **1.349×** for an 8-minute RRTMG/YSU/Noah/Kessler smoke. The one-level and HTS-off histories match bit for bit. The acoustic step stays the fine step, because `dt = 60` s overflows on this mesh while the linear CFL stays small. Of the 80.7 s dry integration, the acoustic update is 29.4 s, the divergence damping is 9.0 s, and the coarse-state hold is about 18 s. The per-substep halo around that acoustic step is about 6 s. Fusing the two acoustic messages made the run slower, and packing only the active-edge halo cells saved about 1 s while moving the 6-hour state by `u` relative L2 1.3×10⁻⁵, so both stayed out of the tree. A land-surface variable-resolution forecast is out of reach on this machine. The JW static for this mesh has blank land use and zero orography, so the radiation smoke used a USGS-water fill and left GWDO and convection off.
+On `sp8.24755` at `dt = 30` s, four levels, this binary is **1.847×** dry (6 h), **2.031×** Kessler (1 h), **2.567×** WSM6 (30 min), **2.398×** Thompson (15 min), and **1.560×** for an 8-minute RRTMG/YSU/Noah/Kessler smoke. The one-level and HTS-off histories match bit for bit. The dry 6-hour and Kessler histories also match the previous HTS binary bit for bit. WSM6, Thompson, and the radiation smoke move against that previous HTS history by `u` relative L2 of about 10⁻⁶, and the vs-all-fine figures stay at the values in the table. The acoustic step stays the fine step, because `dt = 60` s overflows on this mesh while the linear CFL stays small. Of the 66.5 s dry integration, the acoustic update is 28.4 s and the divergence damping is 9.0 s, both within about 1 s of the all-fine cost of the same loops, because `dts` stays 5 s and both already walk the active-edge list. The coarse-state hold is 1.3 s. The per-substep halo around the acoustic step is about 6 s and sits in the 9.5 s untied remainder. Fusing the two acoustic messages made the run slower, and packing only the active-edge halo cells saved about 1 s while moving the 6-hour state by `u` relative L2 1.3×10⁻⁵, so both stayed out of the tree. A land-surface variable-resolution forecast is out of reach on this machine. The JW static for this mesh has blank land use and zero orography, so the radiation smoke used a USGS-water fill and left GWDO and convection off.
 
 `src/core_atmosphere/dynamics/Makefile` depends `mpas_atm_dissipation_models.o` on `mpas_atm_hts.o`, so a parallel `make` builds `mpas_atm_hts.mod` first. `manage_externals` skips `git remote add` when that remote name is already present, so a second `make` does not stop on "remote already exists".

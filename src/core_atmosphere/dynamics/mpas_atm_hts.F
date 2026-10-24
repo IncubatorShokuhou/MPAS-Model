@@ -16,6 +16,7 @@ module mpas_atm_hts
    use mpas_dmpar
    use mpas_log
    use mpas_constants
+   use mpas_timer, only: mpas_timer_start, mpas_timer_stop
 
    implicit none
 
@@ -72,6 +73,14 @@ module mpas_atm_hts
    integer, public :: hts_n_diag_all(0:hts_level_cap) = 0
    integer, public :: hts_n_diag_edge_all(0:hts_level_cap) = 0
    integer, public :: hts_n_diag_vert_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_level_edge(0:hts_level_cap) = 0
+   integer, public :: hts_n_ac_cell(0:hts_level_cap) = 0
+   integer, public :: hts_n_recon_own(0:hts_level_cap) = 0
+   ! True once a level's state arrays already hold its snapshot. The next
+   ! fine step does not rewrite that level. A level step clears the flag so
+   ! the following fine step copies the new snapshot into both time levels.
+   logical, public :: hts_hold_valid(0:hts_level_cap) = .false.
+   logical, public :: hts_hold_rewrote(0:hts_level_cap) = .false.
    integer, public, allocatable :: hts_work_own(:,:)
    integer, public, allocatable :: hts_work_all(:,:)
    integer, public, allocatable :: hts_active_own(:,:)
@@ -85,6 +94,9 @@ module mpas_atm_hts
    integer, public, allocatable :: hts_diag_all(:,:)
    integer, public, allocatable :: hts_diag_edge_all(:,:)
    integer, public, allocatable :: hts_diag_vert_all(:,:)
+   integer, public, allocatable :: hts_level_edge(:,:)
+   integer, public, allocatable :: hts_ac_cell(:,:)
+   integer, public, allocatable :: hts_recon_own(:,:)
 
    real (kind=R8KIND), allocatable :: hts_flux_sum(:,:)
 
@@ -131,6 +143,8 @@ module mpas_atm_hts
       hts_max_level_used = 0
       hts_correct_logs = 0
       hts_max_flux_resid = 0.0_RKIND
+      hts_hold_valid(:) = .false.
+      hts_hold_rewrote(:) = .false.
 
       block => domain % blocklist
       nBlocks = 0
@@ -350,6 +364,9 @@ module mpas_atm_hts
       if (allocated(hts_diag_all)) deallocate(hts_diag_all)
       if (allocated(hts_diag_edge_all)) deallocate(hts_diag_edge_all)
       if (allocated(hts_diag_vert_all)) deallocate(hts_diag_vert_all)
+      if (allocated(hts_level_edge)) deallocate(hts_level_edge)
+      if (allocated(hts_ac_cell)) deallocate(hts_ac_cell)
+      if (allocated(hts_recon_own)) deallocate(hts_recon_own)
 
    end subroutine atm_hts_finalize
 
@@ -370,6 +387,7 @@ module mpas_atm_hts
       integer, dimension(:), pointer :: nEdgesOnCell
       integer :: iCell, iEdge, i, iPass, iVertex, L, nbr, cell1, cell2, v1, v2, coarse
       integer :: nOwn, nAll, nEOwn, nEAll, nAc, nOff, nVAll, nVOwn, nMiss, nExtra
+      logical :: edgeUpdated
       logical, allocatable :: mark(:), mark2(:), edgeMark(:), vertMark(:)
 
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
@@ -402,6 +420,9 @@ module mpas_atm_hts
       if (allocated(hts_diag_all)) deallocate(hts_diag_all)
       if (allocated(hts_diag_edge_all)) deallocate(hts_diag_edge_all)
       if (allocated(hts_diag_vert_all)) deallocate(hts_diag_vert_all)
+      if (allocated(hts_level_edge)) deallocate(hts_level_edge)
+      if (allocated(hts_ac_cell)) deallocate(hts_ac_cell)
+      if (allocated(hts_recon_own)) deallocate(hts_recon_own)
 
       allocate(hts_work_own(nCells, 0:hts_level_cap))
       allocate(hts_work_all(nCells, 0:hts_level_cap))
@@ -416,6 +437,9 @@ module mpas_atm_hts
       allocate(hts_diag_all(nCells, 0:hts_level_cap))
       allocate(hts_diag_edge_all(nEdges, 0:hts_level_cap))
       allocate(hts_diag_vert_all(nVertices, 0:hts_level_cap))
+      allocate(hts_level_edge(nEdges, 0:hts_level_cap))
+      allocate(hts_ac_cell(nCells, 0:hts_level_cap))
+      allocate(hts_recon_own(nCells, 0:hts_level_cap))
       hts_n_work_own = 0
       hts_n_work_all = 0
       hts_n_active_own = 0
@@ -429,6 +453,9 @@ module mpas_atm_hts
       hts_n_diag_all = 0
       hts_n_diag_edge_all = 0
       hts_n_diag_vert_all = 0
+      hts_n_level_edge = 0
+      hts_n_ac_cell = 0
+      hts_n_recon_own = 0
 
       allocate(mark(nCells), mark2(nCells), edgeMark(nEdges), vertMark(nVertices))
 
@@ -643,6 +670,76 @@ module mpas_atm_hts
             call mpas_log_write(' level $i acoustic list mismatch: missed $i extra $i', &
                                 intArgs=(/L, nMiss, nExtra/), messageType=MPAS_LOG_WARN)
          end if
+
+         nEAll = 0
+         do iEdge = 1, nEdges
+            if (hts_edge_level(iEdge) /= L) cycle
+            nEAll = nEAll + 1
+            hts_level_edge(nEAll, L) = iEdge
+         end do
+         hts_n_level_edge(L) = nEAll
+
+         ! Cells an acoustic edge reads. The per-substep rtheta_pp_old copy and
+         ! the inactive perturbation clear use this set instead of every cell.
+         mark(:) = .false.
+         nAll = 0
+         do i = 1, nAc
+            iEdge = hts_ac_edge(i, L)
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 >= 1 .and. cell1 <= nCells) then
+               if (.not. mark(cell1)) then
+                  mark(cell1) = .true.
+                  nAll = nAll + 1
+                  hts_ac_cell(nAll, L) = cell1
+               end if
+            end if
+            if (cell2 >= 1 .and. cell2 <= nCells) then
+               if (.not. mark(cell2)) then
+                  mark(cell2) = .true.
+                  nAll = nAll + 1
+                  hts_ac_cell(nAll, L) = cell2
+               end if
+            end if
+         end do
+         hts_n_ac_cell(L) = nAll
+
+         ! Owned cells whose reconstructed wind changes when this level updates
+         ! an edge. Halo edges of this level are included: the exchange has
+         ! already filled them before the reconstruction.
+         mark(:) = .false.
+         nOwn = 0
+         do iEdge = 1, nEdges
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (.not. ((cell1 >= 1 .and. cell1 <= nCellsSolve) .or. &
+                       (cell2 >= 1 .and. cell2 <= nCellsSolve))) cycle
+            edgeUpdated = hts_edge_level(iEdge) == L
+            if (hts_edge_interface(iEdge) .and. cell1 >= 1 .and. cell1 <= nCells .and. &
+                cell2 >= 1 .and. cell2 <= nCells) then
+               if (max(hts_cell_level(cell1), hts_cell_level(cell2)) == L .and. &
+                   hts_edge_level(iEdge) < L) edgeUpdated = .true.
+            end if
+            if (.not. edgeUpdated) cycle
+            if (cell1 >= 1 .and. cell1 <= nCellsSolve) then
+               if (.not. mark(cell1)) then
+                  mark(cell1) = .true.
+                  nOwn = nOwn + 1
+                  hts_recon_own(nOwn, L) = cell1
+               end if
+            end if
+            if (cell2 >= 1 .and. cell2 <= nCellsSolve) then
+               if (.not. mark(cell2)) then
+                  mark(cell2) = .true.
+                  nOwn = nOwn + 1
+                  hts_recon_own(nOwn, L) = cell2
+               end if
+            end if
+         end do
+         hts_n_recon_own(L) = nOwn
+
+         call mpas_log_write(' level $i hold lists: edges $i, acoustic cells $i, recon owned $i', &
+                             intArgs=(/L, hts_n_level_edge(L), hts_n_ac_cell(L), hts_n_recon_own(L)/))
       end do
 
       deallocate(mark, mark2, edgeMark, vertMark)
@@ -733,9 +830,11 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
       real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
-      integer :: L, iCell, iEdge, k, ratio
+      integer :: L, i, iCell, iEdge, k, ratio
 
       if (hts_max_level_used < 1) return
+
+      call mpas_timer_start('hts_begin_intervals')
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -747,8 +846,8 @@ module mpas_atm_hts
          if (mod(hts_tick, ratio) /= 0) cycle
 
          if (.not. hts_level_started(L)) then
-            do iCell = 1, hts_nCells
-               if (hts_cell_level(iCell) /= L) cycle
+            do i = 1, hts_n_active_all(L)
+               iCell = hts_active_all(i, L)
                do k = 1, hts_nVert
                   snap_rho(k, iCell, L) = rho1(k, iCell)
                   snap_theta(k, iCell, L) = th1(k, iCell)
@@ -762,8 +861,8 @@ module mpas_atm_hts
                   delta_rw(k, iCell, L) = 0.0_RKIND
                end do
             end do
-            do iEdge = 1, hts_nEdges
-               if (hts_edge_level(iEdge) /= L) cycle
+            do i = 1, hts_n_level_edge(L)
+               iEdge = hts_level_edge(i, L)
                do k = 1, hts_nVert
                   snap_u(k, iEdge, L) = u1(k, iEdge)
                   delta_u(k, iEdge, L) = 0.0_RKIND
@@ -771,8 +870,8 @@ module mpas_atm_hts
             end do
             hts_level_started(L) = .true.
          else
-            do iCell = 1, hts_nCells
-               if (hts_cell_level(iCell) /= L) cycle
+            do i = 1, hts_n_active_all(L)
+               iCell = hts_active_all(i, L)
                do k = 1, hts_nVert
                   delta_rho(k, iCell, L) = rho1(k, iCell) - snap_rho(k, iCell, L)
                   delta_theta(k, iCell, L) = th1(k, iCell) - snap_theta(k, iCell, L)
@@ -786,8 +885,8 @@ module mpas_atm_hts
                   snap_rw(k, iCell, L) = rw(k, iCell)
                end do
             end do
-            do iEdge = 1, hts_nEdges
-               if (hts_edge_level(iEdge) /= L) cycle
+            do i = 1, hts_n_level_edge(L)
+               iEdge = hts_level_edge(i, L)
                do k = 1, hts_nVert
                   delta_u(k, iEdge, L) = u1(k, iEdge) - snap_u(k, iEdge, L)
                   snap_u(k, iEdge, L) = u1(k, iEdge)
@@ -795,6 +894,8 @@ module mpas_atm_hts
             end do
          end if
       end do
+
+      call mpas_timer_stop('hts_begin_intervals')
 
    end subroutine atm_hts_begin_intervals
 
@@ -812,10 +913,25 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
       type (mpas_pool_type), pointer :: mesh
-      integer :: L, iCell, iEdge, k, cell1, cell2
+      integer :: L, i, iCell, iEdge, k, cell1, cell2
       real (kind=RKIND) :: alpha, rho_here, th_here, u_here
+      logical :: any
 
       if (hts_max_level_used <= activeLevel) return
+
+      call mpas_timer_start('hts_apply_interpolation')
+
+      ! A level whose state already matches its snapshot is left alone. The
+      ! fine step does not write that level's prognostic fields, and the time
+      ! levels stay equal across the shift until the level itself steps.
+      any = .false.
+      do L = activeLevel + 1, hts_max_level_used
+         if (.not. hts_hold_valid(L)) any = .true.
+      end do
+      if (.not. any) then
+         call mpas_timer_stop('hts_apply_interpolation')
+         return
+      end if
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -827,11 +943,13 @@ module mpas_atm_hts
       ! Hold coarser levels at the start-of-interval snapshot while a finer
       ! level steps. Extrapolating the previous increment fed the coarse
       ! acoustic transient back into the fine flux and the next coarse step
-      ! amplified it.
+      ! amplified it. Cells are written before edges so an edge density sees
+      ! both columns.
+      alpha = 0.0_RKIND
       do L = activeLevel + 1, hts_max_level_used
-         alpha = 0.0_RKIND
-         do iCell = 1, hts_nCells
-            if (hts_cell_level(iCell) /= L) cycle
+         if (hts_hold_valid(L)) cycle
+         do i = 1, hts_n_active_all(L)
+            iCell = hts_active_all(i, L)
             do k = 1, hts_nVert
                rho_here = snap_rho(k, iCell, L) + alpha * delta_rho(k, iCell, L)
                th_here = snap_theta(k, iCell, L) + alpha * delta_theta(k, iCell, L)
@@ -853,21 +971,26 @@ module mpas_atm_hts
             end do
          end do
       end do
-      do iEdge = 1, hts_nEdges
-         L = hts_edge_level(iEdge)
-         if (L <= activeLevel .or. L > hts_max_level_used) cycle
-         alpha = 0.0_RKIND
-         cell1 = cellsOnEdge(1, iEdge)
-         cell2 = cellsOnEdge(2, iEdge)
-         do k = 1, hts_nVert
-            u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
-            u1(k, iEdge) = u_here
-            u2(k, iEdge) = u_here
-            ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
-            ru_save(k, iEdge) = ru(k, iEdge)
-            rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+      do L = activeLevel + 1, hts_max_level_used
+         if (hts_hold_valid(L)) cycle
+         do i = 1, hts_n_level_edge(L)
+            iEdge = hts_level_edge(i, L)
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            do k = 1, hts_nVert
+               u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+               u1(k, iEdge) = u_here
+               u2(k, iEdge) = u_here
+               ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
+               ru_save(k, iEdge) = ru(k, iEdge)
+               rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+            end do
          end do
+         hts_hold_valid(L) = .true.
+         hts_hold_rewrote(L) = .true.
       end do
+
+      call mpas_timer_stop('hts_apply_interpolation')
 
    end subroutine atm_hts_apply_interpolation
 
@@ -885,9 +1008,23 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
       type (mpas_pool_type), pointer :: mesh
-      integer :: L, iCell, iEdge, k, cell1, cell2
+      integer :: L, i, iCell, iEdge, k, cell1, cell2
+      logical :: any
 
       if (hts_max_level_used <= activeLevel) return
+
+      call mpas_timer_start('hts_restore_above')
+
+      ! The active step writes its own columns. Levels that still match their
+      ! snapshot were not written, so putting the snapshot back is a no-op.
+      any = .false.
+      do L = activeLevel + 1, hts_max_level_used
+         if (.not. hts_hold_valid(L)) any = .true.
+      end do
+      if (.not. any) then
+         call mpas_timer_stop('hts_restore_above')
+         return
+      end if
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -897,8 +1034,9 @@ module mpas_atm_hts
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
 
       do L = activeLevel + 1, hts_max_level_used
-         do iCell = 1, hts_nCells
-            if (hts_cell_level(iCell) /= L) cycle
+         if (hts_hold_valid(L)) cycle
+         do i = 1, hts_n_active_all(L)
+            iCell = hts_active_all(i, L)
             do k = 1, hts_nVert
                rho1(k, iCell) = snap_rho(k, iCell, L)
                rho2(k, iCell) = snap_rho(k, iCell, L)
@@ -918,19 +1056,25 @@ module mpas_atm_hts
             end do
          end do
       end do
-      do iEdge = 1, hts_nEdges
-         L = hts_edge_level(iEdge)
-         if (L <= activeLevel .or. L > hts_max_level_used) cycle
-         cell1 = cellsOnEdge(1, iEdge)
-         cell2 = cellsOnEdge(2, iEdge)
-         do k = 1, hts_nVert
-            u1(k, iEdge) = snap_u(k, iEdge, L)
-            u2(k, iEdge) = snap_u(k, iEdge, L)
-            ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * snap_u(k, iEdge, L)
-            ru_save(k, iEdge) = ru(k, iEdge)
-            rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+      do L = activeLevel + 1, hts_max_level_used
+         if (hts_hold_valid(L)) cycle
+         do i = 1, hts_n_level_edge(L)
+            iEdge = hts_level_edge(i, L)
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            do k = 1, hts_nVert
+               u1(k, iEdge) = snap_u(k, iEdge, L)
+               u2(k, iEdge) = snap_u(k, iEdge, L)
+               ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * snap_u(k, iEdge, L)
+               ru_save(k, iEdge) = ru(k, iEdge)
+               rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+            end do
          end do
+         hts_hold_valid(L) = .true.
+         hts_hold_rewrote(L) = .true.
       end do
+
+      call mpas_timer_stop('hts_restore_above')
 
    end subroutine atm_hts_restore_above
 

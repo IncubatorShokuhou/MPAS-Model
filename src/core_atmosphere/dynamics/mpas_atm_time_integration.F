@@ -1815,16 +1815,31 @@ module atm_time_integration
    end subroutine mpas_atm_dynamics_finalize
 
 
-   subroutine hts_refresh_wind()
+   subroutine hts_reconstruct_owned(level)
 
-      ! Rebuild cell-centered winds from the current time-level-2 edge velocity.
+      ! Same radial-basis reconstruction as mpas_reconstruct, on the owned cells
+      ! whose edges this level updates. Cells outside that set keep the value
+      ! from the last time their edges changed.
 
       implicit none
+
+      integer, intent(in) :: level
 
       type (mpas_pool_type), pointer :: state, diag, mesh
       real (kind=RKIND), dimension(:,:), pointer :: u
       real (kind=RKIND), dimension(:,:), pointer :: uReconstructX, uReconstructY, uReconstructZ
       real (kind=RKIND), dimension(:,:), pointer :: uReconstructZonal, uReconstructMeridional
+      real (kind=RKIND), dimension(:,:,:), pointer :: coeffs_reconstruct
+      real (kind=RKIND), dimension(:), pointer :: latCell, lonCell
+      integer, dimension(:,:), pointer :: edgesOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      logical, pointer :: on_a_sphere
+      integer :: i, iCell, iEdge, k, nVertLevels
+      integer, pointer :: nVertLevels_ptr
+      real (kind=RKIND) :: clat, slat, clon, slon
+
+      if (level < 0 .or. level > hts_max_level_used) return
+      if (.not. allocated(hts_recon_own)) return
 
       call mpas_pool_get_subpool(block % structs, 'state', state)
       call mpas_pool_get_subpool(block % structs, 'diag', diag)
@@ -1835,8 +1850,87 @@ module atm_time_integration
       call mpas_pool_get_array(diag, 'uReconstructZ', uReconstructZ)
       call mpas_pool_get_array(diag, 'uReconstructZonal', uReconstructZonal)
       call mpas_pool_get_array(diag, 'uReconstructMeridional', uReconstructMeridional)
-      call mpas_reconstruct(mesh, u, uReconstructX, uReconstructY, uReconstructZ, &
-                            uReconstructZonal, uReconstructMeridional, lACC=.true.)
+      call mpas_pool_get_array(mesh, 'coeffs_reconstruct', coeffs_reconstruct)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'latCell', latCell)
+      call mpas_pool_get_array(mesh, 'lonCell', lonCell)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels_ptr)
+      call mpas_pool_get_config(mesh, 'on_a_sphere', on_a_sphere)
+      nVertLevels = nVertLevels_ptr
+
+      do i = 1, hts_n_recon_own(level)
+         iCell = hts_recon_own(i, level)
+         do k = 1, nVertLevels
+            uReconstructX(k, iCell) = 0.0_RKIND
+            uReconstructY(k, iCell) = 0.0_RKIND
+            uReconstructZ(k, iCell) = 0.0_RKIND
+         end do
+         do iEdge = 1, nEdgesOnCell(iCell)
+            do k = 1, nVertLevels
+               uReconstructX(k, iCell) = uReconstructX(k, iCell) &
+                  + coeffs_reconstruct(1, iEdge, iCell) * u(k, edgesOnCell(iEdge, iCell))
+               uReconstructY(k, iCell) = uReconstructY(k, iCell) &
+                  + coeffs_reconstruct(2, iEdge, iCell) * u(k, edgesOnCell(iEdge, iCell))
+               uReconstructZ(k, iCell) = uReconstructZ(k, iCell) &
+                  + coeffs_reconstruct(3, iEdge, iCell) * u(k, edgesOnCell(iEdge, iCell))
+            end do
+         end do
+      end do
+
+      if (on_a_sphere) then
+         do i = 1, hts_n_recon_own(level)
+            iCell = hts_recon_own(i, level)
+            clat = cos(latCell(iCell))
+            slat = sin(latCell(iCell))
+            clon = cos(lonCell(iCell))
+            slon = sin(lonCell(iCell))
+            do k = 1, nVertLevels
+               uReconstructZonal(k, iCell) = -uReconstructX(k, iCell)*slon + &
+                                              uReconstructY(k, iCell)*clon
+               uReconstructMeridional(k, iCell) = -(uReconstructX(k, iCell)*clon &
+                                                  + uReconstructY(k, iCell)*slon)*slat &
+                                                  + uReconstructZ(k, iCell)*clat
+            end do
+         end do
+      else
+         do i = 1, hts_n_recon_own(level)
+            iCell = hts_recon_own(i, level)
+            do k = 1, nVertLevels
+               uReconstructZonal(k, iCell) = uReconstructX(k, iCell)
+               uReconstructMeridional(k, iCell) = uReconstructY(k, iCell)
+            end do
+         end do
+      end if
+
+   end subroutine hts_reconstruct_owned
+
+
+   subroutine hts_refresh_wind()
+
+      ! Rebuild cell winds on levels whose edge velocity was just rewritten
+      ! from the snapshot. A skipped hold leaves those winds valid.
+
+      implicit none
+
+      integer :: L
+      logical :: any
+
+      any = .false.
+      if (hts_max_level_used > 0) then
+         do L = 0, hts_max_level_used
+            if (hts_hold_rewrote(L)) any = .true.
+         end do
+      end if
+      if (.not. any) return
+
+      call mpas_timer_start('hts_refresh_wind')
+      do L = 0, hts_max_level_used
+         if (.not. hts_hold_rewrote(L)) cycle
+         call hts_reconstruct_owned(L)
+         hts_hold_rewrote(L) = .false.
+      end do
+      call mpas_timer_stop('hts_refresh_wind')
 
    end subroutine hts_refresh_wind
 
@@ -1881,6 +1975,7 @@ module atm_time_integration
 #endif
       call atm_hts_restore_above(block, 0)
       call atm_hts_accumulate_flux(block, 0, dt)
+      hts_hold_valid(0) = .false.
 
       do L = 1, hts_max_level_used
          ratio = ishft(1, L)
@@ -1903,6 +1998,7 @@ module atm_time_integration
          call atm_hts_correct_mass(block, L, dt_level)
          call atm_hts_accumulate_flux(block, L, dt_level)
          call atm_hts_clear_consumed(L)
+         hts_hold_valid(L) = .false.
          hts_impose = .false.
       end do
 
@@ -2893,14 +2989,20 @@ module atm_time_integration
       call mpas_pool_get_array(diag, 'uReconstructZonal', uReconstructZonal)
       call mpas_pool_get_array(diag, 'uReconstructMeridional', uReconstructMeridional)
 
-      call mpas_reconstruct(mesh, u,                &
-                            uReconstructX,          &
-                            uReconstructY,          &
-                            uReconstructZ,          &
-                            uReconstructZonal,      &
-                            uReconstructMeridional, &
-                            lACC = .true.           &
-                           )
+      if (hts_masking .and. hts_max_level_used > 0) then
+         call mpas_timer_start('hts_reconstruct_wind')
+         call hts_reconstruct_owned(hts_active_level)
+         call mpas_timer_stop('hts_reconstruct_wind')
+      else
+         call mpas_reconstruct(mesh, u,                &
+                               uReconstructX,          &
+                               uReconstructY,          &
+                               uReconstructZ,          &
+                               uReconstructZonal,      &
+                               uReconstructMeridional, &
+                               lACC = .true.           &
+                              )
+      end if
 
 
       !
@@ -4159,7 +4261,26 @@ module atm_time_integration
 
       end if ! test for first acoustic step
 
-      if (small_step == 1) then  ! initialize here on first small timestep.
+      ! Divergence damping reads rtheta_pp_old on the two cells of each active
+      ! edge. Inactive cells that no active edge touches are not read. The
+      ! unmasked path still copies the whole thread range.
+      if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) then
+         if (small_step == 1) then
+            do i = 1, hts_n_ac_cell(hts_active_level)
+               iCell = hts_ac_cell(i, hts_active_level)
+               do k = 1, nVertLevels
+                  rtheta_pp_old(k,iCell) = 0.0
+               end do
+            end do
+         else
+            do i = 1, hts_n_ac_cell(hts_active_level)
+               iCell = hts_ac_cell(i, hts_active_level)
+               do k = 1, nVertLevels
+                  rtheta_pp_old(k,iCell) = rtheta_pp(k,iCell)
+               end do
+            end do
+         end if
+      else if (small_step == 1) then
          !$acc parallel default(present)
          !$acc loop gang worker vector collapse(2)
          do iCell=cellStart,cellEnd
@@ -4185,9 +4306,14 @@ module atm_time_integration
       ! The owned-cell loop below visits only the active level. Inactive owned
       ! columns still have to drop their acoustic perturbations on the first
       ! small step, or an active edge sees a stale neighbor.
+      ! An active edge reads its two cells. Zero those inactive neighbors on
+      ! the first small step. Interior columns that no active edge touches
+      ! are not read, so they are left alone.
       if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
-         do i = 1, hts_n_off_own(hts_active_level)
-            iCell = hts_off_own(i, hts_active_level)
+         do i = 1, hts_n_ac_cell(hts_active_level)
+            iCell = hts_ac_cell(i, hts_active_level)
+            if (iCell > nCellsSolve) cycle
+            if (hts_cell_level(iCell) == hts_active_level) cycle
             do k = 1, nVertLevels
                rho_pp(k,iCell) = 0.0_RKIND
                rtheta_pp(k,iCell) = 0.0_RKIND
