@@ -16,7 +16,7 @@
  use mpas_atmphys_interface
  use mpas_atmphys_vars
  use mpas_atmphys_utilities, only: physics_error_fatal
- use mpas_atmphys_column_mask, only: column_mask_on, column_active
+ use mpas_atmphys_column_mask, only: column_mask_on, column_active, column_mask_next_segment
 
 !wrf physics:
  use module_mp_kessler
@@ -340,7 +340,8 @@
  character(len=StrKIND),pointer:: microp_scheme
 
 !local variables and arrays:
- integer:: istep
+ integer:: istep, cursor, segS, segE
+ logical:: segFound
 
 !CCPP-compliant flags:
  character(len=StrKIND):: errmsg
@@ -355,12 +356,6 @@
  errflg = 0
 
  call mpas_pool_get_config(configs,'config_microp_scheme',microp_scheme)
-
-! The copy loops and Kessler skip inactive columns. Thompson and WSM6 still
-! walk every its:ite index, so a masked call would read uninitialized scratch.
- if (column_mask_on .and. trim(microp_scheme) /= 'mp_kessler') then
-    call physics_error_fatal('HTS column mask is implemented for mp_kessler only')
- end if
 
 !... allocation of microphysics arrays:
 !$OMP MASTER
@@ -396,6 +391,11 @@
        call mpas_timer_start('mp_thompson')
        istep = 1
        do while (istep .le. n_microp)
+       ! Mask off: one segment, the original its:ite. Mask on: owned active runs.
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
        call mp_gt_driver( &
                   th        = th_p        , qv         = qv_p         , qc         = qc_p         , &
                   qr        = qr_p        , qi         = qi_p         , qs         = qs_p         , &
@@ -410,8 +410,9 @@
                   ntc       = ntc_p       , muc        = muc_p                                    , &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde           , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme           , &
-                  its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte             &
+                  its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte             &
                            )
+       end do
        istep = istep + 1
        enddo
        call mpas_timer_stop('mp_thompson')
@@ -420,6 +421,10 @@
        call mpas_timer_start('mp_thompson_aerosols')
        istep = 1
        do while (istep .le. n_microp)
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
        call mp_gt_driver( &
                   th        = th_p        , qv         = qv_p         , qc         = qc_p         , &
                   qr        = qr_p        , qi         = qi_p         , qs         = qs_p         , &
@@ -436,14 +441,19 @@
                   muc       = muc_p       ,                                                         &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde           , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme           , &
-                  its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte             &
+                  its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte             &
                            )
+       end do
           istep = istep + 1
           enddo
           call mpas_timer_stop('mp_thompson_aerosols')
 
     case ("mp_wsm6")
        call mpas_timer_start('mp_wsm6')
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
        call wsm6( &
                   th        = th_p        , q          = qv_p         , qc        = qc_p      , &
                   qr        = qr_p        , qi         = qi_p         , qs        = qs_p      , &
@@ -464,8 +474,9 @@
                   errmsg    = errmsg      , errflg     = errflg                               , &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde       , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme       , &
-                  its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte         &
+                  its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte         &
                )
+       end do
        call mpas_timer_stop('mp_wsm6')
 
     case default
@@ -478,7 +489,12 @@
     if(trim(microp_scheme) == "mp_wsm6"     .or. &
        trim(microp_scheme) == "mp_thompson" .or. &
        trim(microp_scheme) == "mp_thompson_aerosols") then
-       call compute_radar_reflectivity(configs,diag_physics,its,ite)
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
+          call compute_radar_reflectivity(configs,diag_physics,segS,segE)
+       end do
     else
        call mpas_log_write('*** NOTICE: NOT computing simulated radar reflectivity')
        call mpas_log_write('            since WSM6 or Thompson microphysics scheme was not selected')

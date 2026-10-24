@@ -14,6 +14,7 @@
  use mpas_atmphys_landuse
  use mpas_atmphys_lsm_noahinit
  use mpas_atmphys_vars
+ use mpas_atmphys_column_mask, only: column_is_active
  use mpas_constants
 
 !wrf physics
@@ -124,6 +125,8 @@
  if (config_oml1d) then
  
    do iCell = 1, nCellsSolve
+
+     if (.not. column_is_active(iCell)) cycle
 
 ! if ocean point, call the 1d ocean mixed layer model 
      if( xland(iCell) .gt. 1.5) then

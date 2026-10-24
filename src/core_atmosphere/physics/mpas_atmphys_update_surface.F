@@ -14,6 +14,7 @@
  use mpas_atmphys_date_time
  use mpas_atmphys_constants,only: stbolt
  use mpas_atmphys_vars
+ use mpas_atmphys_column_mask, only: column_is_active
 
  implicit none
  private
@@ -383,12 +384,14 @@
 
 !first, restore the surface temperature to the sea-surface temperature:
  do iCell = 1, nCellsSolve
+    if (.not. column_is_active(iCell)) cycle
     if(xland(iCell) .ge. 1.5) tsk(iCell) = sst(iCell)
  enddo
 
 !calculate the skin sea-surface temperature: 
  do iCell = 1, nCellsSolve
 
+    if (.not. column_is_active(iCell)) cycle
     if(xland(iCell) .ge. 1.5) then
 
        qo   = glw(iCell)-emiss(iCell)*stbolt*(sstsk(iCell)**4)-2.5e6*qfx(iCell)-hfx(iCell)
@@ -458,6 +461,7 @@
 
 !update the surface temperature over the oceans:
  do iCell = 1, nCellsSolve
+    if (.not. column_is_active(iCell)) cycle
     if(xland(iCell) .ge. 1.5) tsk(iCell) = sstsk(iCell)
  enddo
 
@@ -515,6 +519,7 @@
 
 !... accumulate the skin temperature for current day:
  do iCell = 1, nCellsSolve
+    if (.not. column_is_active(iCell)) cycle
     tday_accum(iCell)  = tday_accum(iCell)  + tsk(iCell)*dt
 !   tday_accum(iCell)  = tday_accum(iCell)  + tsk(iCell)
     nsteps_accum(iCell) = nsteps_accum(iCell) + dt
@@ -534,6 +539,7 @@
     julian = julian_in - 1. + dt/(3600.*24.)
 
     do iCell = 1, nCellsSolve
+       if (.not. column_is_active(iCell)) cycle
 
 !--- update tmn:
        tprior = 0.

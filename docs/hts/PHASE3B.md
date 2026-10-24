@@ -67,11 +67,39 @@ Uniform 120 km, physics suite `none`, 10 steps, `dt = 450` s. HTS on against HTS
 
 `x1.40962`, CFSR `2010-10-23_00`, suite `mesoscale_reference`, `dt = 720` s, 2 steps (24 minutes). HTS on against HTS off: relative L2 is 0 on `u`, `w`, `theta`, and `rho`, dry-mass frame difference 0, drift −1.799×10⁻¹¹. `physics driver` is called twice, once per step. Radiation fired once (`rrtmg_swrad` and `rrtmg_lwrad` each have one call), and WSM6, YSU, Noah, and Tiedtke ran on both steps. Walls 19.53 s (off) and 19.98 s (on) on a bit-identical pair. The 6-hour forecast was not repeated on this binary. Its bit-identical result in [PHASE3.md](PHASE3.md) is from the phase 3 binary, which took the same one-level branch.
 
-## What is still open
+## Schemes beyond Kessler
 
-- Thompson and WSM6 are not masked inside the WRF kernel. A multi-level step with the column mask on and any scheme other than `mp_kessler` aborts in `driver_microphysics` with `HTS column mask is implemented for mp_kessler only`. Skipping the copies and then calling an unmasked kernel would read uninitialized scratch. Kessler is the scheme this phase timed.
-- Radiation, PBL, the land model, convection, the surface layer, GWDO, and sea ice are segmented onto the owned active cells and use the level `dt`, with the radiation and convection alarms latched until that level steps. That path was not timed on a variable-resolution mesh. There is no `sp8.24755` static here, and the Kessler namelist turns those schemes off. A level's cells are scattered, so one RRTMG tile can become many short calls. That overhead is unknown. `driver_oml1d` is still one full-domain call. `compute_radar_reflectivity` is not masked; Kessler does not call it.
-- Diagnostics, `physics_get_tend`, and the moist-coefficient loops still walk every owned column once per level step. Together with the halo gap they are why the net is 1.23×.
-- The acoustic step is still the fine step on every level. `dt = 60` s was not retested. The phase 2c overflow at that `dt` still stands.
-- GWDO reads neighboring columns. The mask uses the owned active list, so a neighbor on another level is not updated on this step. That dependence was not tested.
-- OpenACC was not built. The mask is host-side.
+The Kessler-only stop is gone. `column_is_active` is the shared test: with the mask off it is true and does not read `column_active`. WSM6, Thompson, and Thompson-aerosols are column-local, so `driver_microphysics` calls them through `column_mask_next_segment`. With the mask off that is one call on the original `its:ite`. Radar reflectivity uses the same segments. The 1D ocean mixed layer, the Noah/Noah-MP 2 m diagnostics, the skin SST, and the deep-soil temperature skip inactive columns. Skin SST and deep-soil temperature run from the level loop, with that level's `dt`, only when `hts_max_level_used > 0`. Both namelist flags default to false, so the one-level time tracker still makes the original calls.
+
+Radiation, PBL, the land model, convection, the surface layer, GWDO, sea ice, and cloudiness were already called on those segments from `physics_driver`. No microphysics scheme in this source aborts because the mask is on.
+
+Ozone on the radiation alarm, the monthly albedo, and the SST/sea-ice file update stay on the fine clock for every owned column. They are not integrated with the level `dt`. A coarser level's later radiation reads the ozone written on the alarm tick. `physics_get_tend`, the moist-coefficient loops, and the diagnostics stay full-domain.
+
+Binary md5 `fd5bfbe02ba0a5cc4705f48689bfeab4`. The Kessler hour on it matches the history behind the table above bit for bit (relative L2 0 on `u`, `w`, `theta`, `rho`, and near-surface pressure). A repeat of that hour timed `time integration` at 22.912 s / 18.820 s = **1.217×**, wall 24.96 s / 20.60 s. The earlier 1.227× is the same state; the tenth of a second is timer scatter. The 10-step dry gate and the 2-step `x1.40962` `mesoscale_reference` smoke match the previous histories of those runs bit for bit.
+
+WSM6 on the same mesh, `dt = 30` s, 30 minutes (60 steps), 4 ranks, the same partition. `qi`, `qs`, and `qg` are absent from the JW init and start at zero. Convection, PBL, radiation, the surface layer, and the land model stay off, as in the Kessler namelist. IEEE flags are underflow and denormal. `u` stays about ±35 m/s.
+
+| | all-fine | HTS, max level 3 |
+| --- | ---: | ---: |
+| `/usr/bin/time` wall | 17.33 s | 12.01 s |
+| MPAS total | 17.011 s | 11.677 s |
+| `time integration` | 15.914 s / 60 | 10.654 s / 60 |
+| `atm_compute_dyn_tend` | 4.966 s / 180 | 1.088 s / 336 |
+| `microphysics` | 5.212 s / 60 | 1.065 s / 112 |
+| `mp_wsm6` | 3.592 s / 60 | 0.662 s / 112 |
+
+Integration ratio 15.914 / 10.654 = **1.494×**. Wall 17.33 / 12.01 = 1.443×. `mp_wsm6` is 3.592 / 0.662 = 5.43×, again near the 6.10× cell-count ceiling. The wrapper is 4.90×. The call count is 60 against 112, the same 1.875 level factor as the Kessler hour. WSM6 is a larger share of the step than Kessler, so skipping the coarse columns moves the integration ratio from 1.22× to 1.49× on this half hour.
+
+Last frame, HTS against the WSM6 all-fine history.
+
+| field | rel L2 | Linf |
+| --- | ---: | ---: |
+| `u` | 3.626×10⁻⁴ | 0.132 m/s |
+| `w` | 0.486 | 8.58×10⁻³ m/s |
+| `theta` | 3.671×10⁻⁶ | 0.136 K |
+| `rho` | 1.032×10⁻⁵ | 1.17×10⁻⁴ kg/m³ |
+| near-surface `pressure` | 1.267×10⁻⁵ | 13.3 Pa (rms 1.25 Pa) |
+
+Dry-mass drift −7.88×10⁻⁹ (HTS) and −1.31×10⁻¹⁰ (all-fine). Frame difference −7.75×10⁻⁹. That is larger than the Kessler hour. The initial sounding is dry, WSM6 still condenses, and the level `dt` is not the fine `dt`. It is not a NaN, and `u` does not grow.
+
+Thompson and Thompson-aerosols take the same segmented `mp_gt_driver` call. They were not run: `MP_THOMPSON_QRacrQG_DATA.DBL` and the other Thompson lookup files are not on this machine. A variable-resolution hour with RRTMG and PBL was not run. There is no `sp8.24755` static here, and a level's cells are scattered, so one RRTMG tile becomes many short calls. That overhead is still unknown. GWDO's static orography is per column; a neighbor on another level is not updated on this step, and that dependence was not tested. The acoustic step was not lengthened. OpenACC was not built.

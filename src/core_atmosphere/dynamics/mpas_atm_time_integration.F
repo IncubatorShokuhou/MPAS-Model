@@ -34,7 +34,9 @@ module atm_time_integration
    use mpas_atmphys_interface, only: pre_microphysics, post_microphysics
    use mpas_atmphys_todynamics
    use mpas_atmphys_utilities
-   use mpas_atmphys_column_mask, only: column_mask_on, column_active
+   use mpas_atmphys_column_mask, only: column_mask_on, column_active, &
+      column_mask_defer_sfc_dt, column_sfc_leap, column_sfc_julday
+   use mpas_atmphys_update_surface, only: physics_update_sstskin, physics_update_deepsoiltemp
    use mpas_atmphys_vars, only : dt_dyn, dt_microp, n_microp, l_radtlw, l_radtsw, l_conv
 #endif
 
@@ -546,6 +548,9 @@ module atm_time_integration
 #endif
 
       call atm_hts_setup(domain)
+#ifdef DO_PHYSICS
+      column_mask_defer_sfc_dt = hts_enabled .and. hts_max_level_used > 0
+#endif
 
    end subroutine mpas_atm_dynamics_init
 
@@ -2951,9 +2956,10 @@ module atm_time_integration
       MPAS_ACC_TIMER_STOP('atm_srk3: physics ACC_data_xfer')
       !call microphysics schemes:
       if (trim(config_microp_scheme) /= 'off')  then
-        ! On a multi-level step the copy loops and Kessler skip columns that
-        ! are not on the active level. dt_dyn for this call is the level dt.
-        ! The mask is set by the level driver and stays on through srk3.
+        ! On a multi-level step the copy loops skip columns that are not on
+        ! the active level, and WSM6 / Thompson are called on contiguous runs
+        ! of that mask. dt_dyn for this call is the level dt. The mask is set
+        ! by the level driver and stays on through srk3.
         if (hts_masking .and. hts_max_level_used > 0) then
            call hts_push_microp_dt(block % configs, dt)
         end if
@@ -9317,6 +9323,7 @@ module atm_time_integration
             l_radtsw = hts_radsw_due(level)
             l_conv = hts_conv_due(level)
          end if
+         if (column_mask_defer_sfc_dt) call hts_apply_sfc_dt(dt_level)
          call physics_driver(domain, itimestep, hts_physics_xtime_s)
          if (level >= 0 .and. level <= 8) then
             hts_radlw_due(level) = .false.
@@ -9336,6 +9343,34 @@ module atm_time_integration
       column_mask_on = .false.
 
    end subroutine hts_clear_column_mask
+
+
+   subroutine hts_apply_sfc_dt(dt_level)
+
+      ! Skin SST and deep-soil temperature integrate with dt. On a multi-level
+      ! step each owned column uses its own level dt. The time tracker skips
+      ! these calls when column_mask_defer_sfc_dt is true.
+
+      implicit none
+
+      real (kind=RKIND), intent(in) :: dt_level
+
+      logical, pointer :: config_sstdiurn_update, config_deepsoiltemp_update
+      type (mpas_pool_type), pointer :: mesh, diag_physics, sfc_input
+
+      call mpas_pool_get_config(block % configs, 'config_sstdiurn_update', config_sstdiurn_update)
+      call mpas_pool_get_config(block % configs, 'config_deepsoiltemp_update', config_deepsoiltemp_update)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(block % structs, 'diag_physics', diag_physics)
+      call mpas_pool_get_subpool(block % structs, 'sfc_input', sfc_input)
+
+      if (config_sstdiurn_update) &
+         call physics_update_sstskin(dt_level, mesh, diag_physics, sfc_input)
+      if (config_deepsoiltemp_update) &
+         call physics_update_deepsoiltemp(column_sfc_leap, dt_level, column_sfc_julday, &
+                                           mesh, sfc_input, diag_physics)
+
+   end subroutine hts_apply_sfc_dt
 
 
    subroutine hts_push_microp_dt(configs, dt)
