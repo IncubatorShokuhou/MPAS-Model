@@ -73,7 +73,7 @@ The Kessler-only stop is gone. `column_is_active` is the shared test: with the m
 
 Radiation, PBL, the land model, convection, the surface layer, GWDO, sea ice, and cloudiness were already called on those segments from `physics_driver`. No microphysics scheme in this source aborts because the mask is on.
 
-Ozone on the radiation alarm, the monthly albedo, and the SST/sea-ice file update stay on the fine clock for every owned column. They are not integrated with the level `dt`. A coarser level's later radiation reads the ozone written on the alarm tick. `physics_get_tend`, the moist-coefficient loops, and the diagnostics stay full-domain.
+Ozone on the radiation alarm, the monthly albedo, and the SST/sea-ice file update stay on the fine clock for every owned column. They are integrated on the fine clock. A coarser level's later radiation reads the ozone written on the alarm tick. On this binary, `physics_get_tend`, the moist-coefficient loops, and the diagnostics still walk the full local domain.
 
 Binary md5 `fd5bfbe02ba0a5cc4705f48689bfeab4`. The Kessler hour on it matches the history behind the table above bit for bit (relative L2 0 on `u`, `w`, `theta`, `rho`, and near-surface pressure). A repeat of that hour timed `time integration` at 22.912 s / 18.820 s = **1.217×**, wall 24.96 s / 20.60 s. The earlier 1.227× is the same state; the tenth of a second is timer scatter. The 10-step dry gate and the 2-step `x1.40962` `mesoscale_reference` smoke match the previous histories of those runs bit for bit.
 
@@ -102,4 +102,4 @@ Last frame, HTS against the WSM6 all-fine history.
 
 Dry-mass drift −7.88×10⁻⁹ (HTS) and −1.31×10⁻¹⁰ (all-fine). Frame difference −7.75×10⁻⁹. That is larger than the Kessler hour. The initial sounding is dry, WSM6 still condenses, and the level `dt` is not the fine `dt`. It is not a NaN, and `u` does not grow.
 
-Thompson and Thompson-aerosols take the same segmented `mp_gt_driver` call. They were not run: `MP_THOMPSON_QRacrQG_DATA.DBL` and the other Thompson lookup files are not on this machine. A variable-resolution hour with RRTMG and PBL was not run. There is no `sp8.24755` static here, and a level's cells are scattered, so one RRTMG tile becomes many short calls. That overhead is still unknown. GWDO's static orography is per column; a neighbor on another level is not updated on this step, and that dependence was not tested. The acoustic step was not lengthened. OpenACC was not built.
+Thompson and Thompson-aerosols take the same segmented `mp_gt_driver` call. The runs in this file stop at WSM6. The later diagnostic-ring mask, the Thompson smoke, and the RRTMG/YSU/Noah smoke are in [FINAL.md](FINAL.md). The acoustic step was not lengthened. OpenACC was not built.

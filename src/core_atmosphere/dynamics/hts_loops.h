@@ -107,6 +107,45 @@
          iVertex = vertexStart + hts_ii - 1; \
       end if
 
+#define HTS_DIAG_CELL_ALL_DO \
+   hts_nloop = cellEnd - cellStart + 1; \
+   if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) hts_nloop = hts_n_diag_all(hts_active_level); \
+   hts_ii = 0; \
+   do; \
+      hts_ii = hts_ii + 1; \
+      if (hts_ii > hts_nloop) exit; \
+      if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) then; \
+         iCell = hts_diag_all(hts_ii, hts_active_level); \
+      else; \
+         iCell = cellStart + hts_ii - 1; \
+      end if
+
+#define HTS_DIAG_EDGE_ALL_DO \
+   hts_nloop = edgeEnd - edgeStart + 1; \
+   if (hts_masking .and. hts_max_level_used > 0 .and. edgeStart == 1 .and. edgeEnd == hts_nEdges) hts_nloop = hts_n_diag_edge_all(hts_active_level); \
+   hts_ii = 0; \
+   do; \
+      hts_ii = hts_ii + 1; \
+      if (hts_ii > hts_nloop) exit; \
+      if (hts_masking .and. hts_max_level_used > 0 .and. edgeStart == 1 .and. edgeEnd == hts_nEdges) then; \
+         iEdge = hts_diag_edge_all(hts_ii, hts_active_level); \
+      else; \
+         iEdge = edgeStart + hts_ii - 1; \
+      end if
+
+#define HTS_DIAG_VERT_ALL_DO \
+   hts_nloop = vertexEnd - vertexStart + 1; \
+   if (hts_masking .and. hts_max_level_used > 0 .and. vertexStart == 1 .and. vertexEnd == hts_nVertices) hts_nloop = hts_n_diag_vert_all(hts_active_level); \
+   hts_ii = 0; \
+   do; \
+      hts_ii = hts_ii + 1; \
+      if (hts_ii > hts_nloop) exit; \
+      if (hts_masking .and. hts_max_level_used > 0 .and. vertexStart == 1 .and. vertexEnd == hts_nVertices) then; \
+         iVertex = hts_diag_vert_all(hts_ii, hts_active_level); \
+      else; \
+         iVertex = vertexStart + hts_ii - 1; \
+      end if
+
 #define HTS_VERT_SOLVE_DO \
    hts_nloop = vertexSolveEnd - vertexSolveStart + 1; \
    if (hts_lists_work .and. hts_masking .and. hts_max_level_used > 0 .and. vertexSolveStart == 1 .and. vertexSolveEnd == hts_nVerticesSolve) hts_nloop = hts_n_vert_own(hts_active_level); \

@@ -3416,7 +3416,7 @@ module atm_time_integration
       !$acc parallel default(present)
       !$acc loop gang worker
 !      do iCell = cellSolveStart,cellSolveEnd
-      do iCell = cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
          !$acc loop vector
          do k = 1,nVertLevels
             qtot(k,iCell) = 0.0
@@ -3431,7 +3431,7 @@ module atm_time_integration
 !      do iCell = cellSolveStart,cellSolveEnd
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell = cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
         !$acc loop vector
          do k = 2, nVertLevels
             qtotal = 0.5*(qtot(k,iCell)+qtot(k-1,iCell))
@@ -3444,7 +3444,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iEdge = edgeStart,edgeEnd
+      HTS_WORK_EDGE_ALL_DO
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
          if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve) then
@@ -3614,7 +3614,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker private(b_tri,c_tri)
-      do iCell = cellSolveStart,cellSolveEnd  !  we only need to do cells we are solving for, not halo cells
+      HTS_ACTIVE_CELL_SOLVE_DO  !  active columns; the vertical solve does not read a neighbor
 
 !DIR$ IVDEP
          !$acc loop vector
@@ -3797,7 +3797,7 @@ module atm_time_integration
 
       !$acc parallel default(present)
       !$acc loop gang worker
-      do iCell=cellSolveStart,cellSolveEnd
+      HTS_ACTIVE_CELL_SOLVE_DO
 
          if (bdyMaskCell(iCell) <= nRelaxZone) then  !  no conversion in specified zone, regional_MPAS
             !$acc loop seq
@@ -7398,21 +7398,20 @@ module atm_time_integration
       logical, parameter :: hollingsworth=.true.
       real (kind=RKIND) :: ke_fact, efac
       logical :: reconstruct_v
-      logical :: hts_lists_saved
 
 
 
       !
       ! Compute height on cell edges at velocity locations
       !
-      ! Diagnostics are a function of the whole local state, and the next level
-      ! reads them before it recomputes its own. Keep this pass full-domain.
-      hts_lists_saved = hts_lists_work
-      hts_lists_work = .false.
-
+      ! Multi-level HTS writes this on hts_diag_rings, two rings past the
+      ! tendency work list. The extra rings are the APVM and kinetic-energy
+      ! stencil, so the values the tendency reads are the full-domain values.
+      ! A write that stops on the work list leaves that fringe stale, and the
+      ! next level's first RK tendency consumes it.
       !$acc parallel default(present)
       !$acc loop gang
-      HTS_WORK_EDGE_ALL_DO
+      HTS_DIAG_EDGE_ALL_DO
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
 !DIR$ IVDEP
@@ -7436,7 +7435,7 @@ module atm_time_integration
       ! Compute circulation and relative vorticity at each vertex
       !
       !$acc loop gang
-      HTS_VERT_ALL_DO
+      HTS_DIAG_VERT_ALL_DO
          !$acc loop vector
          do k=1,nVertLevels
             vorticity(k,iVertex) = 0.0_RKIND
@@ -7463,7 +7462,7 @@ module atm_time_integration
       ! Compute the divergence at each cell center
       !
       !$acc loop gang
-      HTS_WORK_CELL_ALL_DO
+      HTS_DIAG_CELL_ALL_DO
          !$acc loop vector
          do k=1,nVertLevels
             divergence(k,iCell) = 0.0_RKIND
@@ -7496,7 +7495,7 @@ module atm_time_integration
       ! compiler will actually allow "float raised to float" operation
       !$acc parallel default(present)
       !$acc loop gang
-      HTS_WORK_CELL_ALL_DO
+      HTS_DIAG_CELL_ALL_DO
          !$acc loop vector
          do k=1,nVertLevels
             ke(k,iCell) = 0.0_RKIND
@@ -7529,7 +7528,7 @@ module atm_time_integration
          ! compiler will actually allow "float raised to float" operation
          !$acc parallel default(present)
          !$acc loop gang
-         HTS_VERT_ALL_DO
+         HTS_DIAG_VERT_ALL_DO
             r = 0.25 * invAreaTriangle(iVertex) 
             !$acc loop vector
             do k=1,nVertLevels
@@ -7554,7 +7553,7 @@ module atm_time_integration
 
          !$acc parallel default(present)
          !$acc loop collapse(2)
-         HTS_WORK_CELL_ALL_DO
+         HTS_DIAG_CELL_ALL_DO
             do k=1,nVertLevels
                ke(k,iCell) = ke_fact * ke(k,iCell)
             end do
@@ -7562,7 +7561,7 @@ module atm_time_integration
 
 
          !$acc loop gang
-         HTS_WORK_CELL_ALL_DO
+         HTS_DIAG_CELL_ALL_DO
             r = invAreaCell(iCell)
             !$acc loop seq
             do i=1,nEdgesOnCell(iCell)
@@ -7591,7 +7590,7 @@ module atm_time_integration
       if (reconstruct_v) then
         !$acc parallel default(present)
         !$acc loop gang
-        HTS_WORK_EDGE_ALL_DO
+        HTS_DIAG_EDGE_ALL_DO
           !$acc loop vector
           do k = 1,nVertLevels
             v(k,iEdge) = 0.0_RKIND
@@ -7617,7 +7616,7 @@ module atm_time_integration
       ! numerator for the pv_vertex calculation
       !$acc parallel default(present)
       !$acc loop collapse(2)
-      HTS_VERT_ALL_DO
+      HTS_DIAG_VERT_ALL_DO
 !DIR$ IVDEP
          do k=1,nVertLevels
 !
@@ -7640,7 +7639,7 @@ module atm_time_integration
       !
       !$acc parallel default(present)
       !$acc loop collapse(2)
-      HTS_WORK_EDGE_ALL_DO
+      HTS_DIAG_EDGE_ALL_DO
 !DIR$ IVDEP
          do k=1,nVertLevels
             pv_edge(k,iEdge) =  0.5 * (pv_vertex(k,verticesOnEdge(1,iEdge)) + pv_vertex(k,verticesOnEdge(2,iEdge)))
@@ -7657,7 +7656,7 @@ module atm_time_integration
          !
          !$acc parallel default(present)
          !$acc loop gang
-         HTS_WORK_CELL_ALL_DO
+         HTS_DIAG_CELL_ALL_DO
             !$acc loop vector
             do k = 1,nVertLevels
                pv_cell(k,iCell) = 0.0_RKIND
@@ -7696,7 +7695,7 @@ module atm_time_integration
          r = config_apvm_upwinding * dt
          !$acc parallel default(present)
          !$acc loop gang
-         HTS_WORK_EDGE_ALL_DO
+         HTS_DIAG_EDGE_ALL_DO
             r1 = 1.0_RKIND * invDvEdge(iEdge)
             r2 = 1.0_RKIND * invDcEdge(iEdge)
 !DIR$ IVDEP
@@ -7711,8 +7710,6 @@ module atm_time_integration
 
 
       end if  ! apvm upwinding
-
-      hts_lists_work = hts_lists_saved
 
    end subroutine atm_compute_solve_diagnostics_work
 
@@ -9380,6 +9377,9 @@ module atm_time_integration
       ! after initialization. A coarse level step has to use its own dt or
       ! the heating rate is long by 2^L when the next coarse step multiplies
       ! it back. Thompson keeps the 90 s substep it uses at init.
+      ! dt_pbl stays at the fine step from initialization. YSU, Noah, sea
+      ! ice, and GWDO return a rate normalized by that dt, and the level
+      ! RK multiplies the stored rate by dt_level.
 
       implicit none
 

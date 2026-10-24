@@ -48,10 +48,12 @@ module mpas_atm_hts
    integer, public :: hts_nloop = 0
    integer, public :: hts_ii = 0
    ! Tendency and dissipation index lists. hts_lists_work false walks the
-   ! original index range. Diagnostics are not on these lists: a partial
-   ! diagnostic write leaves a fringe the other level reads on its next step.
+   ! original index range. Diagnostics use a wider list (hts_diag_rings),
+   ! two rings past the tendency work list, so the APVM and kinetic-energy
+   ! values a level reads are the full-domain values.
    logical, public :: hts_lists_work = .true.
    integer, parameter :: hts_work_rings = 2
+   integer, parameter :: hts_diag_rings = 4
    integer, public :: hts_nCellsSolve = 0
    integer, public :: hts_nEdgesSolve = 0
    integer, public :: hts_nVertices = 0
@@ -67,6 +69,9 @@ module mpas_atm_hts
    integer, public :: hts_n_off_own(0:hts_level_cap) = 0
    integer, public :: hts_n_vert_all(0:hts_level_cap) = 0
    integer, public :: hts_n_vert_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_diag_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_diag_edge_all(0:hts_level_cap) = 0
+   integer, public :: hts_n_diag_vert_all(0:hts_level_cap) = 0
    integer, public, allocatable :: hts_work_own(:,:)
    integer, public, allocatable :: hts_work_all(:,:)
    integer, public, allocatable :: hts_active_own(:,:)
@@ -77,6 +82,9 @@ module mpas_atm_hts
    integer, public, allocatable :: hts_off_own(:,:)
    integer, public, allocatable :: hts_vert_all(:,:)
    integer, public, allocatable :: hts_vert_own(:,:)
+   integer, public, allocatable :: hts_diag_all(:,:)
+   integer, public, allocatable :: hts_diag_edge_all(:,:)
+   integer, public, allocatable :: hts_diag_vert_all(:,:)
 
    real (kind=R8KIND), allocatable :: hts_flux_sum(:,:)
 
@@ -339,6 +347,9 @@ module mpas_atm_hts
       if (allocated(hts_off_own)) deallocate(hts_off_own)
       if (allocated(hts_vert_all)) deallocate(hts_vert_all)
       if (allocated(hts_vert_own)) deallocate(hts_vert_own)
+      if (allocated(hts_diag_all)) deallocate(hts_diag_all)
+      if (allocated(hts_diag_edge_all)) deallocate(hts_diag_edge_all)
+      if (allocated(hts_diag_vert_all)) deallocate(hts_diag_vert_all)
 
    end subroutine atm_hts_finalize
 
@@ -354,10 +365,10 @@ module mpas_atm_hts
 
       type (mpas_pool_type), pointer :: mesh
       integer, pointer :: nCells, nCellsSolve, nEdges, nEdgesSolve
-      integer, pointer :: nVertices, nVerticesSolve
-      integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell, verticesOnEdge
+      integer, pointer :: nVertices, nVerticesSolve, vertexDegree
+      integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell, verticesOnEdge, edgesOnVertex
       integer, dimension(:), pointer :: nEdgesOnCell
-      integer :: iCell, iEdge, i, iPass, L, nbr, cell1, cell2, v1, v2, coarse
+      integer :: iCell, iEdge, i, iPass, iVertex, L, nbr, cell1, cell2, v1, v2, coarse
       integer :: nOwn, nAll, nEOwn, nEAll, nAc, nOff, nVAll, nVOwn, nMiss, nExtra
       logical, allocatable :: mark(:), mark2(:), edgeMark(:), vertMark(:)
 
@@ -372,6 +383,8 @@ module mpas_atm_hts
       call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
       call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
       call mpas_pool_get_array(mesh, 'verticesOnEdge', verticesOnEdge)
+      call mpas_pool_get_array(mesh, 'edgesOnVertex', edgesOnVertex)
+      call mpas_pool_get_dimension(mesh, 'vertexDegree', vertexDegree)
 
       hts_nVertices = nVertices
       hts_nVerticesSolve = nVerticesSolve
@@ -386,6 +399,9 @@ module mpas_atm_hts
       if (allocated(hts_off_own)) deallocate(hts_off_own)
       if (allocated(hts_vert_all)) deallocate(hts_vert_all)
       if (allocated(hts_vert_own)) deallocate(hts_vert_own)
+      if (allocated(hts_diag_all)) deallocate(hts_diag_all)
+      if (allocated(hts_diag_edge_all)) deallocate(hts_diag_edge_all)
+      if (allocated(hts_diag_vert_all)) deallocate(hts_diag_vert_all)
 
       allocate(hts_work_own(nCells, 0:hts_level_cap))
       allocate(hts_work_all(nCells, 0:hts_level_cap))
@@ -397,6 +413,9 @@ module mpas_atm_hts
       allocate(hts_off_own(nCells, 0:hts_level_cap))
       allocate(hts_vert_all(nVertices, 0:hts_level_cap))
       allocate(hts_vert_own(nVertices, 0:hts_level_cap))
+      allocate(hts_diag_all(nCells, 0:hts_level_cap))
+      allocate(hts_diag_edge_all(nEdges, 0:hts_level_cap))
+      allocate(hts_diag_vert_all(nVertices, 0:hts_level_cap))
       hts_n_work_own = 0
       hts_n_work_all = 0
       hts_n_active_own = 0
@@ -407,10 +426,13 @@ module mpas_atm_hts
       hts_n_off_own = 0
       hts_n_vert_all = 0
       hts_n_vert_own = 0
+      hts_n_diag_all = 0
+      hts_n_diag_edge_all = 0
+      hts_n_diag_vert_all = 0
 
       allocate(mark(nCells), mark2(nCells), edgeMark(nEdges), vertMark(nVertices))
 
-      call mpas_log_write(' HTS work rings = $i', intArgs=(/hts_work_rings/))
+      call mpas_log_write(' HTS work rings = $i, diagnostic rings = $i', intArgs=(/hts_work_rings, hts_diag_rings/))
 
       do L = 0, hts_max_level_used
          mark(:) = .false.
@@ -527,8 +549,75 @@ module mpas_atm_hts
          hts_n_vert_all(L) = nVAll
          hts_n_vert_own(L) = nVOwn
 
+         ! Four rings cover the APVM and kinetic-energy reads of the two-ring
+         ! tendency, including the edges a vertex kinetic energy needs. The
+         ! diagnostic write uses this set. There is no extra pass before RK1.
+         do iPass = hts_work_rings + 1, hts_diag_rings
+            mark2(:) = mark(:)
+            do iCell = 1, nCells
+               if (.not. mark2(iCell)) cycle
+               do i = 1, nEdgesOnCell(iCell)
+                  nbr = cellsOnCell(i, iCell)
+                  if (nbr >= 1 .and. nbr <= nCells) mark(nbr) = .true.
+               end do
+            end do
+         end do
+
+         nAll = 0
+         do iCell = 1, nCells
+            if (.not. mark(iCell)) cycle
+            nAll = nAll + 1
+            hts_diag_all(nAll, L) = iCell
+         end do
+         hts_n_diag_all(L) = nAll
+
+         edgeMark(:) = .false.
+         nEAll = 0
+         do iEdge = 1, nEdges
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 < 1 .or. cell1 > nCells) cell1 = 0
+            if (cell2 < 1 .or. cell2 > nCells) cell2 = 0
+            if ((cell1 > 0 .and. mark(cell1)) .or. (cell2 > 0 .and. mark(cell2))) then
+               edgeMark(iEdge) = .true.
+               nEAll = nEAll + 1
+               hts_diag_edge_all(nEAll, L) = iEdge
+            end if
+         end do
+
+         vertMark(:) = .false.
+         do iEdge = 1, nEdges
+            if (.not. edgeMark(iEdge)) cycle
+            v1 = verticesOnEdge(1, iEdge)
+            v2 = verticesOnEdge(2, iEdge)
+            if (v1 >= 1 .and. v1 <= nVertices) vertMark(v1) = .true.
+            if (v2 >= 1 .and. v2 <= nVertices) vertMark(v2) = .true.
+         end do
+         do iVertex = 1, nVertices
+            if (.not. vertMark(iVertex)) cycle
+            do i = 1, vertexDegree
+               iEdge = edgesOnVertex(i, iVertex)
+               if (iEdge < 1 .or. iEdge > nEdges) cycle
+               if (edgeMark(iEdge)) cycle
+               edgeMark(iEdge) = .true.
+               nEAll = nEAll + 1
+               hts_diag_edge_all(nEAll, L) = iEdge
+            end do
+         end do
+         hts_n_diag_edge_all(L) = nEAll
+
+         nVAll = 0
+         do i = 1, nVertices
+            if (.not. vertMark(i)) cycle
+            nVAll = nVAll + 1
+            hts_diag_vert_all(nVAll, L) = i
+         end do
+         hts_n_diag_vert_all(L) = nVAll
+
          call mpas_log_write(' level $i index lists: active owned $i, work owned $i, edges $i', &
                              intArgs=(/L, hts_n_active_own(L), hts_n_work_own(L), hts_n_work_edge_own(L)/))
+         call mpas_log_write(' level $i diagnostic list: cells $i, edges $i, vertices $i', &
+                             intArgs=(/L, hts_n_diag_all(L), hts_n_diag_edge_all(L), hts_n_diag_vert_all(L)/))
 
          ! The acoustic list must be the same edges the unmasked loop would update.
          ! A raw cell id of 0 passes the original "<= nCellsSolve" test.
