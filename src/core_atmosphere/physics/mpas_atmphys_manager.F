@@ -17,6 +17,7 @@
  use mpas_atmphys_o3climatology
  use mpas_atmphys_update_surface
  use mpas_atmphys_utilities
+ use mpas_atmphys_column_mask, only: column_mask_defer_sfc_dt, column_sfc_leap, column_sfc_julday
 
  implicit none
  private
@@ -211,6 +212,8 @@
  julday = DoY
  curr_julday = real(julday-1) + utc_h / 24.0
  LeapYear = isLeapYear(year)
+ column_sfc_leap = LeapYear
+ column_sfc_julday = curr_julday
 !call mpas_log_write('     YEAR        = $i', intArgs=(/year/))
 !call mpas_log_write('     JULDAY      = $i', intArgs=(/julday/))
 !call mpas_log_write('     GMT         = $r', realArgs=(/gmt/))
@@ -244,14 +247,15 @@
           call physics_update_sst(domain%dminfo,config_frac_seaice,mesh,sfc_input,diag_physics)
     endif   
 
-    !apply a diurnal cycle to the sea-surface temperature:
-    if(config_sstdiurn_update) &
-       call physics_update_sstskin(dt_dyn,mesh,diag_physics,sfc_input)
-
-    !update the deep soil temperature:
-    if(config_deepsoiltemp_update) &
-       call physics_update_deepsoiltemp(LeapYear,dt_dyn,curr_julday,mesh, &
-                    sfc_input,diag_physics)
+    ! On a multi-level step these integrate with the level dt inside the
+    ! level loop. One level and HTS-off keep the fine-clock call.
+    if(.not. column_mask_defer_sfc_dt) then
+       if(config_sstdiurn_update) &
+          call physics_update_sstskin(dt_dyn,mesh,diag_physics,sfc_input)
+       if(config_deepsoiltemp_update) &
+          call physics_update_deepsoiltemp(LeapYear,dt_dyn,curr_julday,mesh, &
+                       sfc_input,diag_physics)
+    endif
 
     block => block % next
  end do 

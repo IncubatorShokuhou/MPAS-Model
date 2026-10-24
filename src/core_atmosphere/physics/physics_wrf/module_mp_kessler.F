@@ -15,6 +15,7 @@ CONTAINS
                       ,its,ite, jts,jte, kts,kte                & ! tile   dims
                                                                 )
 !----------------------------------------------------------------
+   use mpas_atmphys_column_mask, only: column_mask_on, column_active
    IMPLICIT NONE
 !----------------------------------------------------------------
    !  taken from the COMMAS code - WCS 10 May 1999.
@@ -97,6 +98,12 @@ CONTAINS
   microphysics_outer_j_loop: DO j = jts, jte
 
   sedimentation_outer_i_loop: DO i = its,ite
+
+   if (column_mask_on) then
+      if (.not. allocated(column_active)) cycle
+      if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+      if (.not. column_active(i)) cycle
+   end if
 
 !   vtmax = 0.
    crmax = 0.
@@ -202,6 +209,11 @@ CONTAINS
 
      DO k = kts, kte
      DO i = its, ite
+       if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+       end if
        factorn = 1.0 / (1.+c3*dt*amax1(0.,qr(i,k,j))**c4)
        qrprod = qc(i,k,j) * (1.0 - factorn)           &
              + factorn*c1*dt*amax1(qc(i,k,j)-c2,0.)      

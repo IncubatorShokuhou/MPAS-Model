@@ -15,6 +15,8 @@
  use mpas_atmphys_init_microphysics
  use mpas_atmphys_interface
  use mpas_atmphys_vars
+ use mpas_atmphys_utilities, only: physics_error_fatal
+ use mpas_atmphys_column_mask, only: column_mask_on, column_active, column_mask_next_segment
 
 !wrf physics:
  use module_mp_kessler
@@ -338,7 +340,8 @@
  character(len=StrKIND),pointer:: microp_scheme
 
 !local variables and arrays:
- integer:: istep
+ integer:: istep, cursor, segS, segE
+ logical:: segFound
 
 !CCPP-compliant flags:
  character(len=StrKIND):: errmsg
@@ -388,6 +391,11 @@
        call mpas_timer_start('mp_thompson')
        istep = 1
        do while (istep .le. n_microp)
+       ! Mask off: one segment, the original its:ite. Mask on: owned active runs.
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
        call mp_gt_driver( &
                   th        = th_p        , qv         = qv_p         , qc         = qc_p         , &
                   qr        = qr_p        , qi         = qi_p         , qs         = qs_p         , &
@@ -402,8 +410,9 @@
                   ntc       = ntc_p       , muc        = muc_p                                    , &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde           , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme           , &
-                  its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte             &
+                  its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte             &
                            )
+       end do
        istep = istep + 1
        enddo
        call mpas_timer_stop('mp_thompson')
@@ -412,6 +421,10 @@
        call mpas_timer_start('mp_thompson_aerosols')
        istep = 1
        do while (istep .le. n_microp)
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
        call mp_gt_driver( &
                   th        = th_p        , qv         = qv_p         , qc         = qc_p         , &
                   qr        = qr_p        , qi         = qi_p         , qs         = qs_p         , &
@@ -428,14 +441,19 @@
                   muc       = muc_p       ,                                                         &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde           , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme           , &
-                  its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte             &
+                  its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte             &
                            )
+       end do
           istep = istep + 1
           enddo
           call mpas_timer_stop('mp_thompson_aerosols')
 
     case ("mp_wsm6")
        call mpas_timer_start('mp_wsm6')
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
        call wsm6( &
                   th        = th_p        , q          = qv_p         , qc        = qc_p      , &
                   qr        = qr_p        , qi         = qi_p         , qs        = qs_p      , &
@@ -456,8 +474,9 @@
                   errmsg    = errmsg      , errflg     = errflg                               , &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde       , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme       , &
-                  its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte         &
+                  its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte         &
                )
+       end do
        call mpas_timer_stop('mp_wsm6')
 
     case default
@@ -470,7 +489,12 @@
     if(trim(microp_scheme) == "mp_wsm6"     .or. &
        trim(microp_scheme) == "mp_thompson" .or. &
        trim(microp_scheme) == "mp_thompson_aerosols") then
-       call compute_radar_reflectivity(configs,diag_physics,its,ite)
+       cursor = its
+       do
+          call column_mask_next_segment(cursor, ite, segS, segE, segFound)
+          if (.not. segFound) exit
+          call compute_radar_reflectivity(configs,diag_physics,segS,segE)
+       end do
     else
        call mpas_log_write('*** NOTICE: NOT computing simulated radar reflectivity')
        call mpas_log_write('            since WSM6 or Thompson microphysics scheme was not selected')
@@ -488,11 +512,15 @@
 !    dynamics grid:
  call microphysics_to_MPAS(configs,mesh,state,time_lev,diag,diag_physics,tend_physics,tend,its,ite)
 
-!... deallocation of all microphysics arrays:
+!... deallocation of all microphysics arrays. A masked level step keeps the
+! scratch allocated: the next level step reuses it instead of allocating
+! the full mesh again. One level and all-fine still free it.
 !$OMP BARRIER
+ if (.not. column_mask_on) then
 !$OMP MASTER
  call deallocate_microphysics(configs)
 !$OMP END MASTER
+ end if
 
 !call mpas_log_write('---enter subroutine driver_microphysics:')
 !call mpas_log_write('')
@@ -530,12 +558,22 @@
 !variables common to all cloud microphysics schemes:
  do j = jts, jte
  do i = its, ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
     rainncv_p(i,j) = 0._RKIND
     rainnc_p(i,j)  = 0._RKIND
  enddo
  enddo
 
  do i = its,ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
     rainncv(i) = 0._RKIND
  enddo
 
@@ -544,6 +582,11 @@
     case ("mp_thompson","mp_thompson_aerosols","mp_wsm6")
        do j = jts, jte
        do i = its, ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
           snowncv_p(i,j)    = 0._RKIND
           graupelncv_p(i,j) = 0._RKIND
           snownc_p(i,j)     = 0._RKIND
@@ -553,6 +596,11 @@
        enddo
 
        do i = its,ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
           snowncv(i)    = 0._RKIND
           graupelncv(i) = 0._RKIND
           sr(i)         = 0._RKIND
@@ -603,12 +651,22 @@
  call mpas_pool_get_array(diag_physics,'sr'        ,sr        )
 
  do i = its,ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
     precipw(i) = 0._RKIND
  enddo
 
 !variables common to all cloud microphysics schemes:
  do j = jts,jte
  do i = its,ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
 
     !precipitable water:
     do k = kts,kte
@@ -636,6 +694,11 @@
     case ("mp_thompson","mp_thompson_aerosols","mp_wsm6")
        do j = jts,jte
        do i = its,ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
           !time-step precipitation:
           snowncv(i)    = snownc_p(i,j)
           graupelncv(i) = graupelnc_p(i,j)
@@ -818,6 +881,11 @@
  call mpas_pool_get_array(diag,'relhum',relhum)
  do k = kts,kte
     do i = its,ite
+       if (column_mask_on) then
+       if (.not. allocated(column_active)) cycle
+       if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+       if (.not. column_active(i)) cycle
+       end if
        relhum(k,i) = 0._RKIND
     enddo
  enddo
@@ -829,6 +897,11 @@
 
  do j = jts,jte
  do i = its,ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
     do k = kts,kte
        p1d(k)  = pres_p(i,k,j)
        t1d(k)  = th_p(i,k,j) * pi_p(i,k,j)

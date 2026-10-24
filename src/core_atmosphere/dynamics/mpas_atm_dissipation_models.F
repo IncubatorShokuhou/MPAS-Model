@@ -7,10 +7,12 @@
 
 #define COMMA ,
 #define DEBUG_WRITE(M) ! call mpas_log_write(M)
+#include "hts_loops.h"
 
 module mpas_atm_dissipation_models
 
    use mpas_kind_types, only : RKIND
+   use mpas_atm_hts
    use mpas_constants
    use mpas_log
    use mpas_timekeeping, only : mpas_get_clock_time, mpas_get_time
@@ -153,7 +155,7 @@ contains
       !$acc parallel default(present)
 
       !$acc loop gang worker private(dudx, dudy, dvdx, dvdy, d_11, d_22, d_12)
-      do iCell = cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
 
          !$acc loop vector
          do k = 1, nVertLevels
@@ -277,7 +279,7 @@ contains
       !$acc parallel default(present)
 
       !$acc loop gang worker private(dudx, dudy, dvdx, dvdy, dwdx, dwdy, dudz, dvdz, dwdz, d_11, d_22, d_33, d_12, d_13, d_23)
-      do iCell = cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
 
          !$acc loop vector
          do k = 1, nVertLevels
@@ -505,7 +507,7 @@ contains
       !$acc parallel default(present)
 
       !$acc loop gang worker private(theta, temp, qvsw, coefa)
-      do iCell = cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
 
 !DIR$ IVDEP
          !$acc loop vector
@@ -687,7 +689,7 @@ contains
       if(les_model_opt /= LES_MODEL_NONE) tau_12_factor = 1.0
 
       !$acc loop gang worker
-      do iEdge=edgeStart,edgeEnd
+      HTS_WORK_EDGE_ALL_DO
          cell1 = cellsOnEdge(1,iEdge)
          cell2 = cellsOnEdge(2,iEdge)
          vertex1 = verticesOnEdge(1,iEdge)
@@ -732,7 +734,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker
-         do iVertex=vertexStart,vertexEnd
+         HTS_VERT_ALL_DO
             !$acc loop vector
             do k = 1, nVertLevels
                delsq_vorticity(k,iVertex) = 0.0_RKIND
@@ -751,7 +753,7 @@ contains
          end do
 
          !$acc loop gang worker
-         do iCell=cellStart,cellEnd
+         HTS_WORK_CELL_ALL_DO
             !$acc loop vector
             do k = 1, nVertLevels
                delsq_divergence(k,iCell) = 0.0_RKIND
@@ -778,7 +780,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker
-         do iEdge=edgeSolveStart,edgeSolveEnd
+         HTS_WORK_EDGE_SOLVE_DO
             cell1 = cellsOnEdge(1,iEdge)
             cell2 = cellsOnEdge(2,iEdge)
             vertex1 = verticesOnEdge(1,iEdge)
@@ -820,7 +822,7 @@ contains
             !$acc parallel default(present)
 
             !$acc loop gang worker
-            do iEdge=edgeSolveStart,edgeSolveEnd
+            HTS_WORK_EDGE_SOLVE_DO
 
                cell1 = cellsOnEdge(1,iEdge)
                cell2 = cellsOnEdge(2,iEdge)
@@ -850,7 +852,7 @@ contains
             !$acc parallel default(present)
 
             !$acc loop gang worker private(u_mix)
-            do iEdge=edgeSolveStart,edgeSolveEnd
+            HTS_WORK_EDGE_SOLVE_DO
 
                cell1 = cellsOnEdge(1,iEdge)
                cell2 = cellsOnEdge(2,iEdge)
@@ -890,7 +892,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker private(turb_vflux)
-         do iEdge=edgeSolveStart,edgeSolveEnd
+         HTS_WORK_EDGE_SOLVE_DO
 
             cell1 = cellsOnEdge(1,iEdge)
             cell2 = cellsOnEdge(2,iEdge)
@@ -1029,7 +1031,7 @@ contains
       !$acc parallel default(present)
 
       !$acc loop gang worker
-      do iCell=cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
 
          !$acc loop vector
          do k = 1, nVertLevels
@@ -1075,7 +1077,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker
-         do iCell=cellSolveStart,cellSolveEnd    ! Technically updating fewer cells than before...
+         HTS_WORK_CELL_SOLVE_DO
 
             r_areaCell = h_mom_eddy_visc4 * invAreaCell(iCell)
 
@@ -1104,7 +1106,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker
-         do iCell=cellSolveStart,cellSolveEnd
+         HTS_WORK_CELL_SOLVE_DO
 !DIR$ IVDEP
             !$acc loop vector
             do k=2,nVertLevels
@@ -1123,7 +1125,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker private(turb_vflux)
-         do iCell = cellSolveStart,cellSolveEnd ! vertical mixing for each column
+         HTS_WORK_CELL_SOLVE_DO
             ! compute turbulent fluxes
      
             !$acc loop vector
@@ -1265,7 +1267,7 @@ contains
       !$acc parallel default(present)
 
       !$acc loop gang worker
-      do iCell=cellStart,cellEnd
+      HTS_WORK_CELL_ALL_DO
 
          !$acc loop vector
          do k = 1, nVertLevels
@@ -1308,7 +1310,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker
-         do iCell=cellSolveStart,cellSolveEnd    ! Technically updating fewer cells than before...
+         HTS_WORK_CELL_SOLVE_DO
             r_areaCell = h_theta_eddy_visc4 * prandtl_inv * invAreaCell(iCell)
 
             !$acc loop seq
@@ -1338,7 +1340,7 @@ contains
             !$acc parallel default(present)
 
             !$acc loop gang worker
-            do iCell=cellStart,cellEnd
+            HTS_WORK_CELL_ALL_DO
                !$acc loop vector
                do k = 1, nVertLevels
                   delsq_theta(k,iCell) = 0.0_RKIND
@@ -1380,7 +1382,7 @@ contains
                !$acc parallel default(present)
 
                !$acc loop gang worker
-               do iCell=cellSolveStart,cellSolveEnd    ! Technically updating fewer cells than before...
+               HTS_WORK_CELL_SOLVE_DO
 
                   r_areaCell = h_theta_eddy_visc4 * prandtl_inv * invAreaCell(iCell)
 
@@ -1418,7 +1420,7 @@ contains
             !$acc parallel default(present)
 
             !$acc loop gang worker
-            do iCell = cellSolveStart,cellSolveEnd
+            HTS_WORK_CELL_SOLVE_DO
 
                !$acc loop vector
                do k=2,nVertLevels-1
@@ -1444,7 +1446,7 @@ contains
             !$acc parallel default(present)
 
             !$acc loop gang worker
-            do iCell = cellSolveStart,cellSolveEnd
+            HTS_WORK_CELL_SOLVE_DO
 
                !$acc loop vector
                do k=2,nVertLevels-1
@@ -1474,7 +1476,7 @@ contains
          !$acc parallel default(present)
 
          !$acc loop gang worker private(turb_vflux, turb_vflux_scalars, prandtl_1d_inverse, rho_k_at_w, zz_at_w)
-         do iCell = cellSolveStart,cellSolveEnd ! vertical mixing for each column
+         HTS_WORK_CELL_SOLVE_DO
             ! compute turbulent fluxes
 
             turb_vflux(nVertlevels+1) = 0.  !  no turbulent flux out of the domain
