@@ -25,6 +25,7 @@ module mpas_atm_hts
    public :: atm_hts_sync_finer, atm_hts_accumulate_flux, atm_hts_prepare_targets
    public :: atm_hts_clear_consumed, atm_hts_correct_mass
    public :: hts_restrict_physics_tendencies
+   public :: hts_exch_layer1
 
    logical, public :: hts_enabled = .false.
    logical, public :: hts_masking = .false.
@@ -97,6 +98,24 @@ module mpas_atm_hts
    integer, public, allocatable :: hts_level_edge(:,:)
    integer, public, allocatable :: hts_ac_cell(:,:)
    integer, public, allocatable :: hts_recon_own(:,:)
+
+   ! Per-substep acoustic halo. rho_pp and rtheta_pp are read only on the
+   ! two cells of an active edge, so the message carries cells that touch the
+   ! active level. The non-HTS path does not call this exchange.
+   logical, public :: hts_ah_ready = .false.
+   integer :: hts_ah_nvert = 0
+   integer :: hts_ah_nsend(0:hts_level_cap) = 0
+   integer :: hts_ah_nrecv(0:hts_level_cap) = 0
+   integer, allocatable :: hts_ah_send_proc(:,:)
+   integer, allocatable :: hts_ah_send_n(:,:)
+   integer, allocatable :: hts_ah_send_off(:,:)
+   integer, allocatable :: hts_ah_send_cell(:)
+   integer, allocatable :: hts_ah_recv_proc(:,:)
+   integer, allocatable :: hts_ah_recv_n(:,:)
+   integer, allocatable :: hts_ah_recv_off(:,:)
+   integer, allocatable :: hts_ah_recv_cell(:)
+   real (kind=RKIND), allocatable :: hts_ah_sbuf(:)
+   real (kind=RKIND), allocatable :: hts_ah_rbuf(:)
 
    real (kind=R8KIND), allocatable :: hts_flux_sum(:,:)
 
@@ -286,6 +305,7 @@ module mpas_atm_hts
       call mpas_log_write(' column physics runs on the active level; microphysics skips the other columns')
 
       call atm_hts_build_lists(block)
+      call atm_hts_build_acoustic_halo(block)
 
       allocate(hts_ru_target(nVertLevels, nEdges+1))
       allocate(hts_flux_sum(nVertLevels, nEdges+1))
@@ -367,6 +387,17 @@ module mpas_atm_hts
       if (allocated(hts_level_edge)) deallocate(hts_level_edge)
       if (allocated(hts_ac_cell)) deallocate(hts_ac_cell)
       if (allocated(hts_recon_own)) deallocate(hts_recon_own)
+      if (allocated(hts_ah_send_proc)) deallocate(hts_ah_send_proc)
+      if (allocated(hts_ah_send_n)) deallocate(hts_ah_send_n)
+      if (allocated(hts_ah_send_off)) deallocate(hts_ah_send_off)
+      if (allocated(hts_ah_send_cell)) deallocate(hts_ah_send_cell)
+      if (allocated(hts_ah_recv_proc)) deallocate(hts_ah_recv_proc)
+      if (allocated(hts_ah_recv_n)) deallocate(hts_ah_recv_n)
+      if (allocated(hts_ah_recv_off)) deallocate(hts_ah_recv_off)
+      if (allocated(hts_ah_recv_cell)) deallocate(hts_ah_recv_cell)
+      if (allocated(hts_ah_sbuf)) deallocate(hts_ah_sbuf)
+      if (allocated(hts_ah_rbuf)) deallocate(hts_ah_rbuf)
+      hts_ah_ready = .false.
 
    end subroutine atm_hts_finalize
 
@@ -1366,6 +1397,320 @@ module mpas_atm_hts
       end do
 
    end subroutine hts_restrict_physics_tendencies
+
+
+   subroutine atm_hts_build_acoustic_halo(block)
+
+      ! Compact layer-1 lists for cells that touch the active level. A cell is
+      ! in the list when its own level matches or one of its edges does, which
+      ! is the same answer on every rank that holds the cell. Send and receive
+      ! counts are checked with an all-to-all. A mismatch keeps the full
+      ! dynamics:rho_pp and dynamics:rtheta_pp groups.
+
+#ifdef MPAS_USE_MPI_F08
+      use mpi_f08, only : MPI_Comm, MPI_INTEGER, MPI_SUM, MPI_Alltoall, MPI_Allreduce
+#else
+      use mpi, only : MPI_INTEGER, MPI_SUM, MPI_Alltoall, MPI_Allreduce
+#endif
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: diag, mesh
+      type (field2DReal), pointer :: fld
+      type (mpas_exchange_list), pointer :: exch
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      logical, allocatable :: touch(:,:)
+      integer, allocatable :: sendCounts(:), recvExpect(:), myRecv(:)
+      integer :: L, iEdge, iCell, cell1, cell2, j, n, nmsg, sendOff, recvOff, fullN, sent
+      integer :: nprocs, maxMsg, maxBuf, localBad, globalBad, ierr
+#ifdef MPAS_USE_MPI_F08
+      type (MPI_Comm) :: comm
+#else
+      integer :: comm
+#endif
+
+      hts_ah_ready = .false.
+      hts_ah_nsend(:) = 0
+      hts_ah_nrecv(:) = 0
+      if (hts_max_level_used < 1) return
+      if (.not. allocated(hts_cell_level)) return
+
+      nullify(diag, mesh, fld)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_field(diag, 'rho_pp', fld)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      if (.not. associated(fld)) return
+      if (.not. associated(fld % sendList)) return
+      if (.not. associated(fld % recvList)) return
+      if (.not. associated(fld % sendList % halos)) return
+      if (size(fld % sendList % halos) < 1) return
+      if (size(fld % recvList % halos) < 1) return
+
+      nprocs = block % domain % dminfo % nprocs
+      comm = block % domain % dminfo % comm
+
+      allocate(touch(hts_nCells, 0:hts_max_level_used))
+      touch(:, :) = .false.
+      do iCell = 1, hts_nCells
+         L = hts_cell_level(iCell)
+         if (L >= 0 .and. L <= hts_max_level_used) touch(iCell, L) = .true.
+      end do
+      do iEdge = 1, hts_nEdges
+         L = hts_edge_level(iEdge)
+         if (L < 0 .or. L > hts_max_level_used) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         if (cell1 >= 1 .and. cell1 <= hts_nCells) touch(cell1, L) = .true.
+         if (cell2 >= 1 .and. cell2 <= hts_nCells) touch(cell2, L) = .true.
+      end do
+
+      maxMsg = 0
+      exch => fld % sendList % halos(1) % exchList
+      do while (associated(exch))
+         maxMsg = maxMsg + 1
+         exch => exch % next
+      end do
+      exch => fld % recvList % halos(1) % exchList
+      n = 0
+      do while (associated(exch))
+         n = n + 1
+         exch => exch % next
+      end do
+      maxMsg = max(maxMsg, n, 1)
+
+      allocate(hts_ah_send_proc(maxMsg, 0:hts_max_level_used))
+      allocate(hts_ah_send_n(maxMsg, 0:hts_max_level_used))
+      allocate(hts_ah_send_off(maxMsg, 0:hts_max_level_used))
+      allocate(hts_ah_recv_proc(maxMsg, 0:hts_max_level_used))
+      allocate(hts_ah_recv_n(maxMsg, 0:hts_max_level_used))
+      allocate(hts_ah_recv_off(maxMsg, 0:hts_max_level_used))
+      allocate(hts_ah_send_cell(max(hts_nCells, 1) * (hts_max_level_used + 1)))
+      allocate(hts_ah_recv_cell(max(hts_nCells, 1) * (hts_max_level_used + 1)))
+      hts_ah_send_n(:, :) = 0
+      hts_ah_recv_n(:, :) = 0
+
+      allocate(sendCounts(0:nprocs-1), recvExpect(0:nprocs-1), myRecv(0:nprocs-1))
+
+      localBad = 0
+      maxBuf = 0
+      sendOff = 0
+      recvOff = 0
+      do L = 0, hts_max_level_used
+         nmsg = 0
+         fullN = 0
+         sent = 0
+         exch => fld % sendList % halos(1) % exchList
+         do while (associated(exch))
+            fullN = fullN + exch % nList
+            n = 0
+            do iCell = 1, exch % nList
+               cell1 = exch % srcList(iCell)
+               if (cell1 >= 1 .and. cell1 <= hts_nCells) then
+                  if (touch(cell1, L)) then
+                     if (sendOff + sent + n + 1 > size(hts_ah_send_cell)) then
+                        localBad = 1
+                     else
+                        hts_ah_send_cell(sendOff + sent + n + 1) = cell1
+                     end if
+                     n = n + 1
+                  end if
+               end if
+            end do
+            if (n > 0) then
+               nmsg = nmsg + 1
+               if (nmsg > maxMsg) then
+                  localBad = 1
+               else
+                  hts_ah_send_proc(nmsg, L) = exch % endPointID
+                  hts_ah_send_n(nmsg, L) = n
+                  hts_ah_send_off(nmsg, L) = sendOff + sent
+               end if
+               sent = sent + n
+            end if
+            exch => exch % next
+         end do
+         hts_ah_nsend(L) = nmsg
+
+         nmsg = 0
+         n = 0
+         exch => fld % recvList % halos(1) % exchList
+         do while (associated(exch))
+            j = 0
+            do iCell = 1, exch % nList
+               cell1 = exch % destList(iCell)
+               if (cell1 >= 1 .and. cell1 <= hts_nCells) then
+                  if (touch(cell1, L)) then
+                     if (recvOff + n + j + 1 > size(hts_ah_recv_cell)) then
+                        localBad = 1
+                     else
+                        hts_ah_recv_cell(recvOff + n + j + 1) = cell1
+                     end if
+                     j = j + 1
+                  end if
+               end if
+            end do
+            if (j > 0) then
+               nmsg = nmsg + 1
+               if (nmsg > maxMsg) then
+                  localBad = 1
+               else
+                  hts_ah_recv_proc(nmsg, L) = exch % endPointID
+                  hts_ah_recv_n(nmsg, L) = j
+                  hts_ah_recv_off(nmsg, L) = recvOff + n
+               end if
+               n = n + j
+            end if
+            exch => exch % next
+         end do
+         hts_ah_nrecv(L) = nmsg
+
+         sendCounts(:) = 0
+         myRecv(:) = 0
+         do j = 1, hts_ah_nsend(L)
+            cell1 = hts_ah_send_proc(j, L)
+            if (cell1 < 0 .or. cell1 >= nprocs) then
+               localBad = 1
+            else
+               sendCounts(cell1) = hts_ah_send_n(j, L)
+            end if
+         end do
+         do j = 1, hts_ah_nrecv(L)
+            cell1 = hts_ah_recv_proc(j, L)
+            if (cell1 < 0 .or. cell1 >= nprocs) then
+               localBad = 1
+            else
+               myRecv(cell1) = hts_ah_recv_n(j, L)
+            end if
+         end do
+         call MPI_Alltoall(sendCounts, 1, MPI_INTEGER, recvExpect, 1, MPI_INTEGER, comm, ierr)
+         do cell1 = 0, nprocs - 1
+            if (recvExpect(cell1) /= myRecv(cell1)) localBad = 1
+         end do
+
+         maxBuf = max(maxBuf, sent, n)
+         call mpas_log_write(' level $i acoustic halo send cells $i of $i', intArgs=(/L, sent, fullN/))
+         sendOff = sendOff + sent
+         recvOff = recvOff + n
+      end do
+
+      deallocate(touch, sendCounts, recvExpect, myRecv)
+
+      call MPI_Allreduce(localBad, globalBad, 1, MPI_INTEGER, MPI_SUM, comm, ierr)
+      if (globalBad /= 0) then
+         hts_ah_ready = .false.
+         call mpas_log_write(' acoustic halo lists do not match; keeping the full layer-1 groups')
+         return
+      end if
+
+      hts_ah_nvert = hts_nVert
+      allocate(hts_ah_sbuf(max(maxBuf, 1) * hts_nVert))
+      allocate(hts_ah_rbuf(max(maxBuf, 1) * hts_nVert))
+      hts_ah_ready = .true.
+      call mpas_log_write(' acoustic halo lists match; layer-1 rho_pp and rtheta_pp use them')
+
+   end subroutine atm_hts_build_acoustic_halo
+
+
+   subroutine hts_exch_layer1(domain, field)
+
+      ! Exchange one layer-1 cell field on the active level's compact list.
+      ! Every rank enters the calls. The caller has already checked hts_ah_ready.
+
+#ifdef MPAS_USE_MPI_F08
+      use mpi_f08, only : MPI_Comm, MPI_Request, MPI_Datatype, MPI_STATUSES_IGNORE, &
+                          MPI_REAL, MPI_DOUBLE_PRECISION, MPI_Irecv, MPI_Isend, MPI_Waitall
+#else
+      use mpi, only : MPI_STATUSES_IGNORE, MPI_REAL, MPI_DOUBLE_PRECISION, &
+                      MPI_Irecv, MPI_Isend, MPI_Waitall
+#endif
+
+      implicit none
+
+      type (domain_type), intent(in) :: domain
+      real (kind=RKIND), intent(inout) :: field(:,:)
+
+#ifdef MPAS_USE_MPI_F08
+#ifdef SINGLE_PRECISION
+      type (MPI_Datatype), parameter :: MPI_REALKIND = MPI_REAL
+#else
+      type (MPI_Datatype), parameter :: MPI_REALKIND = MPI_DOUBLE_PRECISION
+#endif
+      type (MPI_Comm) :: comm
+      type (MPI_Request), allocatable :: sreq(:), rreq(:)
+#else
+#ifdef SINGLE_PRECISION
+      integer, parameter :: MPI_REALKIND = MPI_REAL
+#else
+      integer, parameter :: MPI_REALKIND = MPI_DOUBLE_PRECISION
+#endif
+      integer :: comm
+      integer, allocatable :: sreq(:), rreq(:)
+#endif
+
+      integer :: L, i, j, k, n, iCell, base, rank, ierr
+      integer :: nVert
+
+      L = hts_active_level
+      nVert = hts_ah_nvert
+      if (L < 0 .or. L > hts_max_level_used) return
+      if (nVert < 1) return
+
+      call mpas_timer_start('hts_acoustic_halo')
+
+      comm = domain % dminfo % comm
+      rank = domain % dminfo % my_proc_id
+      allocate(sreq(max(hts_ah_nsend(L), 1)))
+      allocate(rreq(max(hts_ah_nrecv(L), 1)))
+
+      base = 0
+      do i = 1, hts_ah_nrecv(L)
+         n = hts_ah_recv_n(i, L)
+         call MPI_Irecv(hts_ah_rbuf(base + 1), n * nVert, MPI_REALKIND, hts_ah_recv_proc(i, L), &
+                        hts_ah_recv_proc(i, L), comm, rreq(i), ierr)
+         base = base + n * nVert
+      end do
+
+      base = 0
+      do i = 1, hts_ah_nsend(L)
+         n = hts_ah_send_n(i, L)
+         do j = 1, n
+            iCell = hts_ah_send_cell(hts_ah_send_off(i, L) + j)
+            do k = 1, nVert
+               hts_ah_sbuf(base + (j - 1) * nVert + k) = field(k, iCell)
+            end do
+         end do
+         call MPI_Isend(hts_ah_sbuf(base + 1), n * nVert, MPI_REALKIND, hts_ah_send_proc(i, L), &
+                        rank, comm, sreq(i), ierr)
+         base = base + n * nVert
+      end do
+
+      if (hts_ah_nrecv(L) > 0) then
+         call MPI_Waitall(hts_ah_nrecv(L), rreq, MPI_STATUSES_IGNORE, ierr)
+      end if
+
+      base = 0
+      do i = 1, hts_ah_nrecv(L)
+         n = hts_ah_recv_n(i, L)
+         do j = 1, n
+            iCell = hts_ah_recv_cell(hts_ah_recv_off(i, L) + j)
+            do k = 1, nVert
+               field(k, iCell) = hts_ah_rbuf(base + (j - 1) * nVert + k)
+            end do
+         end do
+         base = base + n * nVert
+      end do
+
+      if (hts_ah_nsend(L) > 0) then
+         call MPI_Waitall(hts_ah_nsend(L), sreq, MPI_STATUSES_IGNORE, ierr)
+      end if
+      deallocate(sreq, rreq)
+
+      call mpas_timer_stop('hts_acoustic_halo')
+
+   end subroutine hts_exch_layer1
 
 
 end module mpas_atm_hts

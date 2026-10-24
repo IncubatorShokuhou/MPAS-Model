@@ -2609,7 +2609,11 @@ module atm_time_integration
                MPAS_ACC_TIMER_START('atm_srk3: halo_exchanges + ACC_data_xfer')
                call mpas_pool_get_array(diag, 'rho_pp', rho_pp)
                !$acc update self(rho_pp) if (.not. config_gpu_aware_mpi)
-               call exchange_halo_group(domain, 'dynamics:rho_pp', config_gpu_aware_mpi)
+               if (hts_ah_ready .and. hts_masking .and. hts_max_level_used > 0) then
+                  call hts_exch_layer1(domain, rho_pp)
+               else
+                  call exchange_halo_group(domain, 'dynamics:rho_pp', config_gpu_aware_mpi)
+               end if
                !$acc update device(rho_pp) if (.not. config_gpu_aware_mpi)
                MPAS_ACC_TIMER_STOP('atm_srk3: halo_exchanges + ACC_data_xfer')
 
@@ -2636,7 +2640,11 @@ module atm_time_integration
                MPAS_ACC_TIMER_START('atm_srk3: halo_exchanges + ACC_data_xfer')
                call mpas_pool_get_array(diag, 'rtheta_pp', rtheta_pp)
                !$acc update self(rtheta_pp) if (.not. config_gpu_aware_mpi)
-               call exchange_halo_group(domain, 'dynamics:rtheta_pp', config_gpu_aware_mpi)
+               if (hts_ah_ready .and. hts_masking .and. hts_max_level_used > 0) then
+                  call hts_exch_layer1(domain, rtheta_pp)
+               else
+                  call exchange_halo_group(domain, 'dynamics:rtheta_pp', config_gpu_aware_mpi)
+               end if
                !$acc update device(rtheta_pp) if (.not. config_gpu_aware_mpi)
                MPAS_ACC_TIMER_STOP('atm_srk3: halo_exchanges + ACC_data_xfer')
 
