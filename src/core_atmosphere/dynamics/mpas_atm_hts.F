@@ -17,6 +17,7 @@ module mpas_atm_hts
    use mpas_log
    use mpas_constants
    use mpas_timer, only: mpas_timer_start, mpas_timer_stop
+   use mpas_atmphys_control, only: moist_physics
 
    implicit none
 
@@ -266,6 +267,14 @@ module mpas_atm_hts
       L = config_hts_max_level
       if (L < 0) L = 0
       if (L > hts_level_cap) L = hts_level_cap
+      ! Moist columns share one step across dynamics, Kessler, and PBL/Noah.
+      ! Level 3 is 240 s at dt = 30 s. That step grew w at cell 3177 (job
+      ! 200248). Four 60 s dynamics steps under one 240 s PBL call
+      ! (0fa07c436) left that w on the same path and grew a near-surface u
+      ! oscillation on interior edge 64121 (job 201240). Cap the moist level
+      ! at 2 so the coarse step is 120 s and every process uses that dt.
+      ! Dry dynamics keeps config_hts_max_level.
+      if (moist_physics .and. L > 2) L = 2
 
       do iCell = 1, nCells
          if (uniform .or. meshDensity(iCell) <= 0.0_RKIND) then
@@ -330,6 +339,9 @@ module mpas_atm_hts
       call mpas_log_write('--- hierarchical time stepping ---')
       if (hts_enabled) then
          call mpas_log_write(' config_hts = true, config_hts_max_level = $i', intArgs=(/config_hts_max_level/))
+         if (moist_physics .and. config_hts_max_level > hts_max_level_used) then
+            call mpas_log_write(' moist physics caps the active level at $i', intArgs=(/hts_max_level_used/))
+         end if
       else
          call mpas_log_write(' config_hts = false (integrator is unchanged)')
       end if

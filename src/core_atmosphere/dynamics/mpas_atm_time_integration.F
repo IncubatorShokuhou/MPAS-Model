@@ -52,11 +52,6 @@ module atm_time_integration
 
    integer :: timerid, secs, u_secs
 
-   ! While a moist coarse level is split into shorter coupled steps, this is
-   ! dt_sub/config_dt. Zero means a normal level step: multiply the acoustic
-   ! count by 2^L so the acoustic step stays the fine dts.
-   integer :: hts_acoustic_steps = 0
-
    ! Used to store physics tendencies for dynamics variables
    real (kind=RKIND), dimension(:,:), pointer :: tend_ru_physics, tend_rtheta_physics, tend_rho_physics
    
@@ -1998,23 +1993,16 @@ module atm_time_integration
          call atm_hts_apply_interpolation(block, L)
          call hts_refresh_wind()
 #ifdef DO_PHYSICS
+         ! One coupled step. Dynamics, Kessler, and the PBL/Noah call below
+         ! all use dt_level. Moist runs cap the level at 2 (120 s at dt = 30 s)
+         ! in atm_hts_setup. A 240 s step grew w at cell 3177 (job 200248).
+         ! Splitting that step into 4x60 s dynamics under one 240 s PBL call
+         ! (0fa07c436) left 3177 on the same trajectory and grew a near-surface
+         ! u oscillation on interior edge 64121 (job 201240, |u| 221 at 03:12).
          call hts_level_column_physics(domain, itimestep, L, dt_level)
-#endif
-#ifdef DO_PHYSICS
-         ! Cell 3177 is level 3, 97 cells from any other level. One 240 s
-         ! Kessler step there doubled w every 30 min (job 200248). Splitting
-         ! every level into config_dt dynamics steps (cb274ed09, job 201055)
-         ! matched that accuracy and cost 0.756x, because each substep was a
-         ! full-domain pass. Only the coarsest level is split, and only into
-         ! four steps, so a level-3 step is 60 s. Finer levels stay one long
-         ! step. PBL and Noah stay one call at the level dt.
-         if (moist_physics .and. L == hts_max_level_used .and. ratio >= 4) then
-            call atm_hts_moist_fine_dynamics(domain, dt, ratio, itimestep, exchange_halo_group)
-         else
 #endif
          call atm_srk3(domain, dt_level, itimestep, exchange_halo_group)
 #ifdef DO_PHYSICS
-         end if
          call hts_clear_column_mask()
 #endif
          call atm_hts_restore_above(block, L)
@@ -2086,130 +2074,6 @@ module atm_time_integration
    end subroutine atm_hts_copy_idle_scalars
 
 
-   subroutine atm_hts_moist_fine_dynamics(domain, dt_fine, ratio, itimestep, exchange_halo_group)
-
-      ! Split the coarsest moist level into at most four coupled steps.
-      ! Level 3 is 60 s instead of 240 s, so Kessler sees a quarter of the
-      ! ascent and w is integrated on that same step. The acoustic count is
-      ! dt_sub/config_dt, which keeps dts at the fine acoustic step. ruAvg
-      ! is the mean of the substeps. The level-dt PBL/Noah call has already
-      ! run. Doing this on every level, at config_dt, was a full-domain pass
-      ! per level (job 201055, 0.756x).
-
-      implicit none
-
-      type (domain_type), intent(inout) :: domain
-      real (kind=RKIND), intent(in) :: dt_fine
-      integer, intent(in) :: ratio, itimestep
-      procedure (halo_exchange_routine) :: exchange_halo_group
-
-      type (mpas_pool_type), pointer :: diag
-      real (kind=RKIND), dimension(:,:), pointer :: ruAvg
-      real (kind=RKIND), dimension(:,:), allocatable :: ru_sum
-      real (kind=RKIND) :: dt_sub
-      integer :: isub, iEdge, k, nVert, nEdges, nsub, scale
-
-      nsub = min(ratio, 4)
-      scale = ratio / nsub
-      dt_sub = dt_fine * real(scale, RKIND)
-
-      nullify(diag, ruAvg)
-      call mpas_pool_get_subpool(block % structs, 'diag', diag)
-      call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
-      nVert = size(ruAvg, 1)
-      nEdges = size(ruAvg, 2)
-      allocate(ru_sum(nVert, nEdges))
-      ru_sum(:, :) = 0.0_RKIND
-
-      hts_acoustic_steps = scale
-      do isub = 1, nsub
-         call atm_srk3(domain, dt_sub, itimestep, exchange_halo_group)
-         do iEdge = 1, nEdges
-            if (iEdge > size(hts_edge_level)) cycle
-            if (hts_edge_level(iEdge) /= hts_active_level) then
-               if (.not. (allocated(hts_impose_edge) .and. hts_impose_edge(iEdge))) cycle
-            end if
-            do k = 1, nVert
-               ru_sum(k, iEdge) = ru_sum(k, iEdge) + ruAvg(k, iEdge)
-            end do
-         end do
-         if (isub < nsub) call atm_hts_promote_active_state(block)
-      end do
-      hts_acoustic_steps = 0
-
-      do iEdge = 1, nEdges
-         if (iEdge > size(hts_edge_level)) cycle
-         if (hts_edge_level(iEdge) /= hts_active_level) then
-            if (.not. (allocated(hts_impose_edge) .and. hts_impose_edge(iEdge))) cycle
-         end if
-         do k = 1, nVert
-            ruAvg(k, iEdge) = ru_sum(k, iEdge) / real(nsub, RKIND)
-         end do
-      end do
-      deallocate(ru_sum)
-
-   end subroutine atm_hts_moist_fine_dynamics
-
-
-   subroutine atm_hts_promote_active_state(block)
-
-      ! The next fine dynamics step copies time level 1 onto time level 2.
-      ! Keep the state this substep just wrote.
-
-      implicit none
-
-      type (block_type), intent(in) :: block
-
-      type (mpas_pool_type), pointer :: state
-      real (kind=RKIND), dimension(:,:), pointer :: u1, u2, w1, w2, th1, th2, rho1, rho2
-      real (kind=RKIND), dimension(:,:,:), pointer :: s1, s2
-      integer :: iCell, iEdge, k, j, nCells, nEdges, nVert, nW, nScalars
-
-      nullify(state, u1, u2, w1, w2, th1, th2, rho1, rho2, s1, s2)
-      call mpas_pool_get_subpool(block % structs, 'state', state)
-      call mpas_pool_get_array(state, 'u', u1, 1)
-      call mpas_pool_get_array(state, 'u', u2, 2)
-      call mpas_pool_get_array(state, 'w', w1, 1)
-      call mpas_pool_get_array(state, 'w', w2, 2)
-      call mpas_pool_get_array(state, 'theta_m', th1, 1)
-      call mpas_pool_get_array(state, 'theta_m', th2, 2)
-      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
-      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
-      call mpas_pool_get_array(state, 'scalars', s1, 1)
-      call mpas_pool_get_array(state, 'scalars', s2, 2)
-
-      nCells = min(size(hts_cell_level) - 1, size(th1, 2), size(th2, 2))
-      nEdges = min(size(hts_edge_level), size(u1, 2), size(u2, 2))
-      nVert = min(size(th1, 1), size(th2, 1))
-      nW = min(size(w1, 1), size(w2, 1))
-
-      do iCell = 1, nCells
-         if (hts_cell_level(iCell) /= hts_active_level) cycle
-         do k = 1, nVert
-            th1(k, iCell) = th2(k, iCell)
-            rho1(k, iCell) = rho2(k, iCell)
-         end do
-         do k = 1, nW
-            w1(k, iCell) = w2(k, iCell)
-         end do
-         if (associated(s1) .and. associated(s2)) then
-            nScalars = min(size(s1, 1), size(s2, 1))
-            do k = 1, min(nVert, size(s1, 2), size(s2, 2))
-               do j = 1, nScalars
-                  s1(j, k, iCell) = s2(j, k, iCell)
-               end do
-            end do
-         end if
-      end do
-
-      do iEdge = 1, nEdges
-         if (hts_edge_level(iEdge) /= hts_active_level) cycle
-         do k = 1, min(nVert, size(u1, 1), size(u2, 1))
-            u1(k, iEdge) = u2(k, iEdge)
-         end do
-      end do
-
-   end subroutine atm_hts_promote_active_state
 
 
    subroutine atm_timestep(domain, dt, nowTime, itimestep, exchange_halo_group)
@@ -2495,11 +2359,7 @@ module atm_time_integration
       ! Match the fine acoustic step on coarser levels. A longer acoustic step
       ! put the w error on the interface cells and the solution later became NaN.
       if (hts_masking .and. hts_active_level > 0) then
-         if (hts_acoustic_steps > 0) then
-            number_of_sub_steps = number_of_sub_steps * hts_acoustic_steps
-         else
-            number_of_sub_steps = number_of_sub_steps * ishft(1, hts_active_level)
-         end if
+         number_of_sub_steps = number_of_sub_steps * ishft(1, hts_active_level)
       end if
 
       if(config_time_integration_order == 3) then
@@ -6975,17 +6835,12 @@ module atm_time_integration
       prandtl_inv = 1.0_RKIND / prandtl
       invDt = 1.0_RKIND / dt
 #ifdef DO_PHYSICS
-      ! The Smagorinsky cap is 0.01*len^2/dt. On a 240 s level-3 step that
-      ! binds at one eighth the all-fine deformation, so a grid-scale mode
-      ! is under-mixed. Use the fine dt. k*dt/len^2 is then 0.01 times the
-      ! acoustic scale (0.08 at 60 s on level 3), still inside the explicit
-      ! limit the 0.01 factor is there to protect. Dry dynamics leaves it.
+      ! The Smagorinsky cap is 0.01*len^2/dt. A 120 s moist step would bind
+      ! at a quarter of the all-fine deformation. Use the fine dt so the
+      ! mixing coefficient matches a 30 s step. k*dt/len^2 is then 0.04 at
+      ! 120 s, still inside the explicit limit. Dry dynamics leaves it.
       if (moist_physics .and. hts_masking .and. hts_active_level > 0) then
-         if (hts_acoustic_steps > 0) then
-            invDt = real(hts_acoustic_steps, RKIND) / dt
-         else
-            invDt = real(ishft(1, min(hts_active_level, 3)), RKIND) / dt
-         end if
+         invDt = real(ishft(1, min(hts_active_level, 3)), RKIND) / dt
       end if
 #endif
       inv_r_earth = 1.0_RKIND / r_earth
@@ -9808,11 +9663,10 @@ module atm_time_integration
       dt_pbl = dt
       dt_microp = dt
       n_microp = 1
-      ! Kessler and WSM6 stay one call of the dt passed in. The moist coarse
-      ! path passes config_dt once per fine dynamics step, so this stays 1.
-      ! Raising n_microp inside one long dynamics step, stacked on the
-      ! PBL/Noah subcycle, NaNed the eds land VR at 00:45. Thompson keeps
-      ! the 90 s substep it uses at init.
+      ! Kessler and WSM6 stay one call of the dt passed in. That dt is the
+      ! level step. Raising n_microp inside one long dynamics step, stacked
+      ! on the PBL/Noah subcycle, NaNed the eds land VR at 00:45. Thompson
+      ! keeps the 90 s substep it uses at init.
 
       nullify(microp_scheme)
       call mpas_pool_get_config(configs, 'config_microp_scheme', microp_scheme)
