@@ -95,6 +95,9 @@ module mpas_atm_hts
    ! the following fine step copies the new snapshot into both time levels.
    logical, public :: hts_hold_valid(0:hts_level_cap) = .false.
    logical, public :: hts_hold_rewrote(0:hts_level_cap) = .false.
+   ! True after a level has completed one interval, so the next finer steps
+   ! can blend toward that realized increment. The first interval stays a hold.
+   logical, public :: hts_have_delta(0:hts_level_cap) = .false.
    integer, public, allocatable :: hts_work_own(:,:)
    integer, public, allocatable :: hts_work_all(:,:)
    integer, public, allocatable :: hts_active_own(:,:)
@@ -179,6 +182,7 @@ module mpas_atm_hts
       hts_max_flux_resid = 0.0_RKIND
       hts_hold_valid(:) = .false.
       hts_hold_rewrote(:) = .false.
+      hts_have_delta(:) = .false.
 
       block => domain % blocklist
       nBlocks = 0
@@ -1001,7 +1005,9 @@ module mpas_atm_hts
                end do
             end do
             hts_level_started(L) = .true.
+            hts_have_delta(L) = .false.
          else
+            hts_have_delta(L) = .true.
             do i = 1, hts_n_active_all(L)
                iCell = hts_active_all(i, L)
                do k = 1, hts_nVert
@@ -1045,7 +1051,7 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
       type (mpas_pool_type), pointer :: mesh
-      integer :: L, i, iCell, iEdge, k, cell1, cell2
+      integer :: L, i, iCell, iEdge, k, cell1, cell2, ratio
       real (kind=RKIND) :: alpha, rho_here, th_here, u_here
       logical :: any
 
@@ -1053,17 +1059,21 @@ module mpas_atm_hts
 
       call mpas_timer_start('hts_apply_interpolation')
 
-      ! A level whose state already matches its snapshot is left alone. The
-      ! fine step does not write that level's prognostic fields, and the time
-      ! levels stay equal across the shift until the level itself steps.
+      ! Interior coarse columns stay on the snapshot. The diagnostic ring the
+      ! fine stencil reads is a convex blend of the previous completed coarse
+      ! interval, alpha = mod(tick, 2^L) / 2^L, with no half-step lead.
+      ! rho, theta, u, and w move together. The shared interface edge is not
+      ! overwritten: its level is the finer cell, and tend_u_euler integrates
+      ! it against the blended coarse exner. Acoustic parents stay off, and
+      ! the coarse RK still starts from the snapshot after the restore.
+      ! cf1dc652d ramped rho/theta on top of the acoustic-parent update and
+      ! NaNed u at 00:12:30. A half-step lead on u and w NaNed dry w. Blending
+      ! the whole coarse level toward a parent-first forecast NaNed dry u by
+      ! about 01:50. This path does neither.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
       end do
-      if (.not. any) then
-         call mpas_timer_stop('hts_apply_interpolation')
-         return
-      end if
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -1072,13 +1082,62 @@ module mpas_atm_hts
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
 
-      ! Hold coarser levels at the start-of-interval snapshot (alpha = 0)
-      ! while a finer level steps. A diagnostic-ring rho/theta ramp of the
-      ! previous increment (cf1dc652d) NaNed u at 00:12:30 on eds job
-      ! 199977 (rebuild 199974, GWDO off; w still finite), earlier than
-      ! this hold. Extrapolating u and w fed the coarse
-      ! acoustic transient into the fine flux. Cells are written before
-      ! edges so an edge density sees both columns.
+      do i = 1, hts_n_diag_all(activeLevel)
+         iCell = hts_diag_all(i, activeLevel)
+         L = hts_cell_level(iCell)
+         if (L <= activeLevel .or. L > hts_max_level_used) cycle
+         if (.not. hts_have_delta(L)) cycle
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) == 0) cycle
+         alpha = real(mod(hts_tick, ratio), RKIND) / real(ratio, RKIND)
+         do k = 1, hts_nVert
+            rho_here = snap_rho(k, iCell, L) + alpha * delta_rho(k, iCell, L)
+            th_here = snap_theta(k, iCell, L) + alpha * delta_theta(k, iCell, L)
+            rho1(k, iCell) = rho_here
+            rho2(k, iCell) = rho_here
+            th1(k, iCell) = th_here
+            th2(k, iCell) = th_here
+            call hts_diagnostics_from_state(k, iCell, rho_here, th_here, rho_base(k, iCell), &
+                 rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                 rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+            rho_p_save(k, iCell) = rho_p(k, iCell)
+            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+         end do
+         do k = 1, hts_nVert + 1
+            w1(k, iCell) = snap_w(k, iCell, L) + alpha * delta_w(k, iCell, L)
+            w2(k, iCell) = w1(k, iCell)
+            rw(k, iCell) = snap_rw(k, iCell, L) + alpha * delta_rw(k, iCell, L)
+            rw_save(k, iCell) = rw(k, iCell)
+         end do
+      end do
+      do i = 1, hts_n_diag_edge_all(activeLevel)
+         iEdge = hts_diag_edge_all(i, activeLevel)
+         L = hts_edge_level(iEdge)
+         if (L <= activeLevel .or. L > hts_max_level_used) cycle
+         if (.not. hts_have_delta(L)) cycle
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) == 0) cycle
+         alpha = real(mod(hts_tick, ratio), RKIND) / real(ratio, RKIND)
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         do k = 1, hts_nVert
+            u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+            u1(k, iEdge) = u_here
+            u2(k, iEdge) = u_here
+            ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
+            ru_save(k, iEdge) = ru(k, iEdge)
+            rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+         end do
+      end do
+
+      if (.not. any) then
+         call mpas_timer_stop('hts_apply_interpolation')
+         return
+      end if
+
+      ! First time a level is seen this interval, copy the snapshot into both
+      ! time levels. alpha = 0 here: the ring blend above is skipped on the
+      ! open, and this write puts interior columns back if a level just stepped.
       alpha = 0.0_RKIND
       do L = activeLevel + 1, hts_max_level_used
          if (hts_hold_valid(L)) cycle
@@ -1142,23 +1201,20 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
       type (mpas_pool_type), pointer :: mesh
-      integer :: L, i, iCell, iEdge, k, cell1, cell2
+      integer :: L, i, iCell, iEdge, k, cell1, cell2, ratio
       logical :: any
 
       if (hts_max_level_used <= activeLevel) return
 
       call mpas_timer_start('hts_restore_above')
 
-      ! The active step writes its own columns. Levels that still match their
-      ! snapshot were not written, so putting the snapshot back is a no-op.
+      ! The ring blend is a boundary value for the fine step. Put those
+      ! columns back on the snapshot so the time-level shift does not commit
+      ! the interpolant, and so the coarse RK starts from the snapshot.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
       end do
-      if (.not. any) then
-         call mpas_timer_stop('hts_restore_above')
-         return
-      end if
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -1166,6 +1222,54 @@ module mpas_atm_hts
                             ru, ru_save, rw, rw_save, rho_edge)
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+
+      do i = 1, hts_n_diag_all(activeLevel)
+         iCell = hts_diag_all(i, activeLevel)
+         L = hts_cell_level(iCell)
+         if (L <= activeLevel .or. L > hts_max_level_used) cycle
+         if (.not. hts_have_delta(L)) cycle
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) == 0) cycle
+         do k = 1, hts_nVert
+            rho1(k, iCell) = snap_rho(k, iCell, L)
+            rho2(k, iCell) = snap_rho(k, iCell, L)
+            th1(k, iCell) = snap_theta(k, iCell, L)
+            th2(k, iCell) = snap_theta(k, iCell, L)
+            call hts_diagnostics_from_state(k, iCell, snap_rho(k, iCell, L), snap_theta(k, iCell, L), &
+                 rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                 rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+            rho_p_save(k, iCell) = rho_p(k, iCell)
+            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+         end do
+         do k = 1, hts_nVert + 1
+            w1(k, iCell) = snap_w(k, iCell, L)
+            w2(k, iCell) = snap_w(k, iCell, L)
+            rw(k, iCell) = snap_rw(k, iCell, L)
+            rw_save(k, iCell) = snap_rw(k, iCell, L)
+         end do
+      end do
+      do i = 1, hts_n_diag_edge_all(activeLevel)
+         iEdge = hts_diag_edge_all(i, activeLevel)
+         L = hts_edge_level(iEdge)
+         if (L <= activeLevel .or. L > hts_max_level_used) cycle
+         if (.not. hts_have_delta(L)) cycle
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) == 0) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         do k = 1, hts_nVert
+            u1(k, iEdge) = snap_u(k, iEdge, L)
+            u2(k, iEdge) = snap_u(k, iEdge, L)
+            ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * snap_u(k, iEdge, L)
+            ru_save(k, iEdge) = ru(k, iEdge)
+            rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+         end do
+      end do
+
+      if (.not. any) then
+         call mpas_timer_stop('hts_restore_above')
+         return
+      end if
 
       do L = activeLevel + 1, hts_max_level_used
          if (hts_hold_valid(L)) cycle
