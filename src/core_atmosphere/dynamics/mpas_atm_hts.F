@@ -1092,17 +1092,16 @@ module mpas_atm_hts
 
       call mpas_timer_start('hts_apply_interpolation')
 
-      ! Interior coarse columns stay on the snapshot. The diagnostic ring the
-      ! fine stencil reads is a convex blend of the previous completed coarse
-      ! interval, alpha = mod(tick, 2^L) / 2^L, with no half-step lead.
-      ! rho, theta, u, and w move together. An interface edge whose level is
-      ! this active level is the same blend of the coarser cell's previous
-      ! increment, and the acoustic step holds ru there. Acoustic parents stay
-      ! off. The coarse RK still starts from the snapshot after the restore.
-      ! cf1dc652d ramped rho/theta on top of the acoustic-parent update and
-      ! NaNed u at 00:12:30. A half-step lead on u and w NaNed dry w. A parent
-      ! integration of the interface edge NaNed dry w at 00:42. This path does
-      ! neither: the edge follows an increment the coarse step already took.
+      ! The snapshot stored at an interval open is already the end of the
+      ! previous interval, and delta is that interval's increment. Adding
+      ! alpha*delta on top of the snapshot leads the last realized state by
+      ! up to one coarse step. On the eds land VR that lead is what the
+      ! imposed flux commits: job 200072 survived 2 h, but max |u| reached
+      ! about 160-171 m/s against an all-fine jet near 89, and w relL2 was
+      ! about 7.6. rho and theta still follow the previous increment. u and w
+      ! on the ring stay on the snapshot. An interface edge of this level is
+      ! locked to that same snapshot so tend_u_euler cannot integrate it.
+      ! Acoustic parents stay off. The coarse RK still starts from the snapshot.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
@@ -1137,10 +1136,10 @@ module mpas_atm_hts
             rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
          end do
          do k = 1, hts_nVert + 1
-            w1(k, iCell) = snap_w(k, iCell, L) + alpha * delta_w(k, iCell, L)
-            w2(k, iCell) = w1(k, iCell)
-            rw(k, iCell) = snap_rw(k, iCell, L) + alpha * delta_rw(k, iCell, L)
-            rw_save(k, iCell) = rw(k, iCell)
+            w1(k, iCell) = snap_w(k, iCell, L)
+            w2(k, iCell) = snap_w(k, iCell, L)
+            rw(k, iCell) = snap_rw(k, iCell, L)
+            rw_save(k, iCell) = snap_rw(k, iCell, L)
          end do
       end do
       do i = 1, hts_n_diag_edge_all(activeLevel)
@@ -1150,11 +1149,10 @@ module mpas_atm_hts
          if (.not. hts_have_delta(L)) cycle
          ratio = ishft(1, L)
          if (mod(hts_tick, ratio) == 0) cycle
-         alpha = real(mod(hts_tick, ratio), RKIND) / real(ratio, RKIND)
          cell1 = cellsOnEdge(1, iEdge)
          cell2 = cellsOnEdge(2, iEdge)
          do k = 1, hts_nVert
-            u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+            u_here = snap_u(k, iEdge, L)
             u1(k, iEdge) = u_here
             u2(k, iEdge) = u_here
             ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
@@ -1164,21 +1162,20 @@ module mpas_atm_hts
       end do
 
       ! Interface edges owned by this level (edge level == active) otherwise
-      ! integrate tend_u_euler. Hold them on the coarser level's previous
-      ! increment. Edges the coarse step imposes are not in this set.
+      ! integrate tend_u_euler. Hold them on the last realized coarse wind.
+      ! Adding the previous increment here is a lead, and the close-step
+      ! impose commits it. Edges the coarse step imposes are not in this set.
       if (allocated(hts_lock_edge) .and. allocated(hts_iface_coarse) .and. allocated(hts_ru_target)) then
          do iEdge = 1, hts_nEdges
             if (hts_edge_level(iEdge) /= activeLevel) cycle
             L = hts_iface_coarse(iEdge)
             if (L <= activeLevel .or. L > hts_max_level_used) cycle
             if (.not. hts_have_delta(L)) cycle
-            ratio = ishft(1, L)
-            alpha = real(mod(hts_tick, ratio), RKIND) / real(ratio, RKIND)
             cell1 = cellsOnEdge(1, iEdge)
             cell2 = cellsOnEdge(2, iEdge)
             hts_lock_edge(iEdge) = .true.
             do k = 1, hts_nVert
-               u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+               u_here = snap_u(k, iEdge, L)
                u1(k, iEdge) = u_here
                u2(k, iEdge) = u_here
                ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
