@@ -27,6 +27,8 @@ module mpas_atm_hts
    public :: hts_restrict_physics_tendencies
    public :: hts_exch_layer1
    public :: hts_diagnostics_from_state
+   public :: atm_hts_mark_acoustic_cells
+   public :: hts_cell_acoustic
 
    logical, public :: hts_enabled = .false.
    logical, public :: hts_masking = .false.
@@ -38,6 +40,13 @@ module mpas_atm_hts
    integer, public, allocatable :: hts_cell_level(:)
    integer, public, allocatable :: hts_edge_level(:)
    logical, public, allocatable :: hts_edge_interface(:)
+   ! True when a cell has an edge finer than itself. During a finer step the
+   ! parent takes an acoustic pressure update so the interface-edge gradient
+   ! is two-sided. The prognostic column stays on the interval snapshot.
+   logical, public, allocatable :: hts_cell_open_iface(:)
+   ! Cells that take the acoustic column update on the active level.
+   ! Active-level cells, plus open-interface parents that touch that level.
+   logical, public, allocatable :: hts_cell_live(:)
    logical, public, allocatable :: hts_impose_edge(:)
    real (kind=RKIND), public, allocatable :: hts_ru_target(:,:)
 
@@ -78,6 +87,8 @@ module mpas_atm_hts
    integer, public :: hts_n_level_edge(0:hts_level_cap) = 0
    integer, public :: hts_n_ac_cell(0:hts_level_cap) = 0
    integer, public :: hts_n_recon_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_live_own(0:hts_level_cap) = 0
+   integer, public :: hts_n_live_all(0:hts_level_cap) = 0
    ! True once a level's state arrays already hold its snapshot. The next
    ! fine step does not rewrite that level. A level step clears the flag so
    ! the following fine step copies the new snapshot into both time levels.
@@ -99,6 +110,8 @@ module mpas_atm_hts
    integer, public, allocatable :: hts_level_edge(:,:)
    integer, public, allocatable :: hts_ac_cell(:,:)
    integer, public, allocatable :: hts_recon_own(:,:)
+   integer, public, allocatable :: hts_live_own(:,:)
+   integer, public, allocatable :: hts_live_all(:,:)
 
    ! Per-substep acoustic halo. rho_pp and rtheta_pp are read only on the
    ! two cells of an active edge, so the message carries cells that touch the
@@ -151,7 +164,7 @@ module mpas_atm_hts
       integer :: iCell, iEdge, iNbr, cell1, cell2, L, nbr
       integer :: nBlocks
       integer, dimension(0:hts_level_cap) :: localCount, globalCount
-      integer :: localIface, globalIface, globalOwned
+      integer :: localIface, globalIface, globalOwned, globalOpen
       real (kind=RKIND) :: mdMin, mdMax, mdMinG, mdMaxG, spacing, logtwo
       logical :: uniform
 
@@ -202,6 +215,8 @@ module mpas_atm_hts
       if (allocated(hts_cell_level)) deallocate(hts_cell_level)
       if (allocated(hts_edge_level)) deallocate(hts_edge_level)
       if (allocated(hts_edge_interface)) deallocate(hts_edge_interface)
+      if (allocated(hts_cell_open_iface)) deallocate(hts_cell_open_iface)
+      if (allocated(hts_cell_live)) deallocate(hts_cell_live)
       if (allocated(hts_impose_edge)) deallocate(hts_impose_edge)
       if (allocated(hts_ru_target)) deallocate(hts_ru_target)
       if (allocated(hts_flux_sum)) deallocate(hts_flux_sum)
@@ -209,10 +224,14 @@ module mpas_atm_hts
       allocate(hts_cell_level(nCells+1))
       allocate(hts_edge_level(nEdges+1))
       allocate(hts_edge_interface(nEdges+1))
+      allocate(hts_cell_open_iface(nCells+1))
+      allocate(hts_cell_live(nCells+1))
       allocate(hts_impose_edge(nEdges+1))
       hts_cell_level(:) = 0
       hts_edge_level(:) = 0
       hts_edge_interface(:) = .false.
+      hts_cell_open_iface(:) = .false.
+      hts_cell_live(:) = .false.
       hts_impose_edge(:) = .false.
 
       mdMin = meshDensity(1)
@@ -254,6 +273,12 @@ module mpas_atm_hts
          if (cell2 < 1 .or. cell2 > nCells) cell2 = nCells + 1
          hts_edge_level(iEdge) = min(hts_cell_level(cell1), hts_cell_level(cell2))
          hts_edge_interface(iEdge) = hts_cell_level(cell1) /= hts_cell_level(cell2)
+         if (cell1 >= 1 .and. cell1 <= nCells) then
+            if (hts_edge_level(iEdge) < hts_cell_level(cell1)) hts_cell_open_iface(cell1) = .true.
+         end if
+         if (cell2 >= 1 .and. cell2 <= nCells) then
+            if (hts_edge_level(iEdge) < hts_cell_level(cell2)) hts_cell_open_iface(cell2) = .true.
+         end if
       end do
 
       localCount(:) = 0
@@ -268,6 +293,11 @@ module mpas_atm_hts
          if (hts_edge_interface(iEdge)) localIface = localIface + 1
       end do
       call mpas_dmpar_sum_int(domain % dminfo, localIface, globalIface)
+      localIface = 0
+      do iCell = 1, nCellsSolve
+         if (hts_cell_open_iface(iCell)) localIface = localIface + 1
+      end do
+      call mpas_dmpar_sum_int(domain % dminfo, localIface, globalOpen)
       call mpas_dmpar_sum_int(domain % dminfo, nCellsSolve, globalOwned)
 
       hts_max_level_used = 0
@@ -287,6 +317,7 @@ module mpas_atm_hts
          call mpas_log_write(' level $i cells = $i', intArgs=(/L, globalCount(L)/))
       end do
       call mpas_log_write(' interface edges = $i', intArgs=(/globalIface/))
+      call mpas_log_write(' open-interface cells = $i', intArgs=(/globalOpen/))
       if (uniform) then
          call mpas_log_write(' meshDensity does not vary; every cell is level 0')
       end if
@@ -358,6 +389,8 @@ module mpas_atm_hts
       if (allocated(hts_cell_level)) deallocate(hts_cell_level)
       if (allocated(hts_edge_level)) deallocate(hts_edge_level)
       if (allocated(hts_edge_interface)) deallocate(hts_edge_interface)
+      if (allocated(hts_cell_open_iface)) deallocate(hts_cell_open_iface)
+      if (allocated(hts_cell_live)) deallocate(hts_cell_live)
       if (allocated(hts_impose_edge)) deallocate(hts_impose_edge)
       if (allocated(hts_ru_target)) deallocate(hts_ru_target)
       if (allocated(hts_flux_sum)) deallocate(hts_flux_sum)
@@ -388,6 +421,8 @@ module mpas_atm_hts
       if (allocated(hts_level_edge)) deallocate(hts_level_edge)
       if (allocated(hts_ac_cell)) deallocate(hts_ac_cell)
       if (allocated(hts_recon_own)) deallocate(hts_recon_own)
+      if (allocated(hts_live_own)) deallocate(hts_live_own)
+      if (allocated(hts_live_all)) deallocate(hts_live_all)
       if (allocated(hts_ah_send_proc)) deallocate(hts_ah_send_proc)
       if (allocated(hts_ah_send_n)) deallocate(hts_ah_send_n)
       if (allocated(hts_ah_send_off)) deallocate(hts_ah_send_off)
@@ -455,6 +490,8 @@ module mpas_atm_hts
       if (allocated(hts_level_edge)) deallocate(hts_level_edge)
       if (allocated(hts_ac_cell)) deallocate(hts_ac_cell)
       if (allocated(hts_recon_own)) deallocate(hts_recon_own)
+      if (allocated(hts_live_own)) deallocate(hts_live_own)
+      if (allocated(hts_live_all)) deallocate(hts_live_all)
 
       allocate(hts_work_own(nCells, 0:hts_level_cap))
       allocate(hts_work_all(nCells, 0:hts_level_cap))
@@ -472,6 +509,8 @@ module mpas_atm_hts
       allocate(hts_level_edge(nEdges, 0:hts_level_cap))
       allocate(hts_ac_cell(nCells, 0:hts_level_cap))
       allocate(hts_recon_own(nCells, 0:hts_level_cap))
+      allocate(hts_live_own(nCells, 0:hts_level_cap))
+      allocate(hts_live_all(nCells, 0:hts_level_cap))
       hts_n_work_own = 0
       hts_n_work_all = 0
       hts_n_active_own = 0
@@ -488,6 +527,8 @@ module mpas_atm_hts
       hts_n_level_edge = 0
       hts_n_ac_cell = 0
       hts_n_recon_own = 0
+      hts_n_live_own = 0
+      hts_n_live_all = 0
 
       allocate(mark(nCells), mark2(nCells), edgeMark(nEdges), vertMark(nVertices))
 
@@ -534,6 +575,51 @@ module mpas_atm_hts
          hts_n_active_all(L) = nAll
          hts_n_active_own(L) = nOwn
          hts_n_off_own(L) = nOff
+
+         ! Acoustic columns: this level, plus coarser cells that share an edge
+         ! with it. Parents advance rho_pp and rtheta_pp only.
+         mark2(:) = .false.
+         nOwn = 0
+         nAll = 0
+         do iCell = 1, nCells
+            if (hts_cell_level(iCell) /= L) cycle
+            mark2(iCell) = .true.
+            nAll = nAll + 1
+            hts_live_all(nAll, L) = iCell
+            if (iCell <= nCellsSolve) then
+               nOwn = nOwn + 1
+               hts_live_own(nOwn, L) = iCell
+            end if
+         end do
+         do iEdge = 1, nEdges
+            if (hts_edge_level(iEdge) /= L) cycle
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 >= 1 .and. cell1 <= nCells) then
+               if (hts_cell_level(cell1) > L .and. .not. mark2(cell1)) then
+                  mark2(cell1) = .true.
+                  nAll = nAll + 1
+                  hts_live_all(nAll, L) = cell1
+                  if (cell1 <= nCellsSolve) then
+                     nOwn = nOwn + 1
+                     hts_live_own(nOwn, L) = cell1
+                  end if
+               end if
+            end if
+            if (cell2 >= 1 .and. cell2 <= nCells) then
+               if (hts_cell_level(cell2) > L .and. .not. mark2(cell2)) then
+                  mark2(cell2) = .true.
+                  nAll = nAll + 1
+                  hts_live_all(nAll, L) = cell2
+                  if (cell2 <= nCellsSolve) then
+                     nOwn = nOwn + 1
+                     hts_live_own(nOwn, L) = cell2
+                  end if
+               end if
+            end if
+         end do
+         hts_n_live_all(L) = nAll
+         hts_n_live_own(L) = nOwn
 
          nOwn = 0
          nAll = 0
@@ -772,11 +858,54 @@ module mpas_atm_hts
 
          call mpas_log_write(' level $i hold lists: edges $i, acoustic cells $i, recon owned $i', &
                              intArgs=(/L, hts_n_level_edge(L), hts_n_ac_cell(L), hts_n_recon_own(L)/))
+         call mpas_log_write(' level $i acoustic columns: owned $i, of which parents $i', &
+                             intArgs=(/L, hts_n_live_own(L), hts_n_live_own(L) - hts_n_active_own(L)/))
       end do
 
       deallocate(mark, mark2, edgeMark, vertMark)
 
    end subroutine atm_hts_build_lists
+
+
+   subroutine atm_hts_mark_acoustic_cells()
+
+      ! Mark columns that take the acoustic update on the active level.
+      ! Open-interface parents that touch this level are included so the
+      ! edge pressure gradient sees both sides. Interior coarse columns stay
+      ! out. Parent prognostics are not committed from this update.
+
+      implicit none
+
+      integer :: i, iCell
+
+      if (.not. allocated(hts_cell_live)) return
+      hts_cell_live(:) = .false.
+      if (hts_active_level < 0 .or. hts_active_level > hts_level_cap) return
+      if (.not. allocated(hts_live_all)) return
+      do i = 1, hts_n_live_all(hts_active_level)
+         iCell = hts_live_all(i, hts_active_level)
+         hts_cell_live(iCell) = .true.
+      end do
+
+   end subroutine atm_hts_mark_acoustic_cells
+
+
+   logical function hts_cell_acoustic(iCell)
+
+      ! True for a column the active acoustic step should advance.
+      ! Single-level and non-HTS callers do not use this.
+
+      implicit none
+
+      integer, intent(in) :: iCell
+
+      if (hts_max_level_used <= 0) then
+         hts_cell_acoustic = hts_cell_level(iCell) == hts_active_level
+      else
+         hts_cell_acoustic = hts_cell_live(iCell)
+      end if
+
+   end function hts_cell_acoustic
 
 
    subroutine hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &

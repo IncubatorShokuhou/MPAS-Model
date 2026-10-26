@@ -2296,6 +2296,11 @@ module atm_time_integration
       if (hts_masking .and. hts_active_level > 0) then
          number_of_sub_steps = number_of_sub_steps * ishft(1, hts_active_level)
       end if
+      ! Parents that touch this level are acoustically live. Interior coarse
+      ! columns stay on the snapshot.
+      if (hts_masking .and. hts_max_level_used > 0) then
+         call atm_hts_mark_acoustic_cells()
+      end if
 
       if(config_time_integration_order == 3) then
 
@@ -3431,7 +3436,7 @@ module atm_time_integration
       do iCell = cellStart,cellEnd
 #ifndef MPAS_OPENACC
          if (hts_masking) then
-            if (hts_cell_level(iCell) /= hts_active_level) cycle
+            if (.not. hts_cell_acoustic(iCell)) cycle
          end if
 #endif
          !$acc loop vector
@@ -3448,7 +3453,7 @@ module atm_time_integration
       do iCell = cellStart,cellEnd
 #ifndef MPAS_OPENACC
          if (hts_masking) then
-            if (hts_cell_level(iCell) /= hts_active_level) cycle
+            if (.not. hts_cell_acoustic(iCell)) cycle
          end if
 #endif
          !$acc loop vector
@@ -4161,9 +4166,10 @@ module atm_time_integration
       !
       ! Local variables
       !
-      integer :: cell1, cell2, iEdge, iCell, i, k
+      integer :: cell1, cell2, iEdge, iCell, i, k, iEdge_idx
       real (kind=RKIND) :: c2, rcv, rtheta_pp_tmp
       real (kind=RKIND) :: pgrad, flux, rdts
+      logical :: hts_parent_pp
 
 
       rcv = rgas / (cp - rgas)
@@ -4312,17 +4318,15 @@ module atm_time_integration
 !$OMP BARRIER
 
 #ifndef MPAS_OPENACC
-      ! The owned-cell loop below visits only the active level. Inactive owned
-      ! columns still have to drop their acoustic perturbations on the first
-      ! small step, or an active edge sees a stale neighbor.
-      ! An active edge reads its two cells. Zero those inactive neighbors on
-      ! the first small step. Interior columns that no active edge touches
-      ! are not read, so they are left alone.
+      ! Open-interface parents are updated below. Any other owned neighbor of
+      ! an active edge still has to drop its acoustic perturbation on the
+      ! first small step, or the edge sees a stale neighbor. Interior columns
+      ! that no active edge touches are left alone.
       if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
          do i = 1, hts_n_ac_cell(hts_active_level)
             iCell = hts_ac_cell(i, hts_active_level)
             if (iCell > nCellsSolve) cycle
-            if (hts_cell_level(iCell) == hts_active_level) cycle
+            if (hts_cell_acoustic(iCell)) cycle
             do k = 1, nVertLevels
                rho_pp(k,iCell) = 0.0_RKIND
                rtheta_pp(k,iCell) = 0.0_RKIND
@@ -4333,12 +4337,32 @@ module atm_time_integration
       end if
 #endif
 
+      ! A parent column's horizontal divergence may only see the live
+      ! interface edge. Coarse edges of that column are not advanced here,
+      ! and a leftover ru_p would be a phantom mass flux.
+      if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
+         do i = 1, hts_n_live_own(hts_active_level)
+            iCell = hts_live_own(i, hts_active_level)
+            if (iCell > nCellsSolve) cycle
+            if (hts_cell_level(iCell) == hts_active_level) cycle
+            do iEdge_idx = 1, nEdgesOnCell(iCell)
+               iEdge = edgesOnCell(iEdge_idx, iCell)
+               if (hts_edge_level(iEdge) == hts_active_level) cycle
+               if (hts_impose .and. hts_impose_edge(iEdge)) cycle
+               do k = 1, nVertLevels
+                  ru_p(k, iEdge) = 0.0_RKIND
+               end do
+            end do
+         end do
+      end if
+
+      hts_parent_pp = .false.
       !$acc parallel default(present)
       !$acc loop gang worker private(ts,rs)
       HTS_ACTIVE_CELL_SOLVE_DO
 #ifndef MPAS_OPENACC
          if (hts_masking) then
-            if (hts_cell_level(iCell) /= hts_active_level) then
+            if (.not. hts_cell_acoustic(iCell)) then
                if (small_step == 1) then
                   do k = 1, nVertLevels
                      rho_pp(k,iCell) = 0.0_RKIND
@@ -4349,19 +4373,31 @@ module atm_time_integration
                end if
                cycle
             end if
+            ! Parent: acoustic pressure only. Do not touch wwAvg; scalar
+            ! transport still wants the value from this column's own level.
+            hts_parent_pp = hts_cell_level(iCell) /= hts_active_level
+         else
+            hts_parent_pp = .false.
          end if
+#else
+         hts_parent_pp = .false.
 #endif
 
          if(small_step == 1) then  ! initialize here on first small timestep.
             !$acc loop vector
             do k=1,nVertLevels
-               wwAvg(k,iCell) = 0.0
                rho_pp(k,iCell) = 0.0
                rtheta_pp(k,iCell) = 0.0
                rw_p(k,iCell) = 0.0
             end do
-            wwAvg(nVertLevels+1,iCell) = 0.0
             rw_p(nVertLevels+1,iCell) = 0.0
+            if (.not. hts_parent_pp) then
+               !$acc loop vector
+               do k=1,nVertLevels
+                  wwAvg(k,iCell) = 0.0
+               end do
+               wwAvg(nVertLevels+1,iCell) = 0.0
+            end if
          end if
 
          if(specZoneMaskCell(iCell) == 0.0) then  ! not specified zone, compute...
@@ -4400,11 +4436,13 @@ module atm_time_integration
                                                       -ewm(k  )*coftz(k,iCell)*rw_p(k,iCell))
             end do
 
+            if (.not. hts_parent_pp) then
 !DIR$ IVDEP
             !$acc loop vector
             do k=2, nVertLevels
                wwavg(k,iCell) = wwavg(k,iCell) + ewm(k)*rw_p(k,iCell)
             end do
+            end if
 
 !DIR$ IVDEP
             !$acc loop vector
@@ -4448,11 +4486,13 @@ module atm_time_integration
             end do
 
             ! accumulate (rho*omega)' for use later in scalar transport
+            if (.not. hts_parent_pp) then
 !DIR$ IVDEP
             !$acc loop vector
             do k=2,nVertLevels
                wwAvg(k,iCell) = wwAvg(k,iCell) + ewp(k)*rw_p(k,iCell)
             end do
+            end if
 
             ! update rho_pp and theta_pp given updated rw_p
 
@@ -4472,7 +4512,7 @@ module atm_time_integration
                rho_pp(k,iCell) = rho_pp(k,iCell) + dts*tend_rho(k,iCell)
                rtheta_pp(k,iCell) = rtheta_pp(k,iCell) + dts*tend_rt(k,iCell)
                rw_p(k,iCell) = rw_p(k,iCell) + dts*tend_rw(k,iCell)
-               wwAvg(k,iCell) = wwAvg(k,iCell) + ewp(k)*rw_p(k,iCell)
+               if (.not. hts_parent_pp) wwAvg(k,iCell) = wwAvg(k,iCell) + ewp(k)*rw_p(k,iCell)
             end do
 
          end if
@@ -8295,7 +8335,6 @@ module atm_time_integration
          end do
          !$acc end parallel
       end if
-
 
    end subroutine atm_rk_dynamics_substep_finish
 

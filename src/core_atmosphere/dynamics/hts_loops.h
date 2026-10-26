@@ -31,26 +31,26 @@
 
 #define HTS_ACTIVE_CELL_SOLVE_DO \
    hts_nloop = cellSolveEnd - cellSolveStart + 1; \
-   if (hts_masking .and. hts_max_level_used > 0 .and. cellSolveStart == 1 .and. cellSolveEnd == hts_nCellsSolve) hts_nloop = hts_n_active_own(hts_active_level); \
+   if (hts_masking .and. hts_max_level_used > 0 .and. cellSolveStart == 1 .and. cellSolveEnd == hts_nCellsSolve) hts_nloop = hts_n_live_own(hts_active_level); \
    hts_ii = 0; \
    do; \
       hts_ii = hts_ii + 1; \
       if (hts_ii > hts_nloop) exit; \
       if (hts_masking .and. hts_max_level_used > 0 .and. cellSolveStart == 1 .and. cellSolveEnd == hts_nCellsSolve) then; \
-         iCell = hts_active_own(hts_ii, hts_active_level); \
+         iCell = hts_live_own(hts_ii, hts_active_level); \
       else; \
          iCell = cellSolveStart + hts_ii - 1; \
       end if
 
 #define HTS_ACTIVE_CELL_ALL_DO \
    hts_nloop = cellEnd - cellStart + 1; \
-   if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) hts_nloop = hts_n_active_all(hts_active_level); \
+   if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) hts_nloop = hts_n_live_all(hts_active_level); \
    hts_ii = 0; \
    do; \
       hts_ii = hts_ii + 1; \
       if (hts_ii > hts_nloop) exit; \
       if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) then; \
-         iCell = hts_active_all(hts_ii, hts_active_level); \
+         iCell = hts_live_all(hts_ii, hts_active_level); \
       else; \
          iCell = cellStart + hts_ii - 1; \
       end if
