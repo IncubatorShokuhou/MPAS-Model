@@ -2012,7 +2012,7 @@ module atm_time_integration
          call hts_refresh_wind()
          call hts_coarse_coupled_step(domain, itimestep, exchange_halo_group, L, dt_level, ratio)
          call atm_hts_restore_above(block, L)
-         call atm_hts_correct_mass(block, L, dt_level)
+         if (.not. hts_dbg_skip_mass) call atm_hts_correct_mass(block, L, dt_level)
          call atm_hts_accumulate_flux(block, L, dt_level)
          call atm_hts_clear_consumed(L)
          hts_hold_valid(L) = .false.
@@ -2027,6 +2027,7 @@ module atm_time_integration
       ! step would advect it. Job 200185 matched 200101 because the ring
       ! never touches scalars.
       call atm_hts_copy_idle_scalars(block, .true.)
+      if (hts_dbg_probe_cell > 0) call hts_probe_cell(domain)
       hts_tick = hts_tick + 1
       hts_acoustic_shift = -1
       hts_acoustic_steps = 0
@@ -2037,25 +2038,17 @@ module atm_time_integration
 
    subroutine hts_coarse_coupled_step(domain, itimestep, exchange_halo_group, L, dt_level, ratio)
 
-      ! pbl_substeps = 0 (the default) calls surface, Noah, PBL, and GWDO at
-      ! config_dt on every moist level above 0, folds each increment, and
-      ! keeps one SRK3 at dt_level. Job 201388 grew cell 3177 at a 60 s
-      ! surface call with the same rate as the 120 s and 240 s calls, only
-      ! later. Four 60 s dynamics steps under one 240 s surface call
-      ! (0fa07c436) kept the 240 s onset, so the seed is that call.
-      ! Radiation stays a per-second rate on the long SRK3. The folded rate
-      ! is zeroed before that SRK3. Leaving it would be the 902a6084d failure.
-      !
-      ! A positive pbl_substeps is the ablation and applies only on the
-      ! coarsest moist level. 1 is one call of the level dt (2022d65c7).
+      ! pbl_substeps = 1 (the default) is one surface call of the level dt,
+      ! the 2022d65c7 cap. pbl_substeps = 0 folds a config_dt surface
+      ! increment and then takes one SRK3 at dt_level. That fold warmed
+      ! polar skin temperatures and blew up a level-1 surface edge
+      ! (jobs 201458 and 201494). It is not the default.
       !
       ! micro_substeps > 1 splits that SRK3. Each piece advects moisture and
       ! runs Kessler, then the next piece sees the new theta and w. The
       ! acoustic dt stays config_dt / config_number_of_sub_steps. ruAvg is
-      ! the mean, because mass correction runs once on dt_level. With
-      ! pbl_substeps = 0 the surface count matches that split, so each short
-      ! SRK3 sees a rate from its own dt. Raising the dynamics count to 2^L
-      ! would spend the speedup.
+      ! the mean, because mass correction runs once on dt_level, unless
+      ! config_hts_debug_ruavg_last leaves the last substep.
       !
       ! Both greater than 1 run one physics call and one SRK3 on the same
       ! short dt. An explicit mismatch is raised to the shorter dt so YSU's
@@ -2075,6 +2068,7 @@ module atm_time_integration
       type (mpas_pool_type), pointer :: diag
       real (kind=RKIND), dimension(:,:), pointer :: ruAvg
       real (kind=RKIND), dimension(:,:), allocatable :: ru_sum
+      logical :: keep_lw, keep_sw, keep_cu
       logical, save :: warned_match = .false.
       logical, save :: warned_pow = .false.
       logical, save :: warned_kessler = .false.
@@ -2083,6 +2077,9 @@ module atm_time_integration
 
       nmicro = 1
       npbl = 1
+      keep_lw = .false.
+      keep_sw = .false.
+      keep_cu = .false.
 #ifdef DO_PHYSICS
       if (moist_physics .and. L > 0) then
          if (L == hts_max_level_used) then
@@ -2180,46 +2177,60 @@ module atm_time_integration
          end if
          hts_micro_split = .true.
          hts_micro_nsub = nmicro
+         keep_lw = hts_radlw_due(L)
+         keep_sw = hts_radsw_due(L)
+         keep_cu = hts_conv_due(L)
 
          if (npbl <= 1) then
             call hts_level_column_physics(domain, itimestep, L, dt_level)
          end if
 
-         nullify(diag, ruAvg)
-         call mpas_pool_get_subpool(block % structs, 'diag', diag)
-         call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
-         nVert = size(ruAvg, 1)
-         nEdges = size(ruAvg, 2)
-         allocate(ru_sum(nVert, nEdges))
-         ru_sum(:, :) = 0.0_RKIND
+         if (.not. hts_dbg_ruavg_last) then
+            nullify(diag, ruAvg)
+            call mpas_pool_get_subpool(block % structs, 'diag', diag)
+            call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
+            nVert = size(ruAvg, 1)
+            nEdges = size(ruAvg, 2)
+            allocate(ru_sum(nVert, nEdges))
+            ru_sum(:, :) = 0.0_RKIND
+         end if
 
          do isub = 1, nmicro
             if (npbl > 1) then
+               if (hts_dbg_rad_every .and. isub > 1) then
+                  hts_radlw_due(L) = keep_lw
+                  hts_radsw_due(L) = keep_sw
+                  hts_conv_due(L) = keep_cu
+               end if
                call hts_level_column_physics(domain, itimestep, L, dt_sub)
             end if
             call atm_srk3(domain, dt_sub, itimestep, exchange_halo_group)
+            if (.not. hts_dbg_ruavg_last) then
+               do iEdge = 1, nEdges
+                  if (iEdge > size(hts_edge_level)) cycle
+                  if (hts_edge_level(iEdge) /= hts_active_level) then
+                     if (.not. (allocated(hts_impose_edge) .and. hts_impose_edge(iEdge))) cycle
+                  end if
+                  do k = 1, nVert
+                     ru_sum(k, iEdge) = ru_sum(k, iEdge) + ruAvg(k, iEdge)
+                  end do
+               end do
+            end if
+            if (isub < nmicro .and. .not. hts_dbg_skip_promote) call hts_promote_active_state()
+         end do
+
+         if (.not. hts_dbg_ruavg_last) then
             do iEdge = 1, nEdges
                if (iEdge > size(hts_edge_level)) cycle
                if (hts_edge_level(iEdge) /= hts_active_level) then
                   if (.not. (allocated(hts_impose_edge) .and. hts_impose_edge(iEdge))) cycle
                end if
                do k = 1, nVert
-                  ru_sum(k, iEdge) = ru_sum(k, iEdge) + ruAvg(k, iEdge)
+                  ruAvg(k, iEdge) = ru_sum(k, iEdge) / real(nmicro, RKIND)
                end do
             end do
-            if (isub < nmicro) call hts_promote_active_state()
-         end do
-
-         do iEdge = 1, nEdges
-            if (iEdge > size(hts_edge_level)) cycle
-            if (hts_edge_level(iEdge) /= hts_active_level) then
-               if (.not. (allocated(hts_impose_edge) .and. hts_impose_edge(iEdge))) cycle
-            end if
-            do k = 1, nVert
-               ruAvg(k, iEdge) = ru_sum(k, iEdge) / real(nmicro, RKIND)
-            end do
-         end do
-         deallocate(ru_sum)
+            deallocate(ru_sum)
+         end if
          call hts_clear_column_mask()
       else
          do isub = 1, npbl
@@ -2317,6 +2328,7 @@ module atm_time_integration
       real (kind=RKIND), dimension(:,:,:), pointer :: s1, s2
       integer :: iCell, k, j, L, ratio, nScalars, nVert, nCopy
 
+      if (hts_dbg_skip_idle) return
       if (hts_max_level_used < 1 .and. .not. hts_force_path) return
       if (.not. allocated(hts_cell_level)) return
 
@@ -4686,7 +4698,7 @@ module atm_time_integration
       ! held rho/theta (cf1dc652d) NaNed u at 00:12:30 (job 199977,
       ! rebuild 199974, GWDO off; w still finite). The
       ! pure hold stayed finite until about 01:57.
-      if (hts_masking .and. hts_path_live .and. small_step == 1) then
+      if (hts_masking .and. hts_path_live .and. small_step == 1 .and. .not. hts_dbg_keep_pp) then
          do i = 1, hts_n_ac_cell(hts_active_level)
             iCell = hts_ac_cell(i, hts_active_level)
             if (iCell > nCellsSolve) cycle
@@ -4707,7 +4719,7 @@ module atm_time_integration
 #ifndef MPAS_OPENACC
          if (hts_masking) then
             if (hts_cell_level(iCell) /= hts_active_level) then
-               if (small_step == 1) then
+               if (small_step == 1 .and. .not. hts_dbg_keep_pp) then
                   do k = 1, nVertLevels
                      rho_pp(k,iCell) = 0.0_RKIND
                      rtheta_pp(k,iCell) = 0.0_RKIND
@@ -9816,6 +9828,70 @@ module atm_time_integration
    end subroutine hts_note_physics_alarms
 
 
+   subroutine hts_refresh_column_diag(level)
+
+      ! Physics reads time level 1 and the reconstructed cell wind. Rebuild
+      ! both from the prognostic state so a held column does not hand the
+      ! scheme an exner or a wind from the previous buffer.
+
+      implicit none
+
+      integer, intent(in) :: level
+
+      type (mpas_pool_type), pointer :: state, diag, mesh
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, th1, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rho_p_save, rtheta_p, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
+      integer :: i, iCell, iEdge, k
+
+      if (.not. hts_dbg_refresh) return
+      if (level <= 0 .or. level > hts_max_level_used) return
+      if (.not. allocated(hts_active_own)) return
+
+      nullify(state, diag, mesh, rho1, th1, u1, u2)
+      nullify(rho_p, rho_p_save, rtheta_p, rtheta_p_save, pressure_p, exner)
+      nullify(exner_base, rtheta_base, rho_base, zz)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
+      call mpas_pool_get_array(state, 'theta_m', th1, 1)
+      call mpas_pool_get_array(state, 'u', u1, 1)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+      call mpas_pool_get_array(diag, 'rho_p', rho_p)
+      call mpas_pool_get_array(diag, 'rho_p_save', rho_p_save)
+      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
+      call mpas_pool_get_array(diag, 'rtheta_p_save', rtheta_p_save)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'exner_base', exner_base)
+      call mpas_pool_get_array(diag, 'rtheta_base', rtheta_base)
+      call mpas_pool_get_array(diag, 'rho_base', rho_base)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+
+      do i = 1, hts_n_active_own(level)
+         iCell = hts_active_own(i, level)
+         if (iCell < 1 .or. iCell > size(th1, 2)) cycle
+         do k = 1, min(hts_nVert, size(th1, 1), size(rho1, 1))
+            call hts_diagnostics_from_state(k, iCell, rho1(k, iCell), th1(k, iCell), rho_base(k, iCell), &
+                 rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                 rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+            rho_p_save(k, iCell) = rho_p(k, iCell)
+            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+         end do
+      end do
+
+      do iEdge = 1, min(size(hts_edge_level), size(u1, 2), size(u2, 2))
+         if (hts_edge_level(iEdge) /= level) cycle
+         do k = 1, min(hts_nVert, size(u1, 1), size(u2, 1))
+            u2(k, iEdge) = u1(k, iEdge)
+         end do
+      end do
+      call hts_reconstruct_owned(level)
+
+   end subroutine hts_refresh_column_diag
+
+
    subroutine hts_level_column_physics(domain, itimestep, level, dt_level)
 
       ! Run column physics once on the owned cells of the active level, with
@@ -9856,6 +9932,8 @@ module atm_time_integration
          if (iCell >= 1 .and. iCell <= nCells) column_active(iCell) = .true.
       end do
       column_mask_on = .true.
+
+      if (level > 0) call hts_refresh_column_diag(level)
 
       call hts_push_microp_dt(block % configs, dt_level)
       if (moist_physics) then
@@ -10214,5 +10292,165 @@ module atm_time_integration
 
    end subroutine hts_pop_microp_dt
 #endif
+
+
+   subroutine hts_probe_cell(domain)
+
+      ! One line per fine step for config_hts_debug_probe_cell. The index is
+      ! the Fortran cell (a 0-based history id plus one). w, theta, qv, and
+      ! rho are time level 2, which this step is about to publish.
+
+      use mpas_log, only : mpas_log_write
+
+      implicit none
+
+      type (domain_type), intent(in) :: domain
+
+      type (mpas_pool_type), pointer :: state, diag_physics, mesh
+      real (kind=RKIND), dimension(:,:), pointer :: w, th, rho, u
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:), pointer :: t2m, skintemp
+      integer, dimension(:,:), pointer :: edgesOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell, indexToCellID
+      integer, pointer :: nCellsSolve, index_qv
+      integer :: iCell, iLocal, iEdge, i, k, kw, L, ratio, closed, own, err_level
+      integer :: L_s, closed_s, kw_s
+      real (kind=RKIND) :: wmax, thv, qv, rhov, t2, tsk, usfc, gmax, gmax_s
+      real (kind=RKIND) :: own_r, own_s, wmax_s, th_s, qv_s, rho_s, t2_s, tsk_s, usfc_s
+      real (kind=RKIND) :: L_r, closed_r, kw_r, L_out, closed_out, kw_out
+
+      iCell = hts_dbg_probe_cell
+      own = 0
+      closed = 0
+      kw = 1
+      L = -1
+      wmax = 0.0_RKIND
+      thv = 0.0_RKIND
+      qv = 0.0_RKIND
+      rhov = 0.0_RKIND
+      t2 = 0.0_RKIND
+      tsk = 0.0_RKIND
+      usfc = 0.0_RKIND
+      gmax = 0.0_RKIND
+
+      nullify(state, diag_physics, mesh, w, th, rho, u, scalars, t2m, skintemp)
+      nullify(edgesOnCell, nEdgesOnCell, indexToCellID, nCellsSolve, index_qv)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_array(state, 'w', w, 2)
+      call mpas_pool_get_array(state, 'theta_m', th, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho, 2)
+      call mpas_pool_get_array(state, 'u', u, 2)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+
+      iLocal = 0
+      if (associated(indexToCellID)) then
+         do i = 1, nCellsSolve
+            if (indexToCellID(i) == iCell) then
+               iLocal = i
+               exit
+            end if
+         end do
+      end if
+
+      if (iLocal >= 1 .and. allocated(hts_cell_level)) then
+         if (iLocal <= size(hts_cell_level) - 1) then
+            own = 1
+            L = hts_cell_level(iLocal)
+            if (L <= 0) then
+               closed = 1
+            else
+               ratio = ishft(1, L)
+               if (mod(hts_tick, ratio) == ratio - 1) closed = 1
+            end if
+            kw = 1
+            wmax = 0.0_RKIND
+            do k = 1, min(hts_nVert + 1, size(w, 1))
+               if (abs(w(k, iLocal)) >= abs(wmax)) then
+                  wmax = w(k, iLocal)
+                  kw = k
+               end if
+            end do
+            k = min(max(kw, 1), size(th, 1))
+            thv = th(k, iLocal)
+            rhov = rho(min(k, size(rho, 1)), iLocal)
+            if (associated(index_qv) .and. associated(scalars)) then
+               if (index_qv >= 1 .and. index_qv <= size(scalars, 1) .and. k <= size(scalars, 2)) then
+                  qv = scalars(index_qv, k, iLocal)
+               end if
+            end if
+            usfc = 0.0_RKIND
+            do i = 1, nEdgesOnCell(iLocal)
+               iEdge = edgesOnCell(i, iLocal)
+               if (iEdge >= 1 .and. iEdge <= size(u, 2)) usfc = max(usfc, abs(u(1, iEdge)))
+            end do
+#ifdef DO_PHYSICS
+            err_level = mpas_pool_get_error_level()
+            call mpas_pool_set_error_level(MPAS_POOL_SILENT)
+            call mpas_pool_get_subpool(block % structs, 'diag_physics', diag_physics)
+            if (associated(diag_physics)) then
+               call mpas_pool_get_array(diag_physics, 't2m', t2m)
+               call mpas_pool_get_array(diag_physics, 'skintemp', skintemp)
+            end if
+            call mpas_pool_set_error_level(err_level)
+            if (associated(t2m)) then
+               if (iLocal <= size(t2m)) t2 = t2m(iLocal)
+            end if
+            if (associated(skintemp)) then
+               if (iLocal <= size(skintemp)) tsk = skintemp(iLocal)
+            end if
+#endif
+         end if
+      end if
+
+      if (associated(w)) then
+         do i = 1, nCellsSolve
+            do k = 1, size(w, 1)
+               gmax = max(gmax, abs(w(k, i)))
+            end do
+         end do
+      end if
+
+      own_r = real(own, RKIND)
+      wmax_s = real(own, RKIND) * wmax
+      th_s = real(own, RKIND) * thv
+      qv_s = real(own, RKIND) * qv
+      rho_s = real(own, RKIND) * rhov
+      t2_s = real(own, RKIND) * t2
+      tsk_s = real(own, RKIND) * tsk
+      usfc_s = real(own, RKIND) * usfc
+      L_r = real(own * L, RKIND)
+      closed_r = real(own * closed, RKIND)
+      kw_r = real(own * kw, RKIND)
+      call mpas_dmpar_sum_real(domain % dminfo, own_r, own_s)
+      call mpas_dmpar_sum_real(domain % dminfo, wmax_s, wmax)
+      call mpas_dmpar_sum_real(domain % dminfo, th_s, thv)
+      call mpas_dmpar_sum_real(domain % dminfo, qv_s, qv)
+      call mpas_dmpar_sum_real(domain % dminfo, rho_s, rhov)
+      call mpas_dmpar_sum_real(domain % dminfo, t2_s, t2)
+      call mpas_dmpar_sum_real(domain % dminfo, tsk_s, tsk)
+      call mpas_dmpar_sum_real(domain % dminfo, usfc_s, usfc)
+      call mpas_dmpar_sum_real(domain % dminfo, L_r, L_out)
+      call mpas_dmpar_sum_real(domain % dminfo, closed_r, closed_out)
+      call mpas_dmpar_sum_real(domain % dminfo, kw_r, kw_out)
+      call mpas_dmpar_max_real(domain % dminfo, gmax, gmax_s)
+      own = 0
+      if (own_s > 0.0_RKIND) own = 1
+      L_s = nint(L_out)
+      closed_s = nint(closed_out)
+      kw_s = nint(kw_out)
+
+      call mpas_log_write('HTS probe tick $i cell $i own $i L $i closed $i k $i w $r th $r qv $r rho $r t2 $r tsk $r usfc $r gmax|w| $r', &
+                          masterOnly=.true., flushNow=.true., &
+                          intArgs=(/hts_tick, iCell, own, L_s, closed_s, kw_s/), &
+                          realArgs=(/wmax, thv, qv, rhov, t2, tsk, usfc, gmax_s/))
+
+   end subroutine hts_probe_cell
+
 
 end module atm_time_integration

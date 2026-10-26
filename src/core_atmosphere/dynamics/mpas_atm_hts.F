@@ -37,13 +37,24 @@ module mpas_atm_hts
    integer, public :: hts_active_level = 0
    integer, public :: hts_tick = 0
    integer, public :: hts_max_level_used = 0
-   ! Moist cap and the coarse-level ablations. pbl_substeps = 0 calls
-   ! surface, Noah, PBL, and GWDO at config_dt on every moist level above
-   ! 0. Dry runs ignore the cap. Dynamics and Kessler stay at the level dt.
+   ! Moist cap and the coarse-level ablations. pbl_substeps = 1 is one
+   ! surface call of the level dt. 0 folds a config_dt increment and is
+   ! not the default. Dry runs ignore the cap.
    integer, public :: hts_moist_max_level = 2
    integer, public :: hts_micro_substeps = 1
-   integer, public :: hts_pbl_substeps = 0
+   integer, public :: hts_pbl_substeps = 1
    integer, public :: hts_kessler_nsub = 1
+   ! Level>=1 bisection. match_fine turns on refresh and radiation-per-substep.
+   ! The other flags are independent. probe_cell 0 prints nothing.
+   logical, public :: hts_dbg_match = .false.
+   logical, public :: hts_dbg_refresh = .false.
+   logical, public :: hts_dbg_rad_every = .false.
+   logical, public :: hts_dbg_skip_idle = .false.
+   logical, public :: hts_dbg_skip_mass = .false.
+   logical, public :: hts_dbg_ruavg_last = .false.
+   logical, public :: hts_dbg_skip_promote = .false.
+   logical, public :: hts_dbg_keep_pp = .false.
+   integer, public :: hts_dbg_probe_cell = 0
    ! config_hts_debug_force_path. Every cell stays at level 0, and the
    ! advance still builds lists, the acoustic halo, the hold, the flux sum,
    ! the idle-scalar copy, and column physics. hts_path_live is that path
@@ -180,6 +191,15 @@ module mpas_atm_hts
       type (mpas_pool_type), pointer :: mesh
       logical, pointer :: config_hts
       logical, pointer :: config_hts_debug_force_path
+      logical, pointer :: config_hts_debug_match_fine
+      logical, pointer :: config_hts_debug_refresh_diag
+      logical, pointer :: config_hts_debug_rad_every_substep
+      logical, pointer :: config_hts_debug_skip_idle_copy
+      logical, pointer :: config_hts_debug_skip_mass_correct
+      logical, pointer :: config_hts_debug_ruavg_last
+      logical, pointer :: config_hts_debug_skip_promote
+      logical, pointer :: config_hts_debug_keep_pp
+      integer, pointer :: config_hts_debug_probe_cell
       integer, pointer :: config_hts_max_level
       integer, pointer :: config_hts_moist_max_level
       integer, pointer :: config_hts_micro_substeps
@@ -225,16 +245,28 @@ module mpas_atm_hts
       call mpas_pool_get_config(block % configs, 'config_hts', config_hts)
       call mpas_pool_get_config(block % configs, 'config_hts_max_level', config_hts_max_level)
       nullify(config_hts_moist_max_level, config_hts_micro_substeps, config_hts_pbl_substeps, config_hts_kessler_substeps)
-      nullify(config_hts_debug_force_path)
+      nullify(config_hts_debug_force_path, config_hts_debug_match_fine, config_hts_debug_refresh_diag)
+      nullify(config_hts_debug_rad_every_substep, config_hts_debug_skip_idle_copy, config_hts_debug_skip_mass_correct)
+      nullify(config_hts_debug_ruavg_last, config_hts_debug_skip_promote, config_hts_debug_keep_pp)
+      nullify(config_hts_debug_probe_cell)
       call mpas_pool_get_config(block % configs, 'config_hts_moist_max_level', config_hts_moist_max_level)
       call mpas_pool_get_config(block % configs, 'config_hts_micro_substeps', config_hts_micro_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_pbl_substeps', config_hts_pbl_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_kessler_substeps', config_hts_kessler_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_debug_force_path', config_hts_debug_force_path)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_match_fine', config_hts_debug_match_fine)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_refresh_diag', config_hts_debug_refresh_diag)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_rad_every_substep', config_hts_debug_rad_every_substep)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_skip_idle_copy', config_hts_debug_skip_idle_copy)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_skip_mass_correct', config_hts_debug_skip_mass_correct)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_ruavg_last', config_hts_debug_ruavg_last)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_skip_promote', config_hts_debug_skip_promote)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_keep_pp', config_hts_debug_keep_pp)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_probe_cell', config_hts_debug_probe_cell)
       hts_enabled = config_hts
       hts_moist_max_level = 2
       hts_micro_substeps = 1
-      hts_pbl_substeps = 0
+      hts_pbl_substeps = 1
       hts_kessler_nsub = 1
       if (associated(config_hts_moist_max_level)) hts_moist_max_level = config_hts_moist_max_level
       if (associated(config_hts_micro_substeps)) hts_micro_substeps = config_hts_micro_substeps
@@ -247,6 +279,29 @@ module mpas_atm_hts
       if (hts_kessler_nsub < 0) hts_kessler_nsub = 0
       hts_force_path = .false.
       if (associated(config_hts_debug_force_path)) hts_force_path = config_hts_debug_force_path
+      hts_dbg_match = .false.
+      hts_dbg_refresh = .false.
+      hts_dbg_rad_every = .false.
+      hts_dbg_skip_idle = .false.
+      hts_dbg_skip_mass = .false.
+      hts_dbg_ruavg_last = .false.
+      hts_dbg_skip_promote = .false.
+      hts_dbg_keep_pp = .false.
+      hts_dbg_probe_cell = 0
+      if (associated(config_hts_debug_match_fine)) hts_dbg_match = config_hts_debug_match_fine
+      if (associated(config_hts_debug_refresh_diag)) hts_dbg_refresh = config_hts_debug_refresh_diag
+      if (associated(config_hts_debug_rad_every_substep)) hts_dbg_rad_every = config_hts_debug_rad_every_substep
+      if (associated(config_hts_debug_skip_idle_copy)) hts_dbg_skip_idle = config_hts_debug_skip_idle_copy
+      if (associated(config_hts_debug_skip_mass_correct)) hts_dbg_skip_mass = config_hts_debug_skip_mass_correct
+      if (associated(config_hts_debug_ruavg_last)) hts_dbg_ruavg_last = config_hts_debug_ruavg_last
+      if (associated(config_hts_debug_skip_promote)) hts_dbg_skip_promote = config_hts_debug_skip_promote
+      if (associated(config_hts_debug_keep_pp)) hts_dbg_keep_pp = config_hts_debug_keep_pp
+      if (associated(config_hts_debug_probe_cell)) hts_dbg_probe_cell = config_hts_debug_probe_cell
+      if (hts_dbg_probe_cell < 0) hts_dbg_probe_cell = 0
+      if (hts_dbg_match) then
+         hts_dbg_refresh = .true.
+         hts_dbg_rad_every = .true.
+      end if
 
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_dimension(mesh, 'nCells', nCells)
@@ -388,7 +443,19 @@ module mpas_atm_hts
          call mpas_log_write(' moist max level $i, micro substeps $i, pbl substeps $i, kessler substeps $i', &
                              intArgs=(/hts_moist_max_level, hts_micro_substeps, hts_pbl_substeps, hts_kessler_nsub/))
          if (hts_pbl_substeps == 0) then
-            call mpas_log_write(' pbl_substeps = 0: moist levels above 0 call surface, Noah, PBL, and GWDO at config_dt')
+            call mpas_log_write(' pbl_substeps = 0: moist levels above 0 fold surface, Noah, PBL, and GWDO at config_dt')
+         end if
+         if (hts_dbg_match) call mpas_log_write(' debug match_fine: refresh diagnostics and rerun latched radiation on every substep')
+         if (hts_dbg_refresh .and. .not. hts_dbg_match) call mpas_log_write(' debug refresh_diag')
+         if (hts_dbg_rad_every .and. .not. hts_dbg_match) call mpas_log_write(' debug rad_every_substep')
+         if (hts_dbg_skip_idle) call mpas_log_write(' debug skip_idle_copy')
+         if (hts_dbg_skip_mass) call mpas_log_write(' debug skip_mass_correct')
+         if (hts_dbg_ruavg_last) call mpas_log_write(' debug ruavg_last')
+         if (hts_dbg_skip_promote) call mpas_log_write(' debug skip_promote')
+         if (hts_dbg_keep_pp) call mpas_log_write(' debug keep_pp: inactive acoustic neighbors keep rho_pp and rtheta_pp')
+         if (hts_dbg_probe_cell > 0) then
+            call mpas_log_write(' debug probe cell $i (Fortran index; 0-based history id is $i)', &
+                                intArgs=(/hts_dbg_probe_cell, hts_dbg_probe_cell - 1/))
          end if
          if (hts_micro_substeps == 0) then
             call mpas_log_write(' micro_substeps = 0: moist levels above 0 step dynamics, scalars, and Kessler at config_dt')
