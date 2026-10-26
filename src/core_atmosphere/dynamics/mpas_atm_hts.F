@@ -95,9 +95,6 @@ module mpas_atm_hts
    ! the following fine step copies the new snapshot into both time levels.
    logical, public :: hts_hold_valid(0:hts_level_cap) = .false.
    logical, public :: hts_hold_rewrote(0:hts_level_cap) = .false.
-   ! True after a level has stored one completed increment. The rho/theta
-   ! ramp stays off until then.
-   logical, public :: hts_have_delta(0:hts_level_cap) = .false.
    integer, public, allocatable :: hts_work_own(:,:)
    integer, public, allocatable :: hts_work_all(:,:)
    integer, public, allocatable :: hts_active_own(:,:)
@@ -182,7 +179,6 @@ module mpas_atm_hts
       hts_max_flux_resid = 0.0_RKIND
       hts_hold_valid(:) = .false.
       hts_hold_rewrote(:) = .false.
-      hts_have_delta(:) = .false.
 
       block => domain % blocklist
       nBlocks = 0
@@ -867,9 +863,11 @@ module mpas_atm_hts
 
       ! True only for the active level. A coarser open-interface parent is
       ! not advanced. Eds job 199953 updated that parent's rho_pp and
-      ! rtheta_pp while u and w stayed on the snapshot, and |u| reached
-      ! about 1000 m/s by 00:17:30 with a u NaN at 00:18. The pure hold on
-      ! d3fe6fb75 stayed finite until about 01:57.
+      ! rtheta_pp while u and w stayed on the snapshot: at 00:17:30 u was
+      ! about ±7.2e5 m/s and w about -1e4 / +8e4 m/s, and u was NaN at
+      ! 00:18. Ramping held-ring rho and theta (cf1dc652d, job 199977)
+      ! NaNed u at 00:12:30. The pure hold on d3fe6fb75 stayed finite until
+      ! about 01:57.
 
       implicit none
 
@@ -1002,9 +1000,7 @@ module mpas_atm_hts
                end do
             end do
             hts_level_started(L) = .true.
-            hts_have_delta(L) = .false.
          else
-            hts_have_delta(L) = .true.
             do i = 1, hts_n_active_all(L)
                iCell = hts_active_all(i, L)
                do k = 1, hts_nVert
@@ -1056,12 +1052,17 @@ module mpas_atm_hts
 
       call mpas_timer_start('hts_apply_interpolation')
 
-      ! Momentum can stay on the snapshot once it has been written. The
-      ! thermodynamic ramp below changes every fine tick, so it is not skipped.
+      ! A level whose state already matches its snapshot is left alone. The
+      ! fine step does not write that level's prognostic fields, and the time
+      ! levels stay equal across the shift until the level itself steps.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
       end do
+      if (.not. any) then
+         call mpas_timer_stop('hts_apply_interpolation')
+         return
+      end if
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -1070,70 +1071,34 @@ module mpas_atm_hts
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
 
-      ! Job 199953 (bb575a1b2) updated the parent's acoustic rho_pp and
-      ! rtheta_pp without its prognostic step. At 00:17:30 global u was
-      ! about ±7.2e5 m/s and w about -1e4 / +8e4 m/s; u was NaN at 00:18.
-      ! That acoustic update stays off. This ramp is only the previous
-      ! completed rho/theta increment, on the diagnostic ring, so the fine
-      ! land edge is not integrating tend_u_euler against a frozen exner.
-      ! CPAS follows a WRF nest: each level calls physics once with its own
-      ! dt, and the fine step reads a time-interpolated coarse state. A frozen
-      ! coarse column (alpha = 0) leaves tend_u_euler one-sided while the fine
-      ! land column heats, which is the 01:57 interface-edge wind on eds.
-      ! Ramping u and w as well, with a half-step lead, fed the coarse acoustic
-      ! transient into the fine flux and NaNed w. Only rho and theta move,
-      ! by the previous completed increment and with no lead. The coarse RK
-      ! still starts from the snapshot after the restore. The ramp is the
-      ! diagnostic ring of this level: that is the stencil the tendency reads.
-      ! Interior coarse columns are already on the snapshot and are not read.
-      do i = 1, hts_n_diag_all(activeLevel)
-         iCell = hts_diag_all(i, activeLevel)
-         L = hts_cell_level(iCell)
-         if (L <= activeLevel .or. L > hts_max_level_used) cycle
-         if (.not. hts_have_delta(L)) cycle
-         alpha = real(mod(hts_tick, ishft(1, L)), RKIND) / real(ishft(1, L), RKIND)
-         ! alpha = 0 is the snapshot the hold already wrote. Rewriting it
-         ! clobbers the edge-density and rw the fine diagnostics just stored.
-         if (alpha == 0.0_RKIND) cycle
-         do k = 1, hts_nVert
-            rho_here = snap_rho(k, iCell, L) + alpha * delta_rho(k, iCell, L)
-            th_here = snap_theta(k, iCell, L) + alpha * delta_theta(k, iCell, L)
-            rho1(k, iCell) = rho_here
-            rho2(k, iCell) = rho_here
-            th1(k, iCell) = th_here
-            th2(k, iCell) = th_here
-            call hts_diagnostics_from_state(k, iCell, rho_here, th_here, rho_base(k, iCell), &
-                 rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
-                 rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
-            rho_p_save(k, iCell) = rho_p(k, iCell)
-            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
-         end do
-      end do
-
-      if (.not. any) then
-         call mpas_timer_stop('hts_apply_interpolation')
-         return
-      end if
-
+      ! Hold coarser levels at the start-of-interval snapshot (alpha = 0)
+      ! while a finer level steps. A diagnostic-ring rho/theta ramp of the
+      ! previous increment (cf1dc652d) NaNed u at 00:12:30 on eds job
+      ! 199977, earlier than this hold. Extrapolating u and w fed the coarse
+      ! acoustic transient into the fine flux. Cells are written before
+      ! edges so an edge density sees both columns.
+      alpha = 0.0_RKIND
       do L = activeLevel + 1, hts_max_level_used
          if (hts_hold_valid(L)) cycle
          do i = 1, hts_n_active_all(L)
             iCell = hts_active_all(i, L)
             do k = 1, hts_nVert
-               rho1(k, iCell) = snap_rho(k, iCell, L)
-               rho2(k, iCell) = snap_rho(k, iCell, L)
-               th1(k, iCell) = snap_theta(k, iCell, L)
-               th2(k, iCell) = snap_theta(k, iCell, L)
-               call hts_diagnostics_from_state(k, iCell, snap_rho(k, iCell, L), snap_theta(k, iCell, L), &
-                    rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+               rho_here = snap_rho(k, iCell, L) + alpha * delta_rho(k, iCell, L)
+               th_here = snap_theta(k, iCell, L) + alpha * delta_theta(k, iCell, L)
+               rho1(k, iCell) = rho_here
+               rho2(k, iCell) = rho_here
+               th1(k, iCell) = th_here
+               th2(k, iCell) = th_here
+               call hts_diagnostics_from_state(k, iCell, rho_here, th_here, rho_base(k, iCell), &
+                    rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
                     rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
                rho_p_save(k, iCell) = rho_p(k, iCell)
                rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
             end do
             do k = 1, hts_nVert + 1
-               w1(k, iCell) = snap_w(k, iCell, L)
+               w1(k, iCell) = snap_w(k, iCell, L) + alpha * delta_w(k, iCell, L)
                w2(k, iCell) = w1(k, iCell)
-               rw(k, iCell) = snap_rw(k, iCell, L)
+               rw(k, iCell) = snap_rw(k, iCell, L) + alpha * delta_rw(k, iCell, L)
                rw_save(k, iCell) = rw(k, iCell)
             end do
          end do
@@ -1145,7 +1110,7 @@ module mpas_atm_hts
             cell1 = cellsOnEdge(1, iEdge)
             cell2 = cellsOnEdge(2, iEdge)
             do k = 1, hts_nVert
-               u_here = snap_u(k, iEdge, L)
+               u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
                u1(k, iEdge) = u_here
                u2(k, iEdge) = u_here
                ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
@@ -1182,13 +1147,16 @@ module mpas_atm_hts
 
       call mpas_timer_start('hts_restore_above')
 
-      ! The thermodynamic ramp is a boundary value for the fine pressure
-      ! gradient. The coarse RK starts from the snapshot, so put rho and theta
-      ! back even when u and w were already left there.
+      ! The active step writes its own columns. Levels that still match their
+      ! snapshot were not written, so putting the snapshot back is a no-op.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
       end do
+      if (.not. any) then
+         call mpas_timer_stop('hts_restore_above')
+         return
+      end if
 
       call hts_fetch_fields(block, rho1, rho2, th1, th2, w1, w2, u1, u2, &
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
@@ -1197,34 +1165,21 @@ module mpas_atm_hts
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
 
-      do i = 1, hts_n_diag_all(activeLevel)
-         iCell = hts_diag_all(i, activeLevel)
-         L = hts_cell_level(iCell)
-         if (L <= activeLevel .or. L > hts_max_level_used) cycle
-         if (.not. hts_have_delta(L)) cycle
-         if (real(mod(hts_tick, ishft(1, L)), RKIND) == 0.0_RKIND) cycle
-         do k = 1, hts_nVert
-            rho1(k, iCell) = snap_rho(k, iCell, L)
-            rho2(k, iCell) = snap_rho(k, iCell, L)
-            th1(k, iCell) = snap_theta(k, iCell, L)
-            th2(k, iCell) = snap_theta(k, iCell, L)
-            call hts_diagnostics_from_state(k, iCell, snap_rho(k, iCell, L), snap_theta(k, iCell, L), &
-                 rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
-                 rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
-            rho_p_save(k, iCell) = rho_p(k, iCell)
-            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
-         end do
-         do k = 1, hts_nVert + 1
-            w1(k, iCell) = snap_w(k, iCell, L)
-            w2(k, iCell) = snap_w(k, iCell, L)
-            rw(k, iCell) = snap_rw(k, iCell, L)
-            rw_save(k, iCell) = snap_rw(k, iCell, L)
-         end do
-      end do
       do L = activeLevel + 1, hts_max_level_used
          if (hts_hold_valid(L)) cycle
          do i = 1, hts_n_active_all(L)
             iCell = hts_active_all(i, L)
+            do k = 1, hts_nVert
+               rho1(k, iCell) = snap_rho(k, iCell, L)
+               rho2(k, iCell) = snap_rho(k, iCell, L)
+               th1(k, iCell) = snap_theta(k, iCell, L)
+               th2(k, iCell) = snap_theta(k, iCell, L)
+               call hts_diagnostics_from_state(k, iCell, snap_rho(k, iCell, L), snap_theta(k, iCell, L), &
+                    rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                    rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+               rho_p_save(k, iCell) = rho_p(k, iCell)
+               rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+            end do
             do k = 1, hts_nVert + 1
                w1(k, iCell) = snap_w(k, iCell, L)
                w2(k, iCell) = snap_w(k, iCell, L)
