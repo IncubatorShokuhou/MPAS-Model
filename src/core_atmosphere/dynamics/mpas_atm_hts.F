@@ -37,6 +37,12 @@ module mpas_atm_hts
    integer, public :: hts_active_level = 0
    integer, public :: hts_tick = 0
    integer, public :: hts_max_level_used = 0
+   ! Moist cap and the coarse-level ablations. Defaults reproduce the
+   ! single 120 s coupled step. Dry runs ignore the cap.
+   integer, public :: hts_moist_max_level = 2
+   integer, public :: hts_micro_substeps = 1
+   integer, public :: hts_pbl_substeps = 1
+   integer, public :: hts_kessler_nsub = 1
 
    integer, public, allocatable :: hts_cell_level(:)
    integer, public, allocatable :: hts_edge_level(:)
@@ -167,6 +173,10 @@ module mpas_atm_hts
       type (mpas_pool_type), pointer :: mesh
       logical, pointer :: config_hts
       integer, pointer :: config_hts_max_level
+      integer, pointer :: config_hts_moist_max_level
+      integer, pointer :: config_hts_micro_substeps
+      integer, pointer :: config_hts_pbl_substeps
+      integer, pointer :: config_hts_kessler_substeps
       integer, pointer :: nCells, nCellsSolve, nEdges, nEdgesSolve, nVertLevels
       integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
@@ -204,7 +214,25 @@ module mpas_atm_hts
 
       call mpas_pool_get_config(block % configs, 'config_hts', config_hts)
       call mpas_pool_get_config(block % configs, 'config_hts_max_level', config_hts_max_level)
+      nullify(config_hts_moist_max_level, config_hts_micro_substeps, config_hts_pbl_substeps, config_hts_kessler_substeps)
+      call mpas_pool_get_config(block % configs, 'config_hts_moist_max_level', config_hts_moist_max_level)
+      call mpas_pool_get_config(block % configs, 'config_hts_micro_substeps', config_hts_micro_substeps)
+      call mpas_pool_get_config(block % configs, 'config_hts_pbl_substeps', config_hts_pbl_substeps)
+      call mpas_pool_get_config(block % configs, 'config_hts_kessler_substeps', config_hts_kessler_substeps)
       hts_enabled = config_hts
+      hts_moist_max_level = 2
+      hts_micro_substeps = 1
+      hts_pbl_substeps = 1
+      hts_kessler_nsub = 1
+      if (associated(config_hts_moist_max_level)) hts_moist_max_level = config_hts_moist_max_level
+      if (associated(config_hts_micro_substeps)) hts_micro_substeps = config_hts_micro_substeps
+      if (associated(config_hts_pbl_substeps)) hts_pbl_substeps = config_hts_pbl_substeps
+      if (associated(config_hts_kessler_substeps)) hts_kessler_nsub = config_hts_kessler_substeps
+      if (hts_moist_max_level < 0) hts_moist_max_level = 0
+      if (hts_moist_max_level > hts_level_cap) hts_moist_max_level = hts_level_cap
+      if (hts_micro_substeps < 1) hts_micro_substeps = 1
+      if (hts_pbl_substeps < 1) hts_pbl_substeps = 1
+      if (hts_kessler_nsub < 1) hts_kessler_nsub = 1
 
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_dimension(mesh, 'nCells', nCells)
@@ -269,12 +297,13 @@ module mpas_atm_hts
       if (L > hts_level_cap) L = hts_level_cap
       ! Moist columns share one step across dynamics, Kessler, and PBL/Noah.
       ! Level 3 is 240 s at dt = 30 s. That step grew w at cell 3177 (job
-      ! 200248). Four 60 s dynamics steps under one 240 s PBL call
+      ! 200248). The same growth returned at 120 s (job 201338, onset about
+      ! 03:30). Four 60 s dynamics steps under one 240 s PBL call
       ! (0fa07c436) left that w on the same path and grew a near-surface u
-      ! oscillation on interior edge 64121 (job 201240). Cap the moist level
-      ! at 2 so the coarse step is 120 s and every process uses that dt.
+      ! oscillation on interior edge 64121 (job 201240). The default cap is
+      ! level 2. config_hts_moist_max_level selects the cap for ablations.
       ! Dry dynamics keeps config_hts_max_level.
-      if (moist_physics .and. L > 2) L = 2
+      if (moist_physics .and. L > hts_moist_max_level) L = hts_moist_max_level
 
       do iCell = 1, nCells
          if (uniform .or. meshDensity(iCell) <= 0.0_RKIND) then
@@ -342,6 +371,8 @@ module mpas_atm_hts
          if (moist_physics .and. config_hts_max_level > hts_max_level_used) then
             call mpas_log_write(' moist physics caps the active level at $i', intArgs=(/hts_max_level_used/))
          end if
+         call mpas_log_write(' moist max level $i, micro substeps $i, pbl substeps $i, kessler substeps $i', &
+                             intArgs=(/hts_moist_max_level, hts_micro_substeps, hts_pbl_substeps, hts_kessler_nsub/))
       else
          call mpas_log_write(' config_hts = false (integrator is unchanged)')
       end if

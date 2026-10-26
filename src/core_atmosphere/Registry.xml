@@ -86,6 +86,26 @@
                      description="Largest power-of-two time-step level (0 = fine only). Level L advances by config_dt * 2^L."
                      possible_values="Integers from 0 through 8"/>
 
+                <nml_option name="config_hts_moist_max_level" type="integer" default_value="2"
+                     units="-"
+                     description="Moist-physics cap on the active level. The coarse step is config_dt * 2^min(config_hts_max_level, this). Dry runs ignore it."
+                     possible_values="Integers from 0 through 8"/>
+
+                <nml_option name="config_hts_micro_substeps" type="integer" default_value="1"
+                     units="-"
+                     description="Coupled dynamics, scalar, and Kessler steps on the coarsest moist level. 1 is one step of the level dt. The acoustic step stays config_dt / config_number_of_sub_steps."
+                     possible_values="Positive integers, preferably a power of two"/>
+
+                <nml_option name="config_hts_pbl_substeps" type="integer" default_value="1"
+                     units="-"
+                     description="Surface, Noah, and PBL calls on the coarsest moist level. 1 matches the dynamics step. Greater than 1 with micro_substeps = 1 applies each short tendency to the state and leaves radiation for the long dynamics step."
+                     possible_values="Positive integers"/>
+
+                <nml_option name="config_hts_kessler_substeps" type="integer" default_value="1"
+                     units="-"
+                     description="Kessler calls inside one coarsest-level dynamics step. 1 is a single call of that step. Ignored when config_hts_micro_substeps is greater than 1."
+                     possible_values="Positive integers"/>
+
                 <nml_option name="config_calendar_type" type="character" default_value="gregorian" in_defaults="false"
                      units="-"
                      description="Simulation calendar type"
