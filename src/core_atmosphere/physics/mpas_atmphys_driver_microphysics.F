@@ -373,6 +373,12 @@
  microp_select: select case(trim(microp_scheme))
     case ("mp_kessler")
        call mpas_timer_start('mp_kessler')
+       ! A coarse HTS step splits Kessler into fine dt_microp pieces. One
+       ! 2^L step condenses the whole interval at once and, with Noah
+       ! feeding the column, that latent-heat jump NaNs after the PBL has
+       ! moistened. n_microp is 1 on a fine step, so this loop is a no-op.
+       istep = 1
+       do while (istep .le. n_microp)
        call kessler( &
                   t        = th_p      , qv    = qv_p  , qc     = qc_p     ,                &
                   qr       = qr_p      , rho   = rho_p , pii    = pi_p     ,                &
@@ -385,6 +391,8 @@
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme   , &
                   its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte     &
                    )
+       istep = istep + 1
+       end do
        call mpas_timer_stop('mp_kessler')
 
     case ("mp_thompson")
@@ -450,6 +458,8 @@
 
     case ("mp_wsm6")
        call mpas_timer_start('mp_wsm6')
+       istep = 1
+       do while (istep .le. n_microp)
        cursor = its
        do
           call column_mask_next_segment(cursor, ite, segS, segE, segFound)
@@ -476,6 +486,8 @@
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme       , &
                   its = segS, ite = segE, jts = jts , jte = jte , kts = kts , kte = kte         &
                )
+       end do
+       istep = istep + 1
        end do
        call mpas_timer_stop('mp_wsm6')
 

@@ -20,4 +20,5 @@ Personal WPS GEOG (do not use shared ACL path):
 - `config_noahmp_static = false` (no `soilgrids/` in personal GEOG; atmosphere uses `sf_noah`).
 - Ungrib intermediates reused from tutorial: `MPAS_tutorial/work/beijing_240km_2026101500/FILE:2026-10-15_00`.
 - Benign atmosphere ERROR: diagnostics stream not in simplified `streams.atmosphere` (critical = 0).
-- Multi-level (`config_hts_max_level = 3`) NaNed `u` near 00:25 with the fine `dt_pbl` (jobs 199635, 199659, 199660). GWDO was not the cause. `dt_pbl` now follows the level step. `max_level = 0` (job 199662, 45 min, bit-identical) was the workaround and is not required. The ≥2 h / ≥6 h confirmation is a later eds rerun.
+- Multi-level (`config_hts_max_level = 3`) NaNed `u` near 00:25 with the fine `dt_pbl` (jobs 199635, 199659, 199660). GWDO was not the cause. `dt_pbl` now follows the level step, and a coarse step subcycles PBL and Noah at the fine `dt`. `max_level = 0` (job 199662, 45 min, bit-identical) was the workaround and is not required.
+- After the `dt_pbl` correction and before that subcycle, jobs 199818 (2 h) and 199819 (6 h) still NaNed at `2026-10-15_01:57:30` (all-fine clean). The subcycled binary has not been confirmed on eds.

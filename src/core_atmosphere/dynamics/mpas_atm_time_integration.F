@@ -9419,11 +9419,18 @@ module atm_time_integration
 
    subroutine hts_level_column_physics(domain, itimestep, level, dt_level)
 
-      ! Run column physics on the owned cells of the active level, with that
-      ! level's dt. The mask stays on so microphysics, later in atm_srk3,
-      ! skips the same columns. dt_dyn and dt_pbl are restored before the
-      ! dynamics RK. The per-second rates are already stored by then, and
-      ! the RK multiplies them by dt_level.
+      ! Run column physics on the owned cells of the active level. A coarse
+      ! step subcycles PBL, the land model, sea ice, and GWDO at the fine
+      ! dt, then stores the net change as a per-second rate. The RK still
+      ! multiplies that rate by dt_level, so the dynamics sees one coarse
+      ! increment built from fine steps instead of one implicit step of
+      ! length dt_level. That long implicit step is what kept growing the
+      ! land-VR difference until u went NaN between 1.5 h and 2 h.
+      ! Radiation is called once, when its alarm is due; its heating is
+      ! already K/s. dt_dyn and dt_pbl are restored before the dynamics RK.
+      ! The mask stays on so microphysics, later in atm_srk3, skips the
+      ! same columns and, on a coarse step, splits Kessler and WSM6 the
+      ! same way.
 
       implicit none
 
@@ -9431,7 +9438,9 @@ module atm_time_integration
       integer, intent(in) :: itimestep, level
       real (kind=RKIND), intent(in) :: dt_level
 
-      integer :: i, iCell, nCells
+      integer :: i, iCell, nCells, nsub
+      real (kind=RKIND) :: dt_fine
+      character (len=StrKIND), pointer :: pbl_scheme, lsm_scheme, conv_scheme, gwdo_scheme, sfc_scheme
 
       if (.not. allocated(hts_cell_level)) return
       if (.not. allocated(hts_active_own)) return
@@ -9450,24 +9459,345 @@ module atm_time_integration
       end do
       column_mask_on = .true.
 
-      call hts_push_microp_dt(block % configs, dt_level)
-      if (moist_physics) then
-         if (level >= 0 .and. level <= 8) then
-            l_radtlw = hts_radlw_due(level)
-            l_radtsw = hts_radsw_due(level)
-            l_conv = hts_conv_due(level)
-         end if
+      dt_fine = dt_dyn
+      if (dt_fine <= 0.0_RKIND) dt_fine = dt_level
+      nsub = max(nint(dt_level / dt_fine), 1)
+
+      nullify(pbl_scheme, lsm_scheme, conv_scheme, gwdo_scheme, sfc_scheme)
+      call mpas_pool_get_config(block % configs, 'config_pbl_scheme', pbl_scheme)
+      call mpas_pool_get_config(block % configs, 'config_lsm_scheme', lsm_scheme)
+      call mpas_pool_get_config(block % configs, 'config_convection_scheme', conv_scheme)
+      call mpas_pool_get_config(block % configs, 'config_gwdo_scheme', gwdo_scheme)
+      call mpas_pool_get_config(block % configs, 'config_sfclayer_scheme', sfc_scheme)
+
+      if (moist_physics .and. nsub > 1 .and. &
+          ((associated(pbl_scheme) .and. trim(pbl_scheme) /= 'off') .or. &
+           (associated(lsm_scheme) .and. trim(lsm_scheme) /= 'off') .or. &
+           (associated(conv_scheme) .and. trim(conv_scheme) /= 'off') .or. &
+           (associated(gwdo_scheme) .and. trim(gwdo_scheme) /= 'off') .or. &
+           (associated(sfc_scheme) .and. trim(sfc_scheme) /= 'off'))) then
          if (column_mask_defer_sfc_dt) call hts_apply_sfc_dt(dt_level)
-         call physics_driver(domain, itimestep, hts_physics_xtime_s)
-         if (level >= 0 .and. level <= 8) then
-            hts_radlw_due(level) = .false.
-            hts_radsw_due(level) = .false.
-            hts_conv_due(level) = .false.
+         call hts_subcycle_column_physics(domain, itimestep, level, dt_level, dt_fine, nsub)
+      else
+         call hts_push_microp_dt(block % configs, dt_level)
+         if (moist_physics) then
+            if (level >= 0 .and. level <= 8) then
+               l_radtlw = hts_radlw_due(level)
+               l_radtsw = hts_radsw_due(level)
+               l_conv = hts_conv_due(level)
+            end if
+            if (column_mask_defer_sfc_dt) call hts_apply_sfc_dt(dt_level)
+            call physics_driver(domain, itimestep, hts_physics_xtime_s)
+            if (level >= 0 .and. level <= 8) then
+               hts_radlw_due(level) = .false.
+               hts_radsw_due(level) = .false.
+               hts_conv_due(level) = .false.
+            end if
          end if
+         call hts_pop_microp_dt()
       end if
-      call hts_pop_microp_dt()
 
    end subroutine hts_level_column_physics
+
+
+   subroutine hts_subcycle_column_physics(domain, itimestep, level, dt_level, dt_fine, nsub)
+
+      ! One implicit YSU/Noah step of length dt_level is what kept the
+      ! land-VR difference growing until u went NaN between 1.5 h and 2 h.
+      ! Call those schemes at the fine dt. Each call sees the profile left
+      ! by the previous fine increment, and the sum is stored as a
+      ! per-second rate. The atmosphere is then put back so the RK applies
+      ! that rate once over dt_level. Soil and skin stay where Noah left
+      ! them. Radiation is a K/s rate and is called once; it is not folded
+      ! into the restored tendency.
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep, level, nsub
+      real (kind=RKIND), intent(in) :: dt_level, dt_fine
+
+      type (mpas_pool_type), pointer :: state, diag, mesh, tend_physics
+      integer, pointer :: nVertLevels, index_qv, index_qc, index_qi
+      integer :: nActive, i, k, iCell, isub
+      real (kind=RKIND) :: dth, dqv, dqc, dqi, du, dv, coeff, rth, rqv, inv_dt
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m, rho_zz
+      real (kind=RKIND), dimension(:,:), pointer :: u_rec, v_rec
+      real (kind=RKIND), dimension(:,:), pointer :: exner, pressure_p, rtheta_p, rho_p
+      real (kind=RKIND), dimension(:,:), pointer :: exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:), pointer :: surface_pressure
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rthblten, rqvblten, rqcblten, rqiblten
+      real (kind=RKIND), dimension(:,:), pointer :: rublten, rvblten
+      real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, rqccuten, rqicuten
+      real (kind=RKIND), dimension(:,:), pointer :: rucuten, rvcuten
+      real (kind=RKIND), allocatable, dimension(:,:) :: save_th, save_qv, save_qc, save_qi
+      real (kind=RKIND), allocatable, dimension(:,:) :: save_u, save_v
+      real (kind=RKIND), allocatable, dimension(:,:) :: save_exner, save_pp, save_rtp, save_rhop
+      real (kind=RKIND), allocatable, dimension(:) :: save_ps
+      character (len=StrKIND), pointer :: conv_scheme
+      logical :: have_qc, have_qi, have_cu
+      logical :: radlw_due, radsw_due, conv_due
+
+      if (level < 0 .or. level > 8) return
+      if (nsub < 1) return
+      if (dt_level <= 0.0_RKIND .or. dt_fine <= 0.0_RKIND) return
+
+      nActive = hts_n_active_own(level)
+      radlw_due = hts_radlw_due(level)
+      radsw_due = hts_radsw_due(level)
+      conv_due = hts_conv_due(level)
+
+      nullify(state, diag, mesh, tend_physics)
+      nullify(conv_scheme)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(block % structs, 'tend_physics', tend_physics)
+      call mpas_pool_get_config(block % configs, 'config_convection_scheme', conv_scheme)
+
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+      call mpas_pool_get_dimension(state, 'index_qc', index_qc)
+      call mpas_pool_get_dimension(state, 'index_qi', index_qi)
+
+      call mpas_pool_get_array(state, 'theta_m', theta_m, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 1)
+      call mpas_pool_get_array(state, 'scalars', scalars, 1)
+      call mpas_pool_get_array(diag, 'uReconstructZonal', u_rec)
+      call mpas_pool_get_array(diag, 'uReconstructMeridional', v_rec)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
+      call mpas_pool_get_array(diag, 'rho_p', rho_p)
+      call mpas_pool_get_array(diag, 'exner_base', exner_base)
+      call mpas_pool_get_array(diag, 'rtheta_base', rtheta_base)
+      call mpas_pool_get_array(diag, 'rho_base', rho_base)
+      call mpas_pool_get_array(diag, 'surface_pressure', surface_pressure)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+
+      nullify(rthblten, rqvblten, rqcblten, rqiblten, rublten, rvblten)
+      nullify(rthcuten, rqvcuten, rqccuten, rqicuten, rucuten, rvcuten)
+      call mpas_pool_get_array(tend_physics, 'rthblten', rthblten)
+      call mpas_pool_get_array(tend_physics, 'rqvblten', rqvblten)
+      call mpas_pool_get_array(tend_physics, 'rqcblten', rqcblten)
+      call mpas_pool_get_array(tend_physics, 'rqiblten', rqiblten)
+      call mpas_pool_get_array(tend_physics, 'rublten', rublten)
+      call mpas_pool_get_array(tend_physics, 'rvblten', rvblten)
+      call mpas_pool_get_array(tend_physics, 'rthcuten', rthcuten)
+      call mpas_pool_get_array(tend_physics, 'rqvcuten', rqvcuten)
+      call mpas_pool_get_array(tend_physics, 'rqccuten', rqccuten)
+      call mpas_pool_get_array(tend_physics, 'rqicuten', rqicuten)
+      call mpas_pool_get_array(tend_physics, 'rucuten', rucuten)
+      call mpas_pool_get_array(tend_physics, 'rvcuten', rvcuten)
+
+      have_qc = associated(index_qc) .and. associated(rqcblten)
+      if (have_qc) have_qc = index_qc > 0 .and. size(rqcblten) > 0
+      have_qi = associated(index_qi) .and. associated(rqiblten)
+      if (have_qi) have_qi = index_qi > 0 .and. size(rqiblten) > 0
+      have_cu = associated(conv_scheme)
+      if (have_cu) have_cu = trim(conv_scheme) /= 'off'
+      if (have_cu) have_cu = associated(rthcuten)
+      if (have_cu) have_cu = size(rthcuten) > 0
+
+      if (nActive > 0) then
+         allocate(save_th(nVertLevels, nActive))
+         allocate(save_qv(nVertLevels, nActive))
+         allocate(save_qc(nVertLevels, nActive))
+         allocate(save_qi(nVertLevels, nActive))
+         allocate(save_u(nVertLevels, nActive))
+         allocate(save_v(nVertLevels, nActive))
+         allocate(save_exner(nVertLevels, nActive))
+         allocate(save_pp(nVertLevels, nActive))
+         allocate(save_rtp(nVertLevels, nActive))
+         allocate(save_rhop(nVertLevels, nActive))
+         allocate(save_ps(nActive))
+
+         do i = 1, nActive
+            iCell = hts_active_own(i, level)
+            save_ps(i) = surface_pressure(iCell)
+            do k = 1, nVertLevels
+               save_th(k, i) = theta_m(k, iCell)
+               save_qv(k, i) = scalars(index_qv, k, iCell)
+               if (have_qc) then
+                  save_qc(k, i) = scalars(index_qc, k, iCell)
+               else
+                  save_qc(k, i) = 0.0_RKIND
+               end if
+               if (have_qi) then
+                  save_qi(k, i) = scalars(index_qi, k, iCell)
+               else
+                  save_qi(k, i) = 0.0_RKIND
+               end if
+               save_u(k, i) = u_rec(k, iCell)
+               save_v(k, i) = v_rec(k, iCell)
+               save_exner(k, i) = exner(k, iCell)
+               save_pp(k, i) = pressure_p(k, iCell)
+               save_rtp(k, i) = rtheta_p(k, iCell)
+               save_rhop(k, i) = rho_p(k, iCell)
+            end do
+         end do
+      end if
+
+      do isub = 1, nsub
+         call hts_push_microp_dt(block % configs, dt_fine)
+         if (isub == 1) then
+            l_radtlw = radlw_due
+            l_radtsw = radsw_due
+            l_conv = conv_due
+         else
+            l_radtlw = .false.
+            l_radtsw = .false.
+            l_conv = .false.
+         end if
+         call physics_driver(domain, itimestep, hts_physics_xtime_s)
+         call hts_pop_microp_dt()
+
+         if (nActive <= 0) cycle
+         if (.not. associated(rthblten)) cycle
+         if (size(rthblten) <= 0) cycle
+
+         do i = 1, nActive
+            iCell = hts_active_own(i, level)
+            do k = 1, nVertLevels
+               dth = rthblten(k, iCell)
+               dqv = 0.0_RKIND
+               dqc = 0.0_RKIND
+               dqi = 0.0_RKIND
+               du = 0.0_RKIND
+               dv = 0.0_RKIND
+               if (associated(rqvblten)) then
+                  if (size(rqvblten) > 0) dqv = rqvblten(k, iCell)
+               end if
+               if (have_qc) dqc = rqcblten(k, iCell)
+               if (have_qi) dqi = rqiblten(k, iCell)
+               if (associated(rublten)) then
+                  if (size(rublten) > 0) du = rublten(k, iCell)
+               end if
+               if (associated(rvblten)) then
+                  if (size(rvblten) > 0) dv = rvblten(k, iCell)
+               end if
+               if (have_cu) then
+                  dth = dth + rthcuten(k, iCell)
+                  if (associated(rqvcuten)) then
+                     if (size(rqvcuten) > 0) dqv = dqv + rqvcuten(k, iCell)
+                  end if
+                  if (have_qc .and. associated(rqccuten)) then
+                     if (size(rqccuten) > 0) dqc = dqc + rqccuten(k, iCell)
+                  end if
+                  if (have_qi .and. associated(rqicuten)) then
+                     if (size(rqicuten) > 0) dqi = dqi + rqicuten(k, iCell)
+                  end if
+                  if (associated(rucuten)) then
+                     if (size(rucuten) > 0) du = du + rucuten(k, iCell)
+                  end if
+                  if (associated(rvcuten)) then
+                     if (size(rvcuten) > 0) dv = dv + rvcuten(k, iCell)
+                  end if
+               end if
+
+               dth = dt_fine * dth
+               dqv = dt_fine * dqv
+               dqc = dt_fine * dqc
+               dqi = dt_fine * dqi
+               du = dt_fine * du
+               dv = dt_fine * dv
+
+               ! Same moist conversion physics_get_tend applies. Radiation
+               ! is left in rthratenlw/sw and is not added here.
+               coeff = 1.0_RKIND + rvord * scalars(index_qv, k, iCell)
+               theta_m(k, iCell) = theta_m(k, iCell) + coeff * dth &
+                    + rvord * theta_m(k, iCell) * dqv / coeff
+               scalars(index_qv, k, iCell) = max(0.0_RKIND, scalars(index_qv, k, iCell) + dqv)
+               if (have_qc) scalars(index_qc, k, iCell) = max(0.0_RKIND, scalars(index_qc, k, iCell) + dqc)
+               if (have_qi) scalars(index_qi, k, iCell) = max(0.0_RKIND, scalars(index_qi, k, iCell) + dqi)
+               u_rec(k, iCell) = u_rec(k, iCell) + du
+               v_rec(k, iCell) = v_rec(k, iCell) + dv
+
+               call hts_diagnostics_from_state(k, iCell, rho_zz(k, iCell), theta_m(k, iCell), &
+                    rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
+                    rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
+            end do
+         end do
+      end do
+
+      inv_dt = 1.0_RKIND / dt_level
+      if (nActive > 0 .and. associated(rthblten)) then
+         if (size(rthblten) > 0) then
+            do i = 1, nActive
+               iCell = hts_active_own(i, level)
+               do k = 1, nVertLevels
+                  rqv = (scalars(index_qv, k, iCell) - save_qv(k, i)) * inv_dt
+                  coeff = 1.0_RKIND + rvord * save_qv(k, i)
+                  rth = ((theta_m(k, iCell) - save_th(k, i)) * inv_dt &
+                       - rvord * save_th(k, i) * rqv / coeff) / coeff
+                  rthblten(k, iCell) = rth
+                  if (associated(rqvblten)) then
+                     if (size(rqvblten) > 0) rqvblten(k, iCell) = rqv
+                  end if
+                  if (have_qc) rqcblten(k, iCell) = (scalars(index_qc, k, iCell) - save_qc(k, i)) * inv_dt
+                  if (have_qi) rqiblten(k, iCell) = (scalars(index_qi, k, iCell) - save_qi(k, i)) * inv_dt
+                  if (associated(rublten)) then
+                     if (size(rublten) > 0) rublten(k, iCell) = (u_rec(k, iCell) - save_u(k, i)) * inv_dt
+                  end if
+                  if (associated(rvblten)) then
+                     if (size(rvblten) > 0) rvblten(k, iCell) = (v_rec(k, iCell) - save_v(k, i)) * inv_dt
+                  end if
+                  if (have_cu) then
+                     rthcuten(k, iCell) = 0.0_RKIND
+                     if (associated(rqvcuten)) then
+                        if (size(rqvcuten) > 0) rqvcuten(k, iCell) = 0.0_RKIND
+                     end if
+                     if (associated(rqccuten)) then
+                        if (size(rqccuten) > 0) rqccuten(k, iCell) = 0.0_RKIND
+                     end if
+                     if (associated(rqicuten)) then
+                        if (size(rqicuten) > 0) rqicuten(k, iCell) = 0.0_RKIND
+                     end if
+                     if (associated(rucuten)) then
+                        if (size(rucuten) > 0) rucuten(k, iCell) = 0.0_RKIND
+                     end if
+                     if (associated(rvcuten)) then
+                        if (size(rvcuten) > 0) rvcuten(k, iCell) = 0.0_RKIND
+                     end if
+                  end if
+
+                  theta_m(k, iCell) = save_th(k, i)
+                  scalars(index_qv, k, iCell) = save_qv(k, i)
+                  if (have_qc) scalars(index_qc, k, iCell) = save_qc(k, i)
+                  if (have_qi) scalars(index_qi, k, iCell) = save_qi(k, i)
+                  u_rec(k, iCell) = save_u(k, i)
+                  v_rec(k, iCell) = save_v(k, i)
+                  exner(k, iCell) = save_exner(k, i)
+                  pressure_p(k, iCell) = save_pp(k, i)
+                  rtheta_p(k, iCell) = save_rtp(k, i)
+                  rho_p(k, iCell) = save_rhop(k, i)
+               end do
+               surface_pressure(iCell) = save_ps(i)
+            end do
+         end if
+      end if
+
+      if (allocated(save_th)) deallocate(save_th)
+      if (allocated(save_qv)) deallocate(save_qv)
+      if (allocated(save_qc)) deallocate(save_qc)
+      if (allocated(save_qi)) deallocate(save_qi)
+      if (allocated(save_u)) deallocate(save_u)
+      if (allocated(save_v)) deallocate(save_v)
+      if (allocated(save_exner)) deallocate(save_exner)
+      if (allocated(save_pp)) deallocate(save_pp)
+      if (allocated(save_rtp)) deallocate(save_rtp)
+      if (allocated(save_rhop)) deallocate(save_rhop)
+      if (allocated(save_ps)) deallocate(save_ps)
+
+      l_radtlw = .false.
+      l_radtsw = .false.
+      l_conv = .false.
+      hts_radlw_due(level) = .false.
+      hts_radsw_due(level) = .false.
+      hts_conv_due(level) = .false.
+
+   end subroutine hts_subcycle_column_physics
 
 
    subroutine hts_clear_column_mask()
@@ -9539,9 +9869,19 @@ module atm_time_integration
       hts_mp_n_microp_save = n_microp
 
       dt_dyn = dt
-      dt_microp = dt
       dt_pbl = dt
+      dt_microp = dt
       n_microp = 1
+      ! Kessler and WSM6 have no internal substep. A coarse step that calls
+      ! them once with dt_level condenses or freezes the whole interval in
+      ! one saturation adjustment. Split that call into fine steps. The
+      ! diabatic rate below still divides by dt_dyn = dt_level, and the RK
+      ! multiplies by the same dt, so the net heating is the sum of the
+      ! fine steps. Thompson keeps the 90 s substep it uses at init.
+      if (hts_mp_dt_dyn_save > 0.0_RKIND .and. dt > hts_mp_dt_dyn_save * 1.5_RKIND) then
+         n_microp = max(nint(dt / hts_mp_dt_dyn_save), 1)
+         dt_microp = dt / real(n_microp, RKIND)
+      end if
 
       nullify(microp_scheme)
       call mpas_pool_get_config(configs, 'config_microp_scheme', microp_scheme)

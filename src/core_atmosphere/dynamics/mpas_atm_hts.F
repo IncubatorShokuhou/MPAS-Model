@@ -26,6 +26,7 @@ module mpas_atm_hts
    public :: atm_hts_clear_consumed, atm_hts_correct_mass
    public :: hts_restrict_physics_tendencies
    public :: hts_exch_layer1
+   public :: hts_diagnostics_from_state
 
    logical, public :: hts_enabled = .false.
    logical, public :: hts_masking = .false.
