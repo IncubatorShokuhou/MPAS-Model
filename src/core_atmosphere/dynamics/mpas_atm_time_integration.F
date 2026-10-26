@@ -2894,11 +2894,19 @@ module atm_time_integration
             !$acc update self(w,pv_edge,rho_edge) if (.not. config_gpu_aware_mpi)
             if (config_scalar_advection .and. (.not. config_split_dynamics_transport) ) then
                !
-               ! Communicate halos for w[1,2], pv_edge[1,2], rho_edge[1,2], scalars[1,2]
+               ! Communicate halos for w[1,2], pv_edge[1,2], rho_edge[1,2], scalars[1,2].
+               ! On a fine level the scalar slice is only the active cells.
+               ! theta_m in the start-of-step group is time level 1, and the
+               ! group without scalars is time level 2, so that one stays whole.
                !
                call mpas_pool_get_array(state, 'scalars', scalars_2, 2)
                !$acc update self(scalars_2) if (.not. config_gpu_aware_mpi)
-               call exchange_halo_group(domain, 'dynamics:w,pv_edge,rho_edge,scalars', config_gpu_aware_mpi)
+               if (hts_compact_scalar_halo()) then
+                  call exchange_halo_group(domain, 'dynamics:w,pv_edge,rho_edge', config_gpu_aware_mpi)
+                  call hts_exch_scalars(domain, scalars_2)
+               else
+                  call exchange_halo_group(domain, 'dynamics:w,pv_edge,rho_edge,scalars', config_gpu_aware_mpi)
+               end if
                !$acc update device(scalars_2) if (.not. config_gpu_aware_mpi)
             else
                !
@@ -5259,6 +5267,9 @@ module atm_time_integration
       !$acc parallel async
       !$acc loop gang worker private(scalar_weight2, ica)
       do iEdge=edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+         if (.not. hts_feed_edge(iEdge)) cycle
+#endif
 
          if ((.not.config_apply_lbcs) &
              .or. (bdyMaskEdge(iEdge) < nRelaxZone-1)) then  ! full flux calculation
@@ -5726,7 +5737,11 @@ module atm_time_integration
 
 !$OMP BARRIER
 !$OMP MASTER
-      call exchange_halo_group(block % domain, 'dynamics:'//trim(field_name)//'_old', config_gpu_aware_mpi)
+      if (hts_compact_scalar_halo()) then
+         call hts_exch_scalars(block % domain, scalars_old)
+      else
+         call exchange_halo_group(block % domain, 'dynamics:'//trim(field_name)//'_old', config_gpu_aware_mpi)
+      end if
 !$OMP END MASTER
 !$OMP BARRIER
 
@@ -5843,6 +5858,9 @@ module atm_time_integration
          !
          !$acc loop gang worker
          do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
             ! zero flux at top and bottom
             wdtn(1,iCell) = 0.0_RKIND
@@ -5922,6 +5940,9 @@ module atm_time_integration
          !
          !$acc loop gang worker private(ica, swa)
          do iEdge=edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_feed_edge(iEdge)) cycle
+#endif
 
             cell1 = cellsOnEdge(1,iEdge)
             cell2 = cellsOnEdge(2,iEdge)
@@ -5992,6 +6013,9 @@ module atm_time_integration
 
          !$acc loop gang worker private(flux_upwind_arr)
          do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
             k = 1
             scalar_new(k,iCell) = scalar_old(k,iCell) * rho_zz_old(k,iCell)
@@ -6033,6 +6057,9 @@ module atm_time_integration
          !  upwind flux computation
          !$acc loop gang worker
          do iEdge=edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_feed_edge(iEdge)) cycle
+#endif
 
             cell1 = cellsOnEdge(1,iEdge)
             cell2 = cellsOnEdge(2,iEdge)
@@ -6062,6 +6089,9 @@ module atm_time_integration
 
          !$acc loop gang worker
          do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
             !$acc loop seq
             do i=1,nEdgesOnCell(iCell)
@@ -6091,6 +6121,9 @@ module atm_time_integration
          if (local_advance_density) then
             !$acc loop gang worker
             do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+               if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
                !$acc loop vector
                do k = 1, nVertLevels
@@ -6106,6 +6139,9 @@ module atm_time_integration
          else
             !$acc loop gang worker
             do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+               if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
                !$acc loop vector
                do k = 1, nVertLevels
@@ -6133,7 +6169,11 @@ module atm_time_integration
 
 !$OMP BARRIER
 !$OMP MASTER
-         call exchange_halo_group(block % domain, 'dynamics:scale', config_gpu_aware_mpi)
+         if (hts_compact_scalar_halo() .and. hts_sc_ready) then
+            call hts_exch_scale(block % domain, scale_arr)
+         else
+            call exchange_halo_group(block % domain, 'dynamics:scale', config_gpu_aware_mpi)
+         end if
 !$OMP END MASTER
 !$OMP BARRIER
 
@@ -6145,6 +6185,9 @@ module atm_time_integration
 
          !$acc loop gang worker
          do iEdge=edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_feed_edge(iEdge)) cycle
+#endif
             cell1 = cellsOnEdge(1,iEdge)
             cell2 = cellsOnEdge(2,iEdge)
 
@@ -6175,6 +6218,9 @@ module atm_time_integration
          ! into the following loops. Avoids having to save elements of flux array
          !$acc loop gang worker
          do iEdge=edgeStart,edgeEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_feed_edge(iEdge)) cycle
+#endif
             cell1 = cellsOnEdge(1,iEdge)
             cell2 = cellsOnEdge(2,iEdge)
 
@@ -6202,6 +6248,9 @@ module atm_time_integration
  
          !$acc loop gang worker
          do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
             !$acc loop vector
             do k = 2, nVertLevels
@@ -6217,6 +6266,9 @@ module atm_time_integration
          !
          !$acc loop gang worker
          do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+            if (.not. hts_scale_cell(iCell)) cycle
+#endif
 
             !$acc loop seq
             do i=1,nEdgesOnCell(iCell)

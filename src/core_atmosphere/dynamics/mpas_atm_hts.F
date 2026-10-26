@@ -27,6 +27,11 @@ module mpas_atm_hts
    public :: atm_hts_clear_consumed, atm_hts_correct_mass
    public :: hts_restrict_physics_tendencies
    public :: hts_exch_layer1
+   public :: hts_exch_scalars
+   public :: hts_exch_scale
+   public :: hts_feed_edge
+   public :: hts_scale_cell
+   public :: hts_compact_scalar_halo
    public :: hts_diagnostics_from_state
    public :: atm_hts_mark_acoustic_cells
    public :: hts_cell_acoustic
@@ -141,6 +146,47 @@ module mpas_atm_hts
    real (kind=RKIND), allocatable :: hts_ah_sbuf(:)
    real (kind=RKIND), allocatable :: hts_ah_rbuf(:)
 
+   ! Scalar advection reads a two-layer halo (dynamics:scalars is layers 1
+   ! and 2, up to 10 advCellsForEdge). The layer-1 acoustic list is the
+   ! wrong stencil. These lists send only cells whose level is the active
+   ! level: idle columns are not updated, so their halo copy stays valid.
+   ! Scale is the limiter weight on both cells of an owned edge, including
+   ! the idle neighbor, so that list is the one-ring and layer 1 only.
+   logical, public :: hts_sh_ready = .false.
+   logical, public :: hts_sc_ready = .false.
+   integer, public :: hts_n_owned_global = 0
+   integer, public :: hts_n_active_global(0:hts_level_cap) = 0
+   integer, public, allocatable :: hts_feed_mask(:)
+   integer, allocatable :: hts_scale_mask(:)
+   integer :: hts_sh_nper = 0
+   integer :: hts_sc_nper = 0
+   integer :: hts_sh_maxc = 0
+   integer :: hts_sc_maxc = 0
+   integer :: hts_sh_nsend(0:hts_level_cap) = 0
+   integer :: hts_sh_nrecv(0:hts_level_cap) = 0
+   integer :: hts_sc_nsend(0:hts_level_cap) = 0
+   integer :: hts_sc_nrecv(0:hts_level_cap) = 0
+   integer, allocatable, target :: hts_sh_send_proc(:,:)
+   integer, allocatable, target :: hts_sh_send_n(:,:)
+   integer, allocatable, target :: hts_sh_send_off(:,:)
+   integer, allocatable, target :: hts_sh_send_cell(:)
+   integer, allocatable, target :: hts_sh_recv_proc(:,:)
+   integer, allocatable, target :: hts_sh_recv_n(:,:)
+   integer, allocatable, target :: hts_sh_recv_off(:,:)
+   integer, allocatable, target :: hts_sh_recv_cell(:)
+   integer, allocatable, target :: hts_sc_send_proc(:,:)
+   integer, allocatable, target :: hts_sc_send_n(:,:)
+   integer, allocatable, target :: hts_sc_send_off(:,:)
+   integer, allocatable, target :: hts_sc_send_cell(:)
+   integer, allocatable, target :: hts_sc_recv_proc(:,:)
+   integer, allocatable, target :: hts_sc_recv_n(:,:)
+   integer, allocatable, target :: hts_sc_recv_off(:,:)
+   integer, allocatable, target :: hts_sc_recv_cell(:)
+   real (kind=RKIND), allocatable, target :: hts_sh_sbuf(:)
+   real (kind=RKIND), allocatable, target :: hts_sh_rbuf(:)
+   real (kind=RKIND), allocatable, target :: hts_sc_sbuf(:)
+   real (kind=RKIND), allocatable, target :: hts_sc_rbuf(:)
+
    real (kind=R8KIND), allocatable :: hts_flux_sum(:,:)
 
    real (kind=RKIND), allocatable :: snap_rho(:,:,:), delta_rho(:,:,:)
@@ -180,6 +226,8 @@ module mpas_atm_hts
 
       hts_enabled = .false.
       hts_masking = .false.
+      hts_sh_ready = .false.
+      hts_sc_ready = .false.
       hts_impose = .false.
       hts_active_level = 0
       hts_tick = 0
@@ -331,7 +379,9 @@ module mpas_atm_hts
       call mpas_dmpar_sum_int(domain % dminfo, nCellsSolve, globalOwned)
 
       hts_max_level_used = 0
+      hts_n_owned_global = globalOwned
       do L = 0, hts_level_cap
+         hts_n_active_global(L) = globalCount(L)
          if (globalCount(L) > 0) hts_max_level_used = L
       end do
 
@@ -371,6 +421,8 @@ module mpas_atm_hts
 
       call atm_hts_build_lists(block)
       call atm_hts_build_acoustic_halo(block)
+      call atm_hts_build_scalar_halos(block)
+      call atm_hts_build_feed_mask(block)
 
       allocate(hts_ru_target(nVertLevels, nEdges+1))
       allocate(hts_flux_sum(nVertLevels, nEdges+1))
@@ -469,6 +521,30 @@ module mpas_atm_hts
       if (allocated(hts_ah_sbuf)) deallocate(hts_ah_sbuf)
       if (allocated(hts_ah_rbuf)) deallocate(hts_ah_rbuf)
       hts_ah_ready = .false.
+      if (allocated(hts_feed_mask)) deallocate(hts_feed_mask)
+      if (allocated(hts_scale_mask)) deallocate(hts_scale_mask)
+      if (allocated(hts_sh_send_proc)) deallocate(hts_sh_send_proc)
+      if (allocated(hts_sh_send_n)) deallocate(hts_sh_send_n)
+      if (allocated(hts_sh_send_off)) deallocate(hts_sh_send_off)
+      if (allocated(hts_sh_send_cell)) deallocate(hts_sh_send_cell)
+      if (allocated(hts_sh_recv_proc)) deallocate(hts_sh_recv_proc)
+      if (allocated(hts_sh_recv_n)) deallocate(hts_sh_recv_n)
+      if (allocated(hts_sh_recv_off)) deallocate(hts_sh_recv_off)
+      if (allocated(hts_sh_recv_cell)) deallocate(hts_sh_recv_cell)
+      if (allocated(hts_sh_sbuf)) deallocate(hts_sh_sbuf)
+      if (allocated(hts_sh_rbuf)) deallocate(hts_sh_rbuf)
+      if (allocated(hts_sc_send_proc)) deallocate(hts_sc_send_proc)
+      if (allocated(hts_sc_send_n)) deallocate(hts_sc_send_n)
+      if (allocated(hts_sc_send_off)) deallocate(hts_sc_send_off)
+      if (allocated(hts_sc_send_cell)) deallocate(hts_sc_send_cell)
+      if (allocated(hts_sc_recv_proc)) deallocate(hts_sc_recv_proc)
+      if (allocated(hts_sc_recv_n)) deallocate(hts_sc_recv_n)
+      if (allocated(hts_sc_recv_off)) deallocate(hts_sc_recv_off)
+      if (allocated(hts_sc_recv_cell)) deallocate(hts_sc_recv_cell)
+      if (allocated(hts_sc_sbuf)) deallocate(hts_sc_sbuf)
+      if (allocated(hts_sc_rbuf)) deallocate(hts_sc_rbuf)
+      hts_sh_ready = .false.
+      hts_sc_ready = .false.
 
    end subroutine atm_hts_finalize
 
@@ -2010,6 +2086,628 @@ module mpas_atm_hts
       call mpas_timer_stop('hts_acoustic_halo')
 
    end subroutine hts_exch_layer1
+
+
+   logical function hts_feed_edge(iEdge)
+
+      ! True when this edge's flux is read by an owned cell of the active
+      ! level. Idle edges are not consumed by the masked scalar update.
+
+      implicit none
+
+      integer, intent(in) :: iEdge
+
+      hts_feed_edge = .true.
+      if (.not. hts_masking) return
+      if (hts_max_level_used <= 0) return
+      if (.not. allocated(hts_feed_mask)) return
+      if (iEdge < 1 .or. iEdge > size(hts_feed_mask)) return
+      if (hts_active_level < 0 .or. hts_active_level > hts_level_cap) return
+      hts_feed_edge = iand(hts_feed_mask(iEdge), ishft(1, hts_active_level)) /= 0
+
+   end function hts_feed_edge
+
+
+   logical function hts_scale_cell(iCell)
+
+      ! Owned cell whose limiter weight is read by an active edge: the cell
+      ! itself is on this level, or one of its neighbors is.
+
+      implicit none
+
+      integer, intent(in) :: iCell
+
+      hts_scale_cell = .true.
+      if (.not. hts_masking) return
+      if (hts_max_level_used <= 0) return
+      if (.not. allocated(hts_scale_mask)) return
+      if (iCell < 1 .or. iCell > size(hts_scale_mask)) return
+      if (hts_active_level < 0 .or. hts_active_level > hts_level_cap) return
+      hts_scale_cell = iand(hts_scale_mask(iCell), ishft(1, hts_active_level)) /= 0
+
+   end function hts_scale_cell
+
+
+   logical function hts_compact_scalar_halo()
+
+      ! Same answer on every rank. A level that owns most of the mesh keeps
+      ! the full scalar group: a second message of nearly every halo cell
+      ! costs more than it saves. Finer levels are a small patch.
+
+      implicit none
+
+      integer :: L
+
+      hts_compact_scalar_halo = .false.
+      if (.not. hts_sh_ready) return
+      if (.not. hts_masking) return
+      if (hts_max_level_used < 1) return
+      L = hts_active_level
+      if (L < 0 .or. L > hts_max_level_used) return
+      if (hts_n_owned_global < 1) return
+      if (hts_n_active_global(L) * 2 >= hts_n_owned_global) return
+      hts_compact_scalar_halo = .true.
+
+   end function hts_compact_scalar_halo
+
+
+   subroutine atm_hts_build_feed_mask(block)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nEdges, nCells, nCellsSolve
+      integer :: iEdge, iCell, i, nbr, cell1, cell2, L, nLocal, nGlobal
+
+      if (allocated(hts_feed_mask)) deallocate(hts_feed_mask)
+      if (allocated(hts_scale_mask)) deallocate(hts_scale_mask)
+      if (hts_max_level_used < 1) return
+
+      nullify(mesh, cellsOnEdge, cellsOnCell, nEdgesOnCell, nEdges, nCells, nCellsSolve)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_dimension(mesh, 'nEdges', nEdges)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+
+      allocate(hts_feed_mask(nEdges + 1))
+      hts_feed_mask(:) = 0
+      do iEdge = 1, nEdges
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         if (cell1 >= 1 .and. cell1 <= nCellsSolve) then
+            if (hts_cell_level(cell1) >= 0 .and. hts_cell_level(cell1) <= hts_level_cap) then
+               hts_feed_mask(iEdge) = ibset(hts_feed_mask(iEdge), hts_cell_level(cell1))
+            end if
+         end if
+         if (cell2 >= 1 .and. cell2 <= nCellsSolve) then
+            if (hts_cell_level(cell2) >= 0 .and. hts_cell_level(cell2) <= hts_level_cap) then
+               hts_feed_mask(iEdge) = ibset(hts_feed_mask(iEdge), hts_cell_level(cell2))
+            end if
+         end if
+      end do
+
+      do L = 0, hts_max_level_used
+         nLocal = 0
+         do iEdge = 1, hts_nEdgesSolve
+            if (iand(hts_feed_mask(iEdge), ishft(1, L)) /= 0) nLocal = nLocal + 1
+         end do
+         call mpas_dmpar_sum_int(block % domain % dminfo, nLocal, nGlobal)
+         call mpas_log_write(' level $i scalar-flux edges $i', intArgs=(/L, nGlobal/))
+      end do
+
+      allocate(hts_scale_mask(nCells + 1))
+      hts_scale_mask(:) = 0
+      do iCell = 1, nCellsSolve
+         L = hts_cell_level(iCell)
+         if (L >= 0 .and. L <= hts_level_cap) then
+            hts_scale_mask(iCell) = ibset(hts_scale_mask(iCell), L)
+         end if
+         do i = 1, nEdgesOnCell(iCell)
+            nbr = cellsOnCell(i, iCell)
+            if (nbr < 1 .or. nbr > nCells) cycle
+            L = hts_cell_level(nbr)
+            if (L >= 0 .and. L <= hts_level_cap) then
+               hts_scale_mask(iCell) = ibset(hts_scale_mask(iCell), L)
+            end if
+         end do
+      end do
+
+   end subroutine atm_hts_build_feed_mask
+
+
+   subroutine atm_hts_build_scalar_halos(block)
+
+      ! Build the two-layer scalar list and the one-ring scale list from
+      ! theta_m's halo exchange lists. A count mismatch keeps the full group.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: state
+      type (field2DReal), pointer :: fld
+      integer, pointer :: num_scalars
+      integer :: nPer
+
+      hts_sh_ready = .false.
+      hts_sc_ready = .false.
+      hts_sh_nper = 0
+      hts_sc_nper = 0
+      hts_sh_maxc = 0
+      hts_sc_maxc = 0
+      if (hts_max_level_used < 1) return
+
+      nullify(state, fld, num_scalars)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_field(state, 'theta_m', fld, 1)
+      call mpas_pool_get_dimension(state, 'num_scalars', num_scalars)
+      if (.not. associated(fld)) return
+      if (.not. associated(num_scalars)) return
+      if (num_scalars < 1 .or. hts_nVert < 1) return
+
+      call hts_fill_masked_halo(block, fld, 2, 0, &
+           hts_sh_nsend, hts_sh_nrecv, hts_sh_send_proc, hts_sh_send_n, hts_sh_send_off, hts_sh_send_cell, &
+           hts_sh_recv_proc, hts_sh_recv_n, hts_sh_recv_off, hts_sh_recv_cell, hts_sh_maxc, hts_sh_ready, &
+           'scalar')
+      if (hts_sh_ready) then
+         nPer = num_scalars * hts_nVert
+         hts_sh_nper = nPer
+         allocate(hts_sh_sbuf(max(hts_sh_maxc, 1) * nPer))
+         allocate(hts_sh_rbuf(max(hts_sh_maxc, 1) * nPer))
+      end if
+
+      call hts_fill_masked_halo(block, fld, 1, 1, &
+           hts_sc_nsend, hts_sc_nrecv, hts_sc_send_proc, hts_sc_send_n, hts_sc_send_off, hts_sc_send_cell, &
+           hts_sc_recv_proc, hts_sc_recv_n, hts_sc_recv_off, hts_sc_recv_cell, hts_sc_maxc, hts_sc_ready, &
+           'scale')
+      if (hts_sc_ready) then
+         nPer = hts_nVert * 2
+         hts_sc_nper = nPer
+         allocate(hts_sc_sbuf(max(hts_sc_maxc, 1) * nPer))
+         allocate(hts_sc_rbuf(max(hts_sc_maxc, 1) * nPer))
+      end if
+
+   end subroutine atm_hts_build_scalar_halos
+
+
+   subroutine hts_fill_masked_halo(block, fld, nLayers, ring, &
+        nsend, nrecv, send_proc, send_n, send_off, send_cell, &
+        recv_proc, recv_n, recv_off, recv_cell, maxCells, ready, label)
+
+#ifdef MPAS_USE_MPI_F08
+      use mpi_f08, only : MPI_Comm, MPI_INTEGER, MPI_SUM, MPI_Alltoall, MPI_Allreduce
+#else
+      use mpi, only : MPI_INTEGER, MPI_SUM, MPI_Alltoall, MPI_Allreduce
+#endif
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      type (field2DReal), intent(in) :: fld
+      integer, intent(in) :: nLayers, ring
+      integer, intent(inout) :: nsend(0:), nrecv(0:)
+      integer, allocatable, intent(inout) :: send_proc(:,:), send_n(:,:), send_off(:,:), send_cell(:)
+      integer, allocatable, intent(inout) :: recv_proc(:,:), recv_n(:,:), recv_off(:,:), recv_cell(:)
+      integer, intent(out) :: maxCells
+      logical, intent(out) :: ready
+      character(len=*), intent(in) :: label
+
+      type (mpas_pool_type), pointer :: mesh
+      type (mpas_exchange_list), pointer :: exch
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, allocatable :: sendCounts(:), recvExpect(:), myRecv(:), procToMsg(:)
+      integer :: L, layer, iCell, cell1, j, n, nmsg, fullN, sent, recvTot
+      integer :: nprocs, maxMsg, localBad, globalBad, ierr, cursor, base
+#ifdef MPAS_USE_MPI_F08
+      type (MPI_Comm) :: comm
+#else
+      integer :: comm
+#endif
+
+      ready = .false.
+      maxCells = 0
+      nsend(:) = 0
+      nrecv(:) = 0
+      if (allocated(send_proc)) deallocate(send_proc)
+      if (allocated(send_n)) deallocate(send_n)
+      if (allocated(send_off)) deallocate(send_off)
+      if (allocated(send_cell)) deallocate(send_cell)
+      if (allocated(recv_proc)) deallocate(recv_proc)
+      if (allocated(recv_n)) deallocate(recv_n)
+      if (allocated(recv_off)) deallocate(recv_off)
+      if (allocated(recv_cell)) deallocate(recv_cell)
+
+      if (.not. associated(fld % sendList)) return
+      if (.not. associated(fld % recvList)) return
+      if (.not. associated(fld % sendList % halos)) return
+      if (size(fld % sendList % halos) < nLayers) return
+      if (size(fld % recvList % halos) < nLayers) return
+
+      nullify(mesh, cellsOnCell, nEdgesOnCell)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+
+      nprocs = block % domain % dminfo % nprocs
+      comm = block % domain % dminfo % comm
+      maxMsg = max(nprocs, 1)
+      localBad = 0
+
+      allocate(send_proc(maxMsg, 0:hts_max_level_used))
+      allocate(send_n(maxMsg, 0:hts_max_level_used))
+      allocate(send_off(maxMsg, 0:hts_max_level_used))
+      allocate(recv_proc(maxMsg, 0:hts_max_level_used))
+      allocate(recv_n(maxMsg, 0:hts_max_level_used))
+      allocate(recv_off(maxMsg, 0:hts_max_level_used))
+      allocate(send_cell(max(hts_nCells, 1) * (hts_max_level_used + 1)))
+      allocate(recv_cell(max(hts_nCells, 1) * (hts_max_level_used + 1)))
+      send_n(:, :) = 0
+      recv_n(:, :) = 0
+
+      allocate(sendCounts(0:nprocs-1), recvExpect(0:nprocs-1), myRecv(0:nprocs-1), procToMsg(0:nprocs-1))
+
+      base = 0
+      do L = 0, hts_max_level_used
+         sendCounts(:) = 0
+         myRecv(:) = 0
+         fullN = 0
+         do layer = 1, nLayers
+            exch => fld % sendList % halos(layer) % exchList
+            do while (associated(exch))
+               fullN = fullN + exch % nList
+               n = 0
+               if (exch % endPointID < 0 .or. exch % endPointID >= nprocs) then
+                  localBad = 1
+               else
+                  do iCell = 1, exch % nList
+                     if (hts_keep_cell(exch % srcList(iCell), L, ring, nEdgesOnCell, cellsOnCell)) n = n + 1
+                  end do
+                  sendCounts(exch % endPointID) = sendCounts(exch % endPointID) + n
+               end if
+               exch => exch % next
+            end do
+            exch => fld % recvList % halos(layer) % exchList
+            do while (associated(exch))
+               n = 0
+               if (exch % endPointID < 0 .or. exch % endPointID >= nprocs) then
+                  localBad = 1
+               else
+                  do iCell = 1, exch % nList
+                     if (hts_keep_cell(exch % destList(iCell), L, ring, nEdgesOnCell, cellsOnCell)) n = n + 1
+                  end do
+                  myRecv(exch % endPointID) = myRecv(exch % endPointID) + n
+               end if
+               exch => exch % next
+            end do
+         end do
+
+         call MPI_Alltoall(sendCounts, 1, MPI_INTEGER, recvExpect, 1, MPI_INTEGER, comm, ierr)
+         do cell1 = 0, nprocs - 1
+            if (recvExpect(cell1) /= myRecv(cell1)) localBad = 1
+         end do
+
+         nmsg = 0
+         sent = 0
+         procToMsg(:) = 0
+         do cell1 = 0, nprocs - 1
+            if (sendCounts(cell1) <= 0) cycle
+            nmsg = nmsg + 1
+            if (nmsg > maxMsg .or. base + sent + sendCounts(cell1) > size(send_cell)) then
+               localBad = 1
+            else
+               send_proc(nmsg, L) = cell1
+               send_n(nmsg, L) = sendCounts(cell1)
+               send_off(nmsg, L) = base + sent
+               procToMsg(cell1) = nmsg
+            end if
+            sent = sent + sendCounts(cell1)
+         end do
+         nsend(L) = nmsg
+
+         nmsg = 0
+         recvTot = 0
+         do cell1 = 0, nprocs - 1
+            if (myRecv(cell1) <= 0) cycle
+            nmsg = nmsg + 1
+            if (nmsg > maxMsg .or. base + recvTot + myRecv(cell1) > size(recv_cell)) then
+               localBad = 1
+            else
+               recv_proc(nmsg, L) = cell1
+               recv_n(nmsg, L) = myRecv(cell1)
+               recv_off(nmsg, L) = base + recvTot
+            end if
+            recvTot = recvTot + myRecv(cell1)
+         end do
+         nrecv(L) = nmsg
+
+         sendCounts(:) = 0
+         do layer = 1, nLayers
+            exch => fld % sendList % halos(layer) % exchList
+            do while (associated(exch))
+               if (exch % endPointID >= 0 .and. exch % endPointID < nprocs) then
+                  j = procToMsg(exch % endPointID)
+                  if (j > 0) then
+                     cursor = sendCounts(exch % endPointID)
+                     do iCell = 1, exch % nList
+                        cell1 = exch % srcList(iCell)
+                        if (hts_keep_cell(cell1, L, ring, nEdgesOnCell, cellsOnCell)) then
+                           cursor = cursor + 1
+                           if (send_off(j, L) + cursor <= size(send_cell)) then
+                              send_cell(send_off(j, L) + cursor) = cell1
+                           else
+                              localBad = 1
+                           end if
+                        end if
+                     end do
+                     sendCounts(exch % endPointID) = cursor
+                  end if
+               end if
+               exch => exch % next
+            end do
+         end do
+
+         ! Rebuild the proc map for the receive side. sendCounts is free.
+         procToMsg(:) = 0
+         do j = 1, nrecv(L)
+            if (j <= maxMsg) procToMsg(recv_proc(j, L)) = j
+         end do
+         myRecv(:) = 0
+         do layer = 1, nLayers
+            exch => fld % recvList % halos(layer) % exchList
+            do while (associated(exch))
+               if (exch % endPointID >= 0 .and. exch % endPointID < nprocs) then
+                  j = procToMsg(exch % endPointID)
+                  if (j > 0) then
+                     cursor = myRecv(exch % endPointID)
+                     do iCell = 1, exch % nList
+                        cell1 = exch % destList(iCell)
+                        if (hts_keep_cell(cell1, L, ring, nEdgesOnCell, cellsOnCell)) then
+                           cursor = cursor + 1
+                           if (recv_off(j, L) + cursor <= size(recv_cell)) then
+                              recv_cell(recv_off(j, L) + cursor) = cell1
+                           else
+                              localBad = 1
+                           end if
+                        end if
+                     end do
+                     myRecv(exch % endPointID) = cursor
+                  end if
+               end if
+               exch => exch % next
+            end do
+         end do
+
+         maxCells = max(maxCells, sent, recvTot)
+         call mpas_log_write(' level $i '//trim(label)//' halo send cells $i of $i', intArgs=(/L, sent, fullN/))
+         base = base + max(sent, recvTot)
+      end do
+
+      deallocate(sendCounts, recvExpect, myRecv, procToMsg)
+
+      call MPI_Allreduce(localBad, globalBad, 1, MPI_INTEGER, MPI_SUM, comm, ierr)
+      if (globalBad /= 0) then
+         ready = .false.
+         call mpas_log_write(' '//trim(label)//' halo lists do not match; keeping the full group')
+         return
+      end if
+
+      ready = .true.
+      call mpas_log_write(' '//trim(label)//' halo lists match')
+
+   end subroutine hts_fill_masked_halo
+
+
+   logical function hts_keep_cell(iCell, L, ring, nEdgesOnCell, cellsOnCell)
+
+      implicit none
+
+      integer, intent(in) :: iCell, L, ring
+      integer, dimension(:), intent(in) :: nEdgesOnCell
+      integer, dimension(:,:), intent(in) :: cellsOnCell
+
+      integer :: i, nbr
+
+      hts_keep_cell = .false.
+      if (iCell < 1 .or. iCell > hts_nCells) return
+      if (L < 0 .or. L > hts_level_cap) return
+      if (.not. allocated(hts_cell_level)) return
+      if (iCell > size(hts_cell_level)) return
+      if (hts_cell_level(iCell) == L) then
+         hts_keep_cell = .true.
+         return
+      end if
+      if (ring < 1) return
+      if (iCell > size(nEdgesOnCell)) return
+      do i = 1, nEdgesOnCell(iCell)
+         nbr = cellsOnCell(i, iCell)
+         if (nbr >= 1 .and. nbr <= hts_nCells) then
+            if (nbr <= size(hts_cell_level)) then
+               if (hts_cell_level(nbr) == L) then
+                  hts_keep_cell = .true.
+                  return
+               end if
+            end if
+         end if
+      end do
+
+   end function hts_keep_cell
+
+
+   subroutine hts_exch_scalars(domain, field)
+
+      implicit none
+
+      type (domain_type), intent(in) :: domain
+      real (kind=RKIND), intent(inout) :: field(:,:,:)
+
+      call hts_exch_rank3(domain, field, 1)
+
+   end subroutine hts_exch_scalars
+
+
+   subroutine hts_exch_scale(domain, field)
+
+      implicit none
+
+      type (domain_type), intent(in) :: domain
+      real (kind=RKIND), intent(inout) :: field(:,:,:)
+
+      call hts_exch_rank3(domain, field, 2)
+
+   end subroutine hts_exch_scale
+
+
+   subroutine hts_exch_rank3(domain, field, which)
+
+#ifdef MPAS_USE_MPI_F08
+      use mpi_f08, only : MPI_Comm, MPI_Request, MPI_Datatype, MPI_STATUSES_IGNORE, &
+                          MPI_REAL, MPI_DOUBLE_PRECISION, MPI_Irecv, MPI_Isend, MPI_Waitall
+#else
+      use mpi, only : MPI_STATUSES_IGNORE, MPI_REAL, MPI_DOUBLE_PRECISION, &
+                      MPI_Irecv, MPI_Isend, MPI_Waitall
+#endif
+
+      implicit none
+
+      type (domain_type), intent(in) :: domain
+      real (kind=RKIND), intent(inout) :: field(:,:,:)
+      integer, intent(in) :: which
+
+#ifdef MPAS_USE_MPI_F08
+#ifdef SINGLE_PRECISION
+      type (MPI_Datatype), parameter :: MPI_REALKIND = MPI_REAL
+#else
+      type (MPI_Datatype), parameter :: MPI_REALKIND = MPI_DOUBLE_PRECISION
+#endif
+      type (MPI_Comm) :: comm
+      type (MPI_Request), allocatable :: sreq(:), rreq(:)
+#else
+#ifdef SINGLE_PRECISION
+      integer, parameter :: MPI_REALKIND = MPI_REAL
+#else
+      integer, parameter :: MPI_REALKIND = MPI_DOUBLE_PRECISION
+#endif
+      integer :: comm
+      integer, allocatable :: sreq(:), rreq(:)
+#endif
+
+      integer :: L, i, j, n, iCell, base, rank, ierr, nPer, n1, n2, j1, j2, p
+      integer :: nsend, nrecv, expect
+      integer, pointer :: send_proc(:,:), send_n(:,:), send_off(:), send_cell(:)
+      integer, pointer :: recv_proc(:,:), recv_n(:,:), recv_off(:), recv_cell(:)
+      real (kind=RKIND), pointer :: sbuf(:), rbuf(:)
+
+      L = hts_active_level
+      if (L < 0 .or. L > hts_max_level_used) return
+      n1 = size(field, 1)
+      n2 = size(field, 2)
+      nPer = n1 * n2
+      if (nPer < 1) return
+
+      if (which == 1) then
+         if (.not. hts_sh_ready) return
+         if (nPer /= hts_sh_nper) return
+         nsend = hts_sh_nsend(L)
+         nrecv = hts_sh_nrecv(L)
+         send_proc => hts_sh_send_proc
+         send_n => hts_sh_send_n
+         send_off => hts_sh_send_off(:, L)
+         send_cell => hts_sh_send_cell
+         recv_proc => hts_sh_recv_proc
+         recv_n => hts_sh_recv_n
+         recv_off => hts_sh_recv_off(:, L)
+         recv_cell => hts_sh_recv_cell
+         sbuf => hts_sh_sbuf
+         rbuf => hts_sh_rbuf
+         expect = hts_sh_nper
+      else
+         if (.not. hts_sc_ready) return
+         if (nPer /= hts_sc_nper) return
+         nsend = hts_sc_nsend(L)
+         nrecv = hts_sc_nrecv(L)
+         send_proc => hts_sc_send_proc
+         send_n => hts_sc_send_n
+         send_off => hts_sc_send_off(:, L)
+         send_cell => hts_sc_send_cell
+         recv_proc => hts_sc_recv_proc
+         recv_n => hts_sc_recv_n
+         recv_off => hts_sc_recv_off(:, L)
+         recv_cell => hts_sc_recv_cell
+         sbuf => hts_sc_sbuf
+         rbuf => hts_sc_rbuf
+         expect = hts_sc_nper
+      end if
+      if (expect < 1) return
+
+      call mpas_timer_start('hts_scalar_halo')
+
+      comm = domain % dminfo % comm
+      rank = domain % dminfo % my_proc_id
+      allocate(sreq(max(nsend, 1)))
+      allocate(rreq(max(nrecv, 1)))
+
+      base = 0
+      do i = 1, nrecv
+         n = recv_n(i, L)
+         call MPI_Irecv(rbuf(base + 1), n * nPer, MPI_REALKIND, recv_proc(i, L), &
+                        recv_proc(i, L), comm, rreq(i), ierr)
+         base = base + n * nPer
+      end do
+
+      base = 0
+      do i = 1, nsend
+         n = send_n(i, L)
+         p = base
+         do j = 1, n
+            iCell = send_cell(send_off(i) + j)
+            do j2 = 1, n2
+               do j1 = 1, n1
+                  p = p + 1
+                  sbuf(p) = field(j1, j2, iCell)
+               end do
+            end do
+         end do
+         call MPI_Isend(sbuf(base + 1), n * nPer, MPI_REALKIND, send_proc(i, L), &
+                        rank, comm, sreq(i), ierr)
+         base = base + n * nPer
+      end do
+
+      if (nrecv > 0) then
+         call MPI_Waitall(nrecv, rreq, MPI_STATUSES_IGNORE, ierr)
+      end if
+
+      base = 0
+      do i = 1, nrecv
+         n = recv_n(i, L)
+         p = base
+         do j = 1, n
+            iCell = recv_cell(recv_off(i) + j)
+            do j2 = 1, n2
+               do j1 = 1, n1
+                  p = p + 1
+                  field(j1, j2, iCell) = rbuf(p)
+               end do
+            end do
+         end do
+         base = base + n * nPer
+      end do
+
+      if (nsend > 0) then
+         call MPI_Waitall(nsend, sreq, MPI_STATUSES_IGNORE, ierr)
+      end if
+      deallocate(sreq, rreq)
+
+      call mpas_timer_stop('hts_scalar_halo')
+
+   end subroutine hts_exch_rank3
 
 
 end module mpas_atm_hts
