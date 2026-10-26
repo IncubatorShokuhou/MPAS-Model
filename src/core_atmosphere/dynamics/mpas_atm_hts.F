@@ -1070,6 +1070,102 @@ module mpas_atm_hts
    end subroutine atm_hts_begin_intervals
 
 
+   subroutine atm_hts_balance_locked_divergence(block, activeLevel, rho, u1, u2, ru, ru_save, rho_edge)
+
+      ! A locked interface edge contributes ru_p = 0 in the acoustic step, so
+      ! the vertical solve sees the large-step mass flux. Holding that flux at
+      ! a stale snapshot while the fine cell's other faces move leaves a
+      ! column divergence, and w takes it: on the eds land VR, max |w| is
+      ! about 19 m/s by 00:30 on the fine side of the interface (historically
+      ! the level-0 land cells near 32N, 0E) while the locked edge's own wind
+      ! is still near the jet. Reset the locked faces so that column's
+      ! horizontal divergence is zero. The acoustic lock and the zero parent
+      ! pressure stay; this only changes the flux they hold. Each locked
+      ! edge belongs to one cell of this level. Only level 0 is matched.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: activeLevel
+      real (kind=RKIND), dimension(:,:), intent(in) :: rho
+      real (kind=RKIND), dimension(:,:), intent(inout) :: u1, u2, ru, ru_save, rho_edge
+
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:,:), pointer :: cellsOnEdge, edgesOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      real (kind=RKIND), dimension(:,:), pointer :: edgesOnCell_sign
+      real (kind=RKIND), dimension(:), pointer :: dvEdge
+      integer :: i, iCell, iEdge, k, nlock, cell1, cell2
+      real (kind=RKIND) :: flux, sumDv, ruHere, rhoSum, dRu, duEst
+      real (kind=RKIND), parameter :: du_floor = 1.0_RKIND
+      real (kind=RKIND), parameter :: du_cap = 20.0_RKIND
+
+      ! Coarser than the finest level is left on the snapshot lock. Cancelling
+      ! those columns' mass-flux residual on the single coarser face wrote
+      ! |u| about 2700 m/s on the dry mesh at the first level-2 lock
+      ! (00:02:30): the residual was about 13 kg m-2 s-1 at a face whose
+      ! rho_zz sum was about 0.01. The land w error is the level-0 column,
+      ! which is integrated every fine step. There the same match changes
+      ! the dry wind by about 0.05 m/s.
+      if (activeLevel /= 0) return
+      if (.not. allocated(hts_lock_edge)) return
+      if (.not. allocated(hts_ru_target)) return
+
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'edgesOnCell_sign', edgesOnCell_sign)
+      call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
+
+      do iCell = 1, hts_nCells
+         if (hts_cell_level(iCell) /= activeLevel) cycle
+         nlock = 0
+         sumDv = 0.0_RKIND
+         do i = 1, nEdgesOnCell(iCell)
+            iEdge = edgesOnCell(i, iCell)
+            if (.not. hts_lock_edge(iEdge)) cycle
+            nlock = nlock + 1
+            sumDv = sumDv + dvEdge(iEdge)
+         end do
+         if (nlock == 0 .or. sumDv == 0.0_RKIND) cycle
+         do k = 1, hts_nVert
+            flux = 0.0_RKIND
+            do i = 1, nEdgesOnCell(iCell)
+               iEdge = edgesOnCell(i, iCell)
+               ruHere = ru(k, iEdge)
+               flux = flux + edgesOnCell_sign(i, iCell) * dvEdge(iEdge) * ruHere
+            end do
+            do i = 1, nEdgesOnCell(iCell)
+               iEdge = edgesOnCell(i, iCell)
+               if (.not. hts_lock_edge(iEdge)) cycle
+               if (edgesOnCell_sign(i, iCell) == 0.0_RKIND) cycle
+               cell1 = cellsOnEdge(1, iEdge)
+               cell2 = cellsOnEdge(2, iEdge)
+               rhoSum = rho(k, cell1) + rho(k, cell2)
+               if (rhoSum == 0.0_RKIND) cycle
+               dRu = -flux / (edgesOnCell_sign(i, iCell) * sumDv)
+               duEst = 2.0_RKIND * dRu / rhoSum
+               ! The dry interface correction is about 0.05 m/s, which is the
+               ! real divergence. Forcing that to zero every step grew |w|
+               ! through hour 2 and NaNed u near 04:35. Leave corrections
+               ! smaller than 1 m/s alone. Cap a single step so an upper-level
+               ! density mismatch cannot write a thousand-m/s wind.
+               if (abs(duEst) < du_floor) cycle
+               if (abs(duEst) > du_cap) dRu = dRu * (du_cap / abs(duEst))
+               ru(k, iEdge) = ru(k, iEdge) + dRu
+               ru_save(k, iEdge) = ru(k, iEdge)
+               hts_ru_target(k, iEdge) = ru(k, iEdge)
+               u1(k, iEdge) = 2.0_RKIND * ru(k, iEdge) / rhoSum
+               u2(k, iEdge) = u1(k, iEdge)
+               rho_edge(k, iEdge) = 0.5_RKIND * rhoSum
+            end do
+         end do
+      end do
+
+   end subroutine atm_hts_balance_locked_divergence
+
+
    subroutine atm_hts_apply_interpolation(block, activeLevel)
 
       implicit none
@@ -1094,14 +1190,16 @@ module mpas_atm_hts
 
       ! The snapshot stored at an interval open is already the end of the
       ! previous interval, and delta is that interval's increment. Adding
-      ! alpha*delta on top of the snapshot leads the last realized state by
-      ! up to one coarse step. On the eds land VR that lead is what the
-      ! imposed flux commits: job 200072 survived 2 h, but max |u| reached
-      ! about 160-171 m/s against an all-fine jet near 89, and w relL2 was
-      ! about 7.6. rho and theta still follow the previous increment. u and w
-      ! on the ring stay on the snapshot. An interface edge of this level is
-      ! locked to that same snapshot so tend_u_euler cannot integrate it.
-      ! Acoustic parents stay off. The coarse RK still starts from the snapshot.
+      ! alpha*delta on top of the snapshot leads the last realized state.
+      ! Job 200101 (efe084b70) removed that lead and the 2 h land pair was
+      ! unchanged: max |w| was already about 19 m/s at 00:30 (all-fine below
+      ! 0.6) while max |u| was still the jet, then |u| grew after 01:00 to
+      ! 171 m/s and w relL2 finished near 7.7. The lead was not the cause.
+      ! rho and theta still follow the previous increment. Ring u and w stay
+      ! on the snapshot. An interface edge of this level stays locked so
+      ! tend_u_euler cannot integrate it. On level 0 its mass flux is then
+      ! reset so the fine column's horizontal divergence is zero. Acoustic parents
+      ! stay off. The coarse RK still starts from the snapshot.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
@@ -1162,9 +1260,9 @@ module mpas_atm_hts
       end do
 
       ! Interface edges owned by this level (edge level == active) otherwise
-      ! integrate tend_u_euler. Hold them on the last realized coarse wind.
-      ! Adding the previous increment here is a lead, and the close-step
-      ! impose commits it. Edges the coarse step imposes are not in this set.
+      ! integrate tend_u_euler. Start them on the last realized coarse wind.
+      ! Edges the coarse step imposes are not in this set. The flux is
+      ! rewritten below so the fine column is not divergent.
       if (allocated(hts_lock_edge) .and. allocated(hts_iface_coarse) .and. allocated(hts_ru_target)) then
          do iEdge = 1, hts_nEdges
             if (hts_edge_level(iEdge) /= activeLevel) cycle
@@ -1184,6 +1282,7 @@ module mpas_atm_hts
                hts_ru_target(k, iEdge) = ru(k, iEdge)
             end do
          end do
+         call atm_hts_balance_locked_divergence(block, activeLevel, rho2, u1, u2, ru, ru_save, rho_edge)
       end if
 
       if (.not. any) then
