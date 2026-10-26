@@ -1961,6 +1961,10 @@ module atm_time_integration
       end if
 
       call atm_hts_begin_intervals(block)
+      ! scalars time level 2 is what the scalar flux reads, and the core
+      ! shift publishes it. Idle coarse columns are not copied in the RK
+      ! setup, so level 2 still holds the previous buffer.
+      call atm_hts_copy_idle_scalars(block, .false.)
 
       hts_masking = .true.
       hts_impose = .false.
@@ -2006,9 +2010,62 @@ module atm_time_integration
       call hts_refresh_wind()
       hts_masking = .false.
       hts_active_level = 0
+      ! Columns that did not step still have the previous scalar buffer in
+      ! time level 2. The shift would publish that buffer and the next fine
+      ! step would advect it. Job 200185 matched 200101 because the ring
+      ! never touches scalars.
+      call atm_hts_copy_idle_scalars(block, .true.)
       hts_tick = hts_tick + 1
 
    end subroutine atm_hts_advance
+
+
+   subroutine atm_hts_copy_idle_scalars(block, idle_only)
+
+      ! Copy scalar time level 1 onto time level 2. idle_only false covers
+      ! every coarser column, so the fine flux sees the committed moisture.
+      ! idle_only true covers columns whose level did not close on this tick,
+      ! so the state shift cannot move them backward. A column that closed
+      ! already wrote time level 2.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      logical, intent(in) :: idle_only
+
+      type (mpas_pool_type), pointer :: state
+      real (kind=RKIND), dimension(:,:,:), pointer :: s1, s2
+      integer :: iCell, k, j, L, ratio, nScalars, nVert, nCopy
+
+      if (hts_max_level_used < 1) return
+      if (.not. allocated(hts_cell_level)) return
+
+      nullify(state, s1, s2)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_array(state, 'scalars', s1, 1)
+      call mpas_pool_get_array(state, 'scalars', s2, 2)
+      if (.not. associated(s1) .or. .not. associated(s2)) return
+
+      nScalars = size(s1, 1)
+      nVert = size(s1, 2)
+      ! hts_cell_level is allocated through the garbage cell.
+      nCopy = min(size(hts_cell_level) - 1, size(s1, 3), size(s2, 3))
+
+      do iCell = 1, nCopy
+         L = hts_cell_level(iCell)
+         if (L <= 0 .or. L > hts_max_level_used) cycle
+         if (idle_only) then
+            ratio = ishft(1, L)
+            if (mod(hts_tick, ratio) == ratio - 1) cycle
+         end if
+         do k = 1, nVert
+            do j = 1, nScalars
+               s2(j, k, iCell) = s1(j, k, iCell)
+            end do
+         end do
+      end do
+
+   end subroutine atm_hts_copy_idle_scalars
 
 
    subroutine atm_timestep(domain, dt, nowTime, itimestep, exchange_halo_group)
@@ -5291,6 +5348,13 @@ module atm_time_integration
       !$acc parallel wait
       !$acc loop gang worker private(scalar_tend_column, wdtn)
       do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+         ! A later level on this tick would otherwise rewrite every column,
+         ! including levels that already advanced, from this level's flux.
+         if (hts_masking .and. hts_max_level_used > 0) then
+            if (hts_cell_level(iCell) /= hts_active_level) cycle
+         end if
+#endif
 
          if(bdyMaskCell(iCell) <= nRelaxZone) then  ! specified zone for regional_MPAS is not updated in this routine
 
@@ -6202,6 +6266,13 @@ module atm_time_integration
 
          !$acc loop gang worker
          do iCell=cellStart,cellEnd
+#ifndef MPAS_OPENACC
+            if (hts_masking .and. hts_max_level_used > 0) then
+               if (iCell >= 1 .and. iCell < size(hts_cell_level)) then
+                  if (hts_cell_level(iCell) /= hts_active_level) cycle
+               end if
+            end if
+#endif
             if(bdyMaskCell(iCell) <= nSpecZone) then ! regional_MPAS does spec zone update after transport.
                !$acc loop vector
                do k=1,nVertLevels
