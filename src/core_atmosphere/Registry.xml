@@ -96,10 +96,10 @@
                      description="Coupled dynamics, scalar, and Kessler steps on the coarsest moist level. 1 is one step of the level dt. The acoustic step stays config_dt / config_number_of_sub_steps."
                      possible_values="Positive integers, preferably a power of two"/>
 
-                <nml_option name="config_hts_pbl_substeps" type="integer" default_value="1"
+                <nml_option name="config_hts_pbl_substeps" type="integer" default_value="0"
                      units="-"
-                     description="Surface, Noah, and PBL calls on the coarsest moist level. 1 matches the dynamics step. Greater than 1 with micro_substeps = 1 applies each short tendency to the state and leaves radiation for the long dynamics step."
-                     possible_values="Positive integers"/>
+                     description="Surface, Noah, PBL, and GWDO calls on moist levels above 0. 0 calls them at config_dt (2^L times), folds each increment, and leaves dynamics at the level dt. A positive integer is that many calls on the coarsest moist level only. 1 is one call of the level dt."
+                     possible_values="Integers from 0 up, preferably a power of two"/>
 
                 <nml_option name="config_hts_kessler_substeps" type="integer" default_value="1"
                      units="-"

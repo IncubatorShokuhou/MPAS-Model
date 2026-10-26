@@ -2037,22 +2037,29 @@ module atm_time_integration
 
    subroutine hts_coarse_coupled_step(domain, itimestep, exchange_halo_group, L, dt_level, ratio)
 
-      ! Default (micro_substeps = 1, pbl_substeps = 1) is one column-physics
-      ! call and one SRK3, both at dt_level. That is the 120 s cap.
+      ! pbl_substeps = 0 (the default) calls surface, Noah, PBL, and GWDO at
+      ! config_dt on every moist level above 0, folds each increment, and
+      ! keeps one SRK3 at dt_level. Job 201388 grew cell 3177 at a 60 s
+      ! surface call with the same rate as the 120 s and 240 s calls, only
+      ! later. Four 60 s dynamics steps under one 240 s surface call
+      ! (0fa07c436) kept the 240 s onset, so the seed is that call.
+      ! Radiation stays a per-second rate on the long SRK3. The folded rate
+      ! is zeroed before that SRK3. Leaving it would be the 902a6084d failure.
+      !
+      ! A positive pbl_substeps is the ablation and applies only on the
+      ! coarsest moist level. 1 is one call of the level dt (2022d65c7).
       !
       ! micro_substeps > 1 splits that SRK3. Each piece advects moisture and
       ! runs Kessler, then the next piece sees the new theta and w. The
       ! acoustic dt stays config_dt / config_number_of_sub_steps. ruAvg is
-      ! the mean, because mass correction runs once on dt_level.
-      !
-      ! pbl_substeps > 1 with micro_substeps = 1 calls surface, Noah, and
-      ! PBL on the short dt, folds that increment into the state, and zeros
-      ! those rates. Radiation stays a per-second rate on the long SRK3.
-      ! Leaving the short rate for the long SRK3 is the 902a6084d failure.
+      ! the mean, because mass correction runs once on dt_level. With
+      ! pbl_substeps = 0 the surface count matches that split, so each short
+      ! SRK3 sees a rate from its own dt. Raising the dynamics count to 2^L
+      ! would spend the speedup.
       !
       ! Both greater than 1 run one physics call and one SRK3 on the same
-      ! short dt. A mismatch is raised to the shorter dt so YSU's stored
-      ! rate is not integrated by a longer dynamics step (edge 64121).
+      ! short dt. An explicit mismatch is raised to the shorter dt so YSU's
+      ! stored rate is not integrated by a longer dynamics step (edge 64121).
 
       implicit none
 
@@ -2071,14 +2078,20 @@ module atm_time_integration
       logical, save :: warned_match = .false.
       logical, save :: warned_pow = .false.
       logical, save :: warned_kessler = .false.
-      logical, save :: logged_split = .false.
+      logical, save :: logged_level(0:8) = .false.
 
       nmicro = 1
       npbl = 1
 #ifdef DO_PHYSICS
-      if (moist_physics .and. L == hts_max_level_used .and. L > 0) then
-         nmicro = hts_micro_substeps
-         npbl = hts_pbl_substeps
+      if (moist_physics .and. L > 0) then
+         if (L == hts_max_level_used) then
+            nmicro = hts_micro_substeps
+            if (hts_pbl_substeps > 0) npbl = hts_pbl_substeps
+         end if
+         if (hts_pbl_substeps <= 0) then
+            npbl = ratio
+            if (nmicro > 1) npbl = nmicro
+         end if
       end if
 #endif
       if (nmicro < 1) nmicro = 1
@@ -2103,10 +2116,12 @@ module atm_time_integration
       hts_micro_split = .false.
       hts_micro_nsub = 1
 
-      if ((nmicro > 1 .or. npbl > 1) .and. .not. logged_split) then
-         call mpas_log_write('HTS coarse level $i: micro substeps $i, pbl substeps $i, dt $r', &
-                             intArgs=(/L, nmicro, npbl/), realArgs=(/dt_level/))
-         logged_split = .true.
+      if ((nmicro > 1 .or. npbl > 1) .and. L >= 0 .and. L <= 8) then
+         if (.not. logged_level(L)) then
+            call mpas_log_write('HTS coarse level $i: micro substeps $i, pbl substeps $i, dt $r', &
+                                intArgs=(/L, nmicro, npbl/), realArgs=(/dt_level/))
+            logged_level(L) = .true.
+         end if
       end if
 
       if (nmicro == 1 .and. npbl <= 1) then

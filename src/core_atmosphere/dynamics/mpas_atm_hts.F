@@ -37,11 +37,12 @@ module mpas_atm_hts
    integer, public :: hts_active_level = 0
    integer, public :: hts_tick = 0
    integer, public :: hts_max_level_used = 0
-   ! Moist cap and the coarse-level ablations. Defaults reproduce the
-   ! single 120 s coupled step. Dry runs ignore the cap.
+   ! Moist cap and the coarse-level ablations. pbl_substeps = 0 calls
+   ! surface, Noah, PBL, and GWDO at config_dt on every moist level above
+   ! 0. Dry runs ignore the cap. Dynamics and Kessler stay at the level dt.
    integer, public :: hts_moist_max_level = 2
    integer, public :: hts_micro_substeps = 1
-   integer, public :: hts_pbl_substeps = 1
+   integer, public :: hts_pbl_substeps = 0
    integer, public :: hts_kessler_nsub = 1
 
    integer, public, allocatable :: hts_cell_level(:)
@@ -222,7 +223,7 @@ module mpas_atm_hts
       hts_enabled = config_hts
       hts_moist_max_level = 2
       hts_micro_substeps = 1
-      hts_pbl_substeps = 1
+      hts_pbl_substeps = 0
       hts_kessler_nsub = 1
       if (associated(config_hts_moist_max_level)) hts_moist_max_level = config_hts_moist_max_level
       if (associated(config_hts_micro_substeps)) hts_micro_substeps = config_hts_micro_substeps
@@ -231,7 +232,7 @@ module mpas_atm_hts
       if (hts_moist_max_level < 0) hts_moist_max_level = 0
       if (hts_moist_max_level > hts_level_cap) hts_moist_max_level = hts_level_cap
       if (hts_micro_substeps < 1) hts_micro_substeps = 1
-      if (hts_pbl_substeps < 1) hts_pbl_substeps = 1
+      if (hts_pbl_substeps < 0) hts_pbl_substeps = 0
       if (hts_kessler_nsub < 1) hts_kessler_nsub = 1
 
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
@@ -373,6 +374,9 @@ module mpas_atm_hts
          end if
          call mpas_log_write(' moist max level $i, micro substeps $i, pbl substeps $i, kessler substeps $i', &
                              intArgs=(/hts_moist_max_level, hts_micro_substeps, hts_pbl_substeps, hts_kessler_nsub/))
+         if (hts_pbl_substeps == 0) then
+            call mpas_log_write(' pbl_substeps = 0: moist levels above 0 call surface, Noah, PBL, and GWDO at config_dt')
+         end if
       else
          call mpas_log_write(' config_hts = false (integrator is unchanged)')
       end if
