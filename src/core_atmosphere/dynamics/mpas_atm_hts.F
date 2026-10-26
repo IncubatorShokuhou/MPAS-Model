@@ -1356,12 +1356,13 @@ module mpas_atm_hts
 
    subroutine hts_restrict_physics_tendencies(tend_ru, tend_rtheta, tend_rho)
 
-      ! physics_driver runs once per fine clock tick and fills every column.
-      ! physics_get_tend then copies those per-second rates into the dynamics
-      ! tendencies, and the RK step multiplies by its own dt. On a multi-level
-      ! step, keep the rates only on the active level so a coarse column is
-      ! not forced on a fine tick and a fine column is not forced again over
-      ! the long step. Single-level and all-fine return without writing.
+      ! Column physics runs on the active level only and writes per-second
+      ! rates there. physics_get_tend copies those rates, including rates
+      ! left from the previous step on columns this call did not touch, and
+      ! the RK multiplies by this step's dt. Keep the copy only on the
+      ! active level so a coarse column is not forced on a fine tick and a
+      ! fine column is not forced again over the long step. Single-level
+      ! and all-fine return without writing.
 
       implicit none
 

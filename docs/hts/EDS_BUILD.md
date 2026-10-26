@@ -158,3 +158,20 @@ Real-land IC + short forecast (jobs **199309** init, **199311** atmosphere):
 - Pointer: `work/README_LAND_VR.md`
 
 Do not write outside `/eds/energy/dev01/lvhao/MPAS-Model` and the personal GEOG path. All heavy work via Slurm (`energy` / `normal_qos`; prefer `gpu4090` when `normal` is full).
+
+## Multi-level land stability
+
+The 15-minute pair above ends before the failure. Same mesh, IC, `dt = 30` s, Noah+YSU+RRTMG+Kessler, multi-level (`config_hts_max_level = 3`):
+
+| job | max_level | GWDO | duration | HTS |
+| --- | ---: | --- | --- | --- |
+| 199311 | 3 | off | 15 min | completed (before the fail window) |
+| 199635 / 199660 | 3 | on | 6 h / 45 min | NaN in `u` near 00:25, then SIGSEGV |
+| 199659 | 3 | off | 6 h | same NaN |
+| 199662 | 0 | on | 45 min | completed, 0 NaNs, bit-identical to all-fine |
+
+Onset on the multi-level runs: t = 0 radiation is fine; near 00:19, `pressure(1) < pressure(2)` on southern-ocean coarse cells; 00:25 `u` is NaN. The second radiation call is at 00:30, after the state is already corrupt. One-level integration was 147.4 s all-fine / 145.5 s HTS.
+
+`dt_pbl` was left at `config_dt` while the coarse RK multiplied YSU's `(new-old)/(2*dt_pbl)` rate by `dt_level` (240 s on level 3). Noah stepped the soil by the fine `dt` on that same call. The code now sets `dt_pbl` to the level step for the masked physics call and restores the fine value before the dynamics RK. RRTMG's heating rate is already K/s and was not rescaled. `config_hts_max_level = 0` is no longer the land-physics workaround. The ≥2 h and ≥6 h HTS vs all-fine reruns are still to be done on eds; this note does not record them. Coarse columns still take one implicit PBL/land step of length `dt * 2^L` rather than `2^L` fine steps, so they will not match all-fine bit for bit.
+
+The land static and GFS IC are not on the cloud VM. A 45-minute extension of the local USGS-water RRTMG/YSU/Noah/Kessler smoke (the 8-minute case, not the eds land VR) finished on both the previous binary and this one: critical 0, no NaNs, no `pressure(1) < pressure(2)`. At 45 minutes, level-3 lowest-layer `theta` differs from all-fine by a mean of −0.073 K with the level `dt_pbl` (maximum 0.28 K) and −0.046 K with the fine `dt_pbl` (maximum 0.23 K). Dry 6 h and Kessler 1 h on the same VM match the previous HTS histories bit for bit (`u`, `w`, `theta`, `rho`, `pressure`). Those two do not exercise YSU or Noah.

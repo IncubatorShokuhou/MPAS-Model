@@ -37,7 +37,7 @@ module atm_time_integration
    use mpas_atmphys_column_mask, only: column_mask_on, column_active, &
       column_mask_defer_sfc_dt, column_sfc_leap, column_sfc_julday
    use mpas_atmphys_update_surface, only: physics_update_sstskin, physics_update_deepsoiltemp
-   use mpas_atmphys_vars, only : dt_dyn, dt_microp, n_microp, l_radtlw, l_radtsw, l_conv
+   use mpas_atmphys_vars, only : dt_dyn, dt_microp, dt_pbl, n_microp, l_radtlw, l_radtsw, l_conv
 #endif
 
    use mpas_atm_boundaries, only : nSpecZone, nRelaxZone, nBdyZone, mpas_atm_get_bdy_state, mpas_atm_get_bdy_tend  ! regional_MPAS addition
@@ -125,6 +125,7 @@ module atm_time_integration
    real (kind=RKIND) :: hts_physics_xtime_s = 0.0_RKIND
    real (kind=RKIND) :: hts_mp_dt_dyn_save
    real (kind=RKIND) :: hts_mp_dt_microp_save
+   real (kind=RKIND) :: hts_mp_dt_pbl_save
    integer :: hts_mp_n_microp_save
    logical :: hts_radlw_due(0:8) = .false.
    logical :: hts_radsw_due(0:8) = .false.
@@ -9420,7 +9421,9 @@ module atm_time_integration
 
       ! Run column physics on the owned cells of the active level, with that
       ! level's dt. The mask stays on so microphysics, later in atm_srk3,
-      ! skips the same columns. dt_dyn is restored before the dynamics RK.
+      ! skips the same columns. dt_dyn and dt_pbl are restored before the
+      ! dynamics RK. The per-second rates are already stored by then, and
+      ! the RK multiplies them by dt_level.
 
       implicit none
 
@@ -9511,9 +9514,17 @@ module atm_time_integration
       ! after initialization. A coarse level step has to use its own dt or
       ! the heating rate is long by 2^L when the next coarse step multiplies
       ! it back. Thompson keeps the 90 s substep it uses at init.
-      ! dt_pbl stays at the fine step from initialization. YSU, Noah, sea
-      ! ice, and GWDO return a rate normalized by that dt, and the level
-      ! RK multiplies the stored rate by dt_level.
+      !
+      ! dt_pbl is the same level step. YSU builds an implicit mix over
+      ! 2*dt_pbl and stores (new-old)/(2*dt_pbl). Noah, sea ice, and the
+      ! ocean mixed layer advance their columns by dt_pbl. GWDO's critical
+      ! line limiter uses that same dt. The level RK multiplies the stored
+      ! per-second rates by dt_level, so a fine dt_pbl on a coarse step
+      ! applies the mix by 2^L too much. On sp8.24755 that inverted the
+      ! lowest pressure layers on level-3 ocean cells near 20 minutes and
+      ! NaNed u, with GWDO on or off. RRTMG is already a true K/s rate
+      ! (K/day divided by 86400) and does not read dt_pbl. One level and
+      ! HTS off never enter this routine with a coarser dt.
 
       implicit none
 
@@ -9524,10 +9535,12 @@ module atm_time_integration
 
       hts_mp_dt_dyn_save = dt_dyn
       hts_mp_dt_microp_save = dt_microp
+      hts_mp_dt_pbl_save = dt_pbl
       hts_mp_n_microp_save = n_microp
 
       dt_dyn = dt
       dt_microp = dt
+      dt_pbl = dt
       n_microp = 1
 
       nullify(microp_scheme)
@@ -9551,6 +9564,7 @@ module atm_time_integration
 
       dt_dyn = hts_mp_dt_dyn_save
       dt_microp = hts_mp_dt_microp_save
+      dt_pbl = hts_mp_dt_pbl_save
       n_microp = hts_mp_n_microp_save
 
    end subroutine hts_pop_microp_dt
