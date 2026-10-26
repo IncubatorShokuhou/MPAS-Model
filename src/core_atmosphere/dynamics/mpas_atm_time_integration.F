@@ -4317,8 +4317,11 @@ module atm_time_integration
       ! acoustic perturbation on the first small step. Interior columns that
       ! no active edge touches are left alone. Open-interface parents are
       ! inactive here: updating only their rho_pp and rtheta_pp (bb575a1b2)
-      ! NaNed u at 00:18 on eds job 199953. The pure hold stayed finite
-      ! until about 01:57.
+      ! drove global w to about -1e4 / +8e4 m/s and u to about ±7.2e5 m/s
+      ! at 00:17:30, then NaNed u at 00:18 (eds job 199953). The pure hold
+      ! stayed finite until about 01:57. The large-step exner on the
+      ! diagnostic ring may follow the previous rho/theta increment; that
+      ! is not this acoustic update.
       if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
          do i = 1, hts_n_ac_cell(hts_active_level)
             iCell = hts_ac_cell(i, hts_active_level)
@@ -9422,9 +9425,11 @@ module atm_time_integration
       ! Run column physics once on the owned cells of the active level, with
       ! that level's dt. The fine-dt subcycle of PBL and Noah (902a6084d)
       ! NaNed u at 00:45 (job 199900). Updating an open-interface parent's
-      ! acoustic pressure without its prognostic step (bb575a1b2) NaNed u
-      ! at 00:18 (job 199953). The single level-dt call with a pure snapshot
-      ! hold (d3fe6fb75) stayed finite until about 01:57. Radiation is
+      ! acoustic pressure without its prognostic step (bb575a1b2) drove w
+      ! to about -1e4 / +8e4 m/s and u to about ±7.2e5 m/s at 00:17:30, then
+      ! NaNed u at 00:18 (job 199953, rebuild 199950, GWDO off). The single
+      ! level-dt call with a pure snapshot hold (d3fe6fb75) stayed finite
+      ! until about 01:57. Radiation is
       ! called once, when its alarm is due. dt_dyn and dt_pbl are restored
       ! before the dynamics RK. The mask stays on so microphysics, later in
       ! atm_srk3, skips the same columns.
