@@ -4319,7 +4319,8 @@ module atm_time_integration
       ! inactive here: updating only their rho_pp and rtheta_pp (bb575a1b2)
       ! drove global w to about -1e4 / +8e4 m/s and u to about ±7.2e5 m/s
       ! at 00:17:30, then NaNed u at 00:18 (eds job 199953). Ramping the
-      ! held rho/theta (cf1dc652d) NaNed u at 00:12:30 (job 199977). The
+      ! held rho/theta (cf1dc652d) NaNed u at 00:12:30 (job 199977,
+      ! rebuild 199974, GWDO off; w still finite). The
       ! pure hold stayed finite until about 01:57.
       if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
          do i = 1, hts_n_ac_cell(hts_active_level)
@@ -9428,7 +9429,8 @@ module atm_time_integration
       ! to about -1e4 / +8e4 m/s and u to about ±7.2e5 m/s at 00:17:30, then
       ! NaNed u at 00:18 (job 199953, rebuild 199950, GWDO off). Ramping
       ! held-ring rho and theta while pinning u and w (cf1dc652d) NaNed u
-      ! at 00:12:30 (job 199977). The single level-dt call with a pure
+      ! at 00:12:30 (job 199977, rebuild 199974, GWDO off; w still finite,
+      ! HTS wall 57.63 s). The single level-dt call with a pure
       ! snapshot hold (d3fe6fb75) stayed finite until about 01:57. Radiation is
       ! called once, when its alarm is due. dt_dyn and dt_pbl are restored
       ! before the dynamics RK. The mask stays on so microphysics, later in

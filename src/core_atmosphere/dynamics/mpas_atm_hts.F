@@ -865,9 +865,10 @@ module mpas_atm_hts
       ! not advanced. Eds job 199953 updated that parent's rho_pp and
       ! rtheta_pp while u and w stayed on the snapshot: at 00:17:30 u was
       ! about ±7.2e5 m/s and w about -1e4 / +8e4 m/s, and u was NaN at
-      ! 00:18. Ramping held-ring rho and theta (cf1dc652d, job 199977)
-      ! NaNed u at 00:12:30. The pure hold on d3fe6fb75 stayed finite until
-      ! about 01:57.
+      ! 00:18. Ramping held-ring rho and theta (cf1dc652d, job 199977,
+      ! rebuild 199974, GWDO off) NaNed u at 00:12:30; w was still finite
+      ! on that print (HTS wall 57.63 s). The pure hold on d3fe6fb75 stayed
+      ! finite until about 01:57.
 
       implicit none
 
@@ -1074,7 +1075,8 @@ module mpas_atm_hts
       ! Hold coarser levels at the start-of-interval snapshot (alpha = 0)
       ! while a finer level steps. A diagnostic-ring rho/theta ramp of the
       ! previous increment (cf1dc652d) NaNed u at 00:12:30 on eds job
-      ! 199977, earlier than this hold. Extrapolating u and w fed the coarse
+      ! 199977 (rebuild 199974, GWDO off; w still finite), earlier than
+      ! this hold. Extrapolating u and w fed the coarse
       ! acoustic transient into the fine flux. Cells are written before
       ! edges so an edge density sees both columns.
       alpha = 0.0_RKIND
