@@ -2296,11 +2296,6 @@ module atm_time_integration
       if (hts_masking .and. hts_active_level > 0) then
          number_of_sub_steps = number_of_sub_steps * ishft(1, hts_active_level)
       end if
-      ! Parents that touch this level are acoustically live. Interior coarse
-      ! columns stay on the snapshot.
-      if (hts_masking .and. hts_max_level_used > 0) then
-         call atm_hts_mark_acoustic_cells()
-      end if
 
       if(config_time_integration_order == 3) then
 
@@ -4166,10 +4161,9 @@ module atm_time_integration
       !
       ! Local variables
       !
-      integer :: cell1, cell2, iEdge, iCell, i, k, iEdge_idx
+      integer :: cell1, cell2, iEdge, iCell, i, k
       real (kind=RKIND) :: c2, rcv, rtheta_pp_tmp
       real (kind=RKIND) :: pgrad, flux, rdts
-      logical :: hts_parent_pp
 
 
       rcv = rgas / (cp - rgas)
@@ -4318,15 +4312,18 @@ module atm_time_integration
 !$OMP BARRIER
 
 #ifndef MPAS_OPENACC
-      ! Open-interface parents are updated below. Any other owned neighbor of
-      ! an active edge still has to drop its acoustic perturbation on the
-      ! first small step, or the edge sees a stale neighbor. Interior columns
-      ! that no active edge touches are left alone.
+      ! The owned-cell loop below visits only the active level. An active
+      ! edge still reads its two cells, so an inactive neighbor drops its
+      ! acoustic perturbation on the first small step. Interior columns that
+      ! no active edge touches are left alone. Open-interface parents are
+      ! inactive here: updating only their rho_pp and rtheta_pp (bb575a1b2)
+      ! NaNed u at 00:18 on eds job 199953. The pure hold stayed finite
+      ! until about 01:57.
       if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
          do i = 1, hts_n_ac_cell(hts_active_level)
             iCell = hts_ac_cell(i, hts_active_level)
             if (iCell > nCellsSolve) cycle
-            if (hts_cell_acoustic(iCell)) cycle
+            if (hts_cell_level(iCell) == hts_active_level) cycle
             do k = 1, nVertLevels
                rho_pp(k,iCell) = 0.0_RKIND
                rtheta_pp(k,iCell) = 0.0_RKIND
@@ -4337,32 +4334,12 @@ module atm_time_integration
       end if
 #endif
 
-      ! A parent column's horizontal divergence may only see the live
-      ! interface edge. Coarse edges of that column are not advanced here,
-      ! and a leftover ru_p would be a phantom mass flux.
-      if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
-         do i = 1, hts_n_live_own(hts_active_level)
-            iCell = hts_live_own(i, hts_active_level)
-            if (iCell > nCellsSolve) cycle
-            if (hts_cell_level(iCell) == hts_active_level) cycle
-            do iEdge_idx = 1, nEdgesOnCell(iCell)
-               iEdge = edgesOnCell(iEdge_idx, iCell)
-               if (hts_edge_level(iEdge) == hts_active_level) cycle
-               if (hts_impose .and. hts_impose_edge(iEdge)) cycle
-               do k = 1, nVertLevels
-                  ru_p(k, iEdge) = 0.0_RKIND
-               end do
-            end do
-         end do
-      end if
-
-      hts_parent_pp = .false.
       !$acc parallel default(present)
       !$acc loop gang worker private(ts,rs)
       HTS_ACTIVE_CELL_SOLVE_DO
 #ifndef MPAS_OPENACC
          if (hts_masking) then
-            if (.not. hts_cell_acoustic(iCell)) then
+            if (hts_cell_level(iCell) /= hts_active_level) then
                if (small_step == 1) then
                   do k = 1, nVertLevels
                      rho_pp(k,iCell) = 0.0_RKIND
@@ -4373,31 +4350,19 @@ module atm_time_integration
                end if
                cycle
             end if
-            ! Parent: acoustic pressure only. Do not touch wwAvg; scalar
-            ! transport still wants the value from this column's own level.
-            hts_parent_pp = hts_cell_level(iCell) /= hts_active_level
-         else
-            hts_parent_pp = .false.
          end if
-#else
-         hts_parent_pp = .false.
 #endif
 
          if(small_step == 1) then  ! initialize here on first small timestep.
             !$acc loop vector
             do k=1,nVertLevels
+               wwAvg(k,iCell) = 0.0
                rho_pp(k,iCell) = 0.0
                rtheta_pp(k,iCell) = 0.0
                rw_p(k,iCell) = 0.0
             end do
+            wwAvg(nVertLevels+1,iCell) = 0.0
             rw_p(nVertLevels+1,iCell) = 0.0
-            if (.not. hts_parent_pp) then
-               !$acc loop vector
-               do k=1,nVertLevels
-                  wwAvg(k,iCell) = 0.0
-               end do
-               wwAvg(nVertLevels+1,iCell) = 0.0
-            end if
          end if
 
          if(specZoneMaskCell(iCell) == 0.0) then  ! not specified zone, compute...
@@ -4436,13 +4401,11 @@ module atm_time_integration
                                                       -ewm(k  )*coftz(k,iCell)*rw_p(k,iCell))
             end do
 
-            if (.not. hts_parent_pp) then
 !DIR$ IVDEP
             !$acc loop vector
             do k=2, nVertLevels
                wwavg(k,iCell) = wwavg(k,iCell) + ewm(k)*rw_p(k,iCell)
             end do
-            end if
 
 !DIR$ IVDEP
             !$acc loop vector
@@ -4486,13 +4449,11 @@ module atm_time_integration
             end do
 
             ! accumulate (rho*omega)' for use later in scalar transport
-            if (.not. hts_parent_pp) then
 !DIR$ IVDEP
             !$acc loop vector
             do k=2,nVertLevels
                wwAvg(k,iCell) = wwAvg(k,iCell) + ewp(k)*rw_p(k,iCell)
             end do
-            end if
 
             ! update rho_pp and theta_pp given updated rw_p
 
@@ -4512,7 +4473,7 @@ module atm_time_integration
                rho_pp(k,iCell) = rho_pp(k,iCell) + dts*tend_rho(k,iCell)
                rtheta_pp(k,iCell) = rtheta_pp(k,iCell) + dts*tend_rt(k,iCell)
                rw_p(k,iCell) = rw_p(k,iCell) + dts*tend_rw(k,iCell)
-               if (.not. hts_parent_pp) wwAvg(k,iCell) = wwAvg(k,iCell) + ewp(k)*rw_p(k,iCell)
+               wwAvg(k,iCell) = wwAvg(k,iCell) + ewp(k)*rw_p(k,iCell)
             end do
 
          end if
@@ -9460,12 +9421,12 @@ module atm_time_integration
 
       ! Run column physics once on the owned cells of the active level, with
       ! that level's dt. The fine-dt subcycle of PBL and Noah (902a6084d)
-      ! advanced soil and skin through 2^L calls while the dynamics stayed
-      ! frozen, then handed the RK one coarse rate. On the eds land VR that
-      ! NaNed u at 00:45 (job 199900), earlier than the single level-dt call
-      ! (d3fe6fb75), which stayed finite until 01:57. Radiation is called
-      ! once, when its alarm is due. dt_dyn and dt_pbl are restored before
-      ! the dynamics RK. The mask stays on so microphysics, later in
+      ! NaNed u at 00:45 (job 199900). Updating an open-interface parent's
+      ! acoustic pressure without its prognostic step (bb575a1b2) NaNed u
+      ! at 00:18 (job 199953). The single level-dt call with a pure snapshot
+      ! hold (d3fe6fb75) stayed finite until about 01:57. Radiation is
+      ! called once, when its alarm is due. dt_dyn and dt_pbl are restored
+      ! before the dynamics RK. The mask stays on so microphysics, later in
       ! atm_srk3, skips the same columns.
 
       implicit none
