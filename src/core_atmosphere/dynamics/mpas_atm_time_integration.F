@@ -561,7 +561,7 @@ module atm_time_integration
 
       call atm_hts_setup(domain)
 #ifdef DO_PHYSICS
-      column_mask_defer_sfc_dt = hts_enabled .and. hts_max_level_used > 0
+      column_mask_defer_sfc_dt = hts_path_live
 #endif
 
    end subroutine mpas_atm_dynamics_init
@@ -1929,7 +1929,7 @@ module atm_time_integration
       logical :: any
 
       any = .false.
-      if (hts_max_level_used > 0) then
+      if (hts_path_live) then
          do L = 0, hts_max_level_used
             if (hts_hold_rewrote(L)) any = .true.
          end do
@@ -1967,9 +1967,9 @@ module atm_time_integration
       hts_micro_split = .false.
       hts_micro_nsub = 1
       hts_kessler_substeps = hts_kessler_nsub
-      if (hts_kessler_substeps < 1) hts_kessler_substeps = 1
+      if (hts_kessler_substeps < 0) hts_kessler_substeps = 0
 
-      if (hts_max_level_used <= 0) then
+      if (.not. hts_path_live) then
          hts_masking = .true.
          hts_active_level = 0
          hts_impose = .false.
@@ -2078,6 +2078,7 @@ module atm_time_integration
       logical, save :: warned_match = .false.
       logical, save :: warned_pow = .false.
       logical, save :: warned_kessler = .false.
+      logical, save :: warned_long = .false.
       logical, save :: logged_level(0:8) = .false.
 
       nmicro = 1
@@ -2085,9 +2086,12 @@ module atm_time_integration
 #ifdef DO_PHYSICS
       if (moist_physics .and. L > 0) then
          if (L == hts_max_level_used) then
-            nmicro = hts_micro_substeps
+            if (hts_micro_substeps > 0) nmicro = hts_micro_substeps
             if (hts_pbl_substeps > 0) npbl = hts_pbl_substeps
          end if
+         ! 0 is config_dt on every moist level above 0. A positive count
+         ! stays on the coarsest level only, above.
+         if (hts_micro_substeps <= 0) nmicro = ratio
          if (hts_pbl_substeps <= 0) then
             npbl = ratio
             if (nmicro > 1) npbl = nmicro
@@ -2109,6 +2113,11 @@ module atm_time_integration
          end if
          nmicro = nstep
          npbl = nstep
+      end if
+      if (nmicro > 1 .and. npbl <= 1 .and. .not. warned_long) then
+         call mpas_log_write('HTS dynamics uses $i steps while the surface call stays one level step. That restarts acoustics under one YSU rate (edge 64121).', &
+                             intArgs=(/nmicro/), messageType=MPAS_LOG_WARN)
+         warned_long = .true.
       end if
 
       hts_acoustic_shift = -1
@@ -2308,7 +2317,7 @@ module atm_time_integration
       real (kind=RKIND), dimension(:,:,:), pointer :: s1, s2
       integer :: iCell, k, j, L, ratio, nScalars, nVert, nCopy
 
-      if (hts_max_level_used < 1) return
+      if (hts_max_level_used < 1 .and. .not. hts_force_path) return
       if (.not. allocated(hts_cell_level)) return
 
       nullify(state, s1, s2)
@@ -2822,7 +2831,7 @@ module atm_time_integration
             ! Hyperdiffusion reads delsq on the neighbors of the active level.
             ! Zero the scratch so a neighbor outside the work list is finite.
             ! The unmasked pass overwrites every entry it reads.
-            if (hts_masking .and. hts_max_level_used > 0) then
+            if (hts_masking .and. hts_path_live) then
                delsq_theta(:, :) = 0.0_RKIND
                delsq_w(:, :) = 0.0_RKIND
                delsq_divergence(:, :) = 0.0_RKIND
@@ -2947,7 +2956,7 @@ module atm_time_integration
                MPAS_ACC_TIMER_START('atm_srk3: halo_exchanges + ACC_data_xfer')
                call mpas_pool_get_array(diag, 'rho_pp', rho_pp)
                !$acc update self(rho_pp) if (.not. config_gpu_aware_mpi)
-               if (hts_ah_ready .and. hts_masking .and. hts_max_level_used > 0) then
+               if (hts_ah_ready .and. hts_masking .and. hts_path_live) then
                   call hts_exch_layer1(domain, rho_pp)
                else
                   call exchange_halo_group(domain, 'dynamics:rho_pp', config_gpu_aware_mpi)
@@ -2978,7 +2987,7 @@ module atm_time_integration
                MPAS_ACC_TIMER_START('atm_srk3: halo_exchanges + ACC_data_xfer')
                call mpas_pool_get_array(diag, 'rtheta_pp', rtheta_pp)
                !$acc update self(rtheta_pp) if (.not. config_gpu_aware_mpi)
-               if (hts_ah_ready .and. hts_masking .and. hts_max_level_used > 0) then
+               if (hts_ah_ready .and. hts_masking .and. hts_path_live) then
                   call hts_exch_layer1(domain, rtheta_pp)
                else
                   call exchange_halo_group(domain, 'dynamics:rtheta_pp', config_gpu_aware_mpi)
@@ -3335,7 +3344,7 @@ module atm_time_integration
       call mpas_pool_get_array(diag, 'uReconstructZonal', uReconstructZonal)
       call mpas_pool_get_array(diag, 'uReconstructMeridional', uReconstructMeridional)
 
-      if (hts_masking .and. hts_max_level_used > 0) then
+      if (hts_masking .and. hts_path_live) then
          call mpas_timer_start('hts_reconstruct_wind')
          call hts_reconstruct_owned(hts_active_level)
          call mpas_timer_stop('hts_reconstruct_wind')
@@ -3408,7 +3417,7 @@ module atm_time_integration
         ! the active level, and WSM6 / Thompson are called on contiguous runs
         ! of that mask. dt_dyn for this call is the level dt. The mask is set
         ! by the level driver and stays on through srk3.
-        if (hts_masking .and. hts_max_level_used > 0) then
+        if (hts_masking .and. hts_path_live) then
            call hts_push_microp_dt(block % configs, dt)
         end if
         call pre_microphysics( block % configs, state, diag, 2)
@@ -3421,7 +3430,7 @@ module atm_time_integration
 !$OMP END PARALLEL DO
         call mpas_timer_stop('microphysics')
         call post_microphysics( block % configs, state, diag, tend, 2)
-        if (hts_masking .and. hts_max_level_used > 0) then
+        if (hts_masking .and. hts_path_live) then
            call hts_pop_microp_dt()
         end if
       end if
@@ -4628,7 +4637,7 @@ module atm_time_integration
       ! Divergence damping reads rtheta_pp_old on the two cells of each active
       ! edge. Inactive cells that no active edge touches are not read. The
       ! unmasked path still copies the whole thread range.
-      if (hts_masking .and. hts_max_level_used > 0 .and. cellStart == 1 .and. cellEnd == hts_nCells) then
+      if (hts_masking .and. hts_path_live .and. cellStart == 1 .and. cellEnd == hts_nCells) then
          if (small_step == 1) then
             do i = 1, hts_n_ac_cell(hts_active_level)
                iCell = hts_ac_cell(i, hts_active_level)
@@ -4677,7 +4686,7 @@ module atm_time_integration
       ! held rho/theta (cf1dc652d) NaNed u at 00:12:30 (job 199977,
       ! rebuild 199974, GWDO off; w still finite). The
       ! pure hold stayed finite until about 01:57.
-      if (hts_masking .and. hts_max_level_used > 0 .and. small_step == 1) then
+      if (hts_masking .and. hts_path_live .and. small_step == 1) then
          do i = 1, hts_n_ac_cell(hts_active_level)
             iCell = hts_ac_cell(i, hts_active_level)
             if (iCell > nCellsSolve) cycle
@@ -5631,7 +5640,7 @@ module atm_time_integration
 #ifndef MPAS_OPENACC
          ! A later level on this tick would otherwise rewrite every column,
          ! including levels that already advanced, from this level's flux.
-         if (hts_masking .and. hts_max_level_used > 0) then
+         if (hts_masking .and. hts_path_live) then
             if (hts_cell_level(iCell) /= hts_active_level) cycle
          end if
 #endif
@@ -6547,7 +6556,7 @@ module atm_time_integration
          !$acc loop gang worker
          do iCell=cellStart,cellEnd
 #ifndef MPAS_OPENACC
-            if (hts_masking .and. hts_max_level_used > 0) then
+            if (hts_masking .and. hts_path_live) then
                if (iCell >= 1 .and. iCell < size(hts_cell_level)) then
                   if (hts_cell_level(iCell) /= hts_active_level) cycle
                end if
@@ -10139,6 +10148,7 @@ module atm_time_integration
       real (kind=RKIND), intent(in) :: dt
 
       character (len=StrKIND), pointer :: microp_scheme
+      integer :: n_kess
 
       hts_mp_dt_dyn_save = dt_dyn
       hts_mp_dt_microp_save = dt_microp
@@ -10153,14 +10163,24 @@ module atm_time_integration
       ! divides the whole theta change by dt_dyn, which is still the step dt.
       ! A micro_substeps split already shortened that step, so it does not
       ! subcycle again.
-      if (hts_kessler_substeps > 1 .and. .not. hts_micro_split .and. &
-          hts_active_level > 0 .and. hts_active_level == hts_max_level_used) then
-         n_microp = hts_kessler_substeps
-         dt_microp = dt / real(n_microp, RKIND)
-         if (.not. hts_kessler_logged) then
-            call mpas_log_write('HTS Kessler uses $i calls of $r s inside one $r s dynamics step', &
-                                intArgs=(/n_microp/), realArgs=(/dt_microp, dt/))
-            hts_kessler_logged = .true.
+      ! 0 is one Kessler call per config_dt on every moist level above 0,
+      ! inside that level's single dynamics step. A positive count above 1
+      ! stays on the coarsest level. A micro split already shortened the step.
+      if (.not. hts_micro_split .and. hts_active_level > 0) then
+         n_kess = 1
+         if (hts_kessler_nsub <= 0) then
+            n_kess = ishft(1, hts_active_level)
+         else if (hts_kessler_nsub > 1 .and. hts_active_level == hts_max_level_used) then
+            n_kess = hts_kessler_nsub
+         end if
+         if (n_kess > 1) then
+            n_microp = n_kess
+            dt_microp = dt / real(n_microp, RKIND)
+            if (.not. hts_kessler_logged) then
+               call mpas_log_write('HTS Kessler uses $i calls of $r s inside one $r s dynamics step', &
+                                   intArgs=(/n_microp/), realArgs=(/dt_microp, dt/))
+               hts_kessler_logged = .true.
+            end if
          end if
       end if
       ! Kessler and WSM6 stay one call of the dt passed in. That dt is the

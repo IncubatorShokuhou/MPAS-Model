@@ -1000,7 +1000,7 @@ module atm_core
       use mpas_atmphys_driver
       use mpas_atmphys_manager
       use mpas_atmphys_update
-      use mpas_atm_hts, only: hts_enabled, hts_max_level_used
+      use mpas_atm_hts, only: hts_enabled, hts_max_level_used, hts_path_live
 #endif
 #ifdef DO_CHEMISTRY
       use mpas_atm_chemistry, only: chemistry_step
@@ -1035,7 +1035,7 @@ module atm_core
       if(moist_physics) then
          call physics_timetracker(domain,dt,clock,itimestep,xtime_s)
          hts_physics_xtime_s = xtime_s
-         if (hts_enabled .and. hts_max_level_used > 0) then
+         if (hts_path_live) then
             call hts_note_physics_alarms()
          else
             call physics_driver(domain,itimestep,xtime_s)

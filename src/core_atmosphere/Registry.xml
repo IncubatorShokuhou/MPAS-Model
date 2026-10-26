@@ -93,8 +93,8 @@
 
                 <nml_option name="config_hts_micro_substeps" type="integer" default_value="1"
                      units="-"
-                     description="Coupled dynamics, scalar, and Kessler steps on the coarsest moist level. 1 is one step of the level dt. The acoustic step stays config_dt / config_number_of_sub_steps."
-                     possible_values="Positive integers, preferably a power of two"/>
+                     description="Coupled dynamics, scalar, and Kessler steps on moist levels above 0. 0 uses config_dt (2^L steps) on every such level. A positive integer is that many steps on the coarsest moist level only. 1 is one step of the level dt. The acoustic step stays config_dt / config_number_of_sub_steps."
+                     possible_values="Integers from 0 up, preferably a power of two"/>
 
                 <nml_option name="config_hts_pbl_substeps" type="integer" default_value="0"
                      units="-"
@@ -103,8 +103,13 @@
 
                 <nml_option name="config_hts_kessler_substeps" type="integer" default_value="1"
                      units="-"
-                     description="Kessler calls inside one coarsest-level dynamics step. 1 is a single call of that step. Ignored when config_hts_micro_substeps is greater than 1."
-                     possible_values="Positive integers"/>
+                     description="Kessler calls inside one dynamics step. 0 uses config_dt (2^L calls) on every moist level above 0. A positive integer greater than 1 is that many calls on the coarsest moist level only. 1 is one call of the level dt. Ignored when config_hts_micro_substeps is 0 or greater than 1."
+                     possible_values="Integers from 0 up"/>
+
+                <nml_option name="config_hts_debug_force_path" type="logical" default_value="false"
+                     units="-"
+                     description="With every cell at level 0, still run lists, the acoustic halo, snapshot and restore, flux accumulation, the idle-scalar copy, and HTS column physics. Requires config_hts true. A mesh that already has a coarse level ignores it."
+                     possible_values="Logical values"/>
 
                 <nml_option name="config_calendar_type" type="character" default_value="gregorian" in_defaults="false"
                      units="-"

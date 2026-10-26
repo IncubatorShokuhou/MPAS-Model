@@ -44,6 +44,12 @@ module mpas_atm_hts
    integer, public :: hts_micro_substeps = 1
    integer, public :: hts_pbl_substeps = 0
    integer, public :: hts_kessler_nsub = 1
+   ! config_hts_debug_force_path. Every cell stays at level 0, and the
+   ! advance still builds lists, the acoustic halo, the hold, the flux sum,
+   ! the idle-scalar copy, and column physics. hts_path_live is that path
+   ! or any run that actually has a coarse level.
+   logical, public :: hts_force_path = .false.
+   logical, public :: hts_path_live = .false.
 
    integer, public, allocatable :: hts_cell_level(:)
    integer, public, allocatable :: hts_edge_level(:)
@@ -173,6 +179,7 @@ module mpas_atm_hts
       type (block_type), pointer :: block
       type (mpas_pool_type), pointer :: mesh
       logical, pointer :: config_hts
+      logical, pointer :: config_hts_debug_force_path
       integer, pointer :: config_hts_max_level
       integer, pointer :: config_hts_moist_max_level
       integer, pointer :: config_hts_micro_substeps
@@ -195,6 +202,8 @@ module mpas_atm_hts
       hts_active_level = 0
       hts_tick = 0
       hts_max_level_used = 0
+      hts_force_path = .false.
+      hts_path_live = .false.
       hts_correct_logs = 0
       hts_max_flux_resid = 0.0_RKIND
       hts_hold_valid(:) = .false.
@@ -216,10 +225,12 @@ module mpas_atm_hts
       call mpas_pool_get_config(block % configs, 'config_hts', config_hts)
       call mpas_pool_get_config(block % configs, 'config_hts_max_level', config_hts_max_level)
       nullify(config_hts_moist_max_level, config_hts_micro_substeps, config_hts_pbl_substeps, config_hts_kessler_substeps)
+      nullify(config_hts_debug_force_path)
       call mpas_pool_get_config(block % configs, 'config_hts_moist_max_level', config_hts_moist_max_level)
       call mpas_pool_get_config(block % configs, 'config_hts_micro_substeps', config_hts_micro_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_pbl_substeps', config_hts_pbl_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_kessler_substeps', config_hts_kessler_substeps)
+      call mpas_pool_get_config(block % configs, 'config_hts_debug_force_path', config_hts_debug_force_path)
       hts_enabled = config_hts
       hts_moist_max_level = 2
       hts_micro_substeps = 1
@@ -231,9 +242,11 @@ module mpas_atm_hts
       if (associated(config_hts_kessler_substeps)) hts_kessler_nsub = config_hts_kessler_substeps
       if (hts_moist_max_level < 0) hts_moist_max_level = 0
       if (hts_moist_max_level > hts_level_cap) hts_moist_max_level = hts_level_cap
-      if (hts_micro_substeps < 1) hts_micro_substeps = 1
+      if (hts_micro_substeps < 0) hts_micro_substeps = 0
       if (hts_pbl_substeps < 0) hts_pbl_substeps = 0
-      if (hts_kessler_nsub < 1) hts_kessler_nsub = 1
+      if (hts_kessler_nsub < 0) hts_kessler_nsub = 0
+      hts_force_path = .false.
+      if (associated(config_hts_debug_force_path)) hts_force_path = config_hts_debug_force_path
 
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_dimension(mesh, 'nCells', nCells)
@@ -377,6 +390,15 @@ module mpas_atm_hts
          if (hts_pbl_substeps == 0) then
             call mpas_log_write(' pbl_substeps = 0: moist levels above 0 call surface, Noah, PBL, and GWDO at config_dt')
          end if
+         if (hts_micro_substeps == 0) then
+            call mpas_log_write(' micro_substeps = 0: moist levels above 0 step dynamics, scalars, and Kessler at config_dt')
+         end if
+         if (hts_kessler_nsub == 0) then
+            call mpas_log_write(' kessler_substeps = 0: moist levels above 0 call Kessler at config_dt inside one dynamics step')
+         end if
+         if (hts_force_path) then
+            call mpas_log_write(' config_hts_debug_force_path = true')
+         end if
       else
          call mpas_log_write(' config_hts = false (integrator is unchanged)')
       end if
@@ -391,16 +413,28 @@ module mpas_atm_hts
       end if
       call mpas_log_write('----------------------------------')
 
-      if (.not. hts_enabled) return
+      if (.not. hts_enabled) then
+         hts_force_path = .false.
+         hts_path_live = .false.
+         return
+      end if
 
 #ifdef MPAS_OPENACC
       call mpas_log_write('config_hts is not supported in an OpenACC build.', messageType=MPAS_LOG_CRIT)
 #endif
 
-      if (hts_max_level_used == 0) then
+      if (hts_max_level_used == 0 .and. .not. hts_force_path) then
+         hts_path_live = .false.
          call mpas_log_write('HTS enabled with a single level; masked integrator, no subcycling')
          return
       end if
+      if (hts_max_level_used == 0) then
+         call mpas_log_write('HTS debug force path: every cell is level 0; lists, halo, hold, flux, idle scalars, and column physics run')
+      else if (hts_force_path) then
+         hts_force_path = .false.
+         call mpas_log_write('HTS debug force path ignored; a coarse level is already active')
+      end if
+      hts_path_live = .true.
 
       call mpas_log_write(' column physics runs on the active level; microphysics skips the other columns')
 
@@ -1033,7 +1067,7 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer :: L, i, iCell, iEdge, k, ratio
 
-      if (hts_max_level_used < 1) return
+      if (hts_max_level_used < 1 .and. .not. hts_force_path) return
 
       call mpas_timer_start('hts_begin_intervals')
 
@@ -1135,7 +1169,7 @@ module mpas_atm_hts
       logical :: any
 
       if (allocated(hts_lock_edge)) hts_lock_edge(:) = .false.
-      if (hts_max_level_used <= activeLevel) return
+      if (hts_max_level_used <= activeLevel .and. .not. (hts_force_path .and. hts_max_level_used == 0)) return
 
       call mpas_timer_start('hts_apply_interpolation')
 
@@ -1313,7 +1347,7 @@ module mpas_atm_hts
       integer :: L, i, iCell, iEdge, k, cell1, cell2, ratio
       logical :: any
 
-      if (hts_max_level_used <= activeLevel) return
+      if (hts_max_level_used <= activeLevel .and. .not. (hts_force_path .and. hts_max_level_used == 0)) return
 
       call mpas_timer_start('hts_restore_above')
 
@@ -1706,7 +1740,7 @@ module mpas_atm_hts
       integer :: iCell, iEdge, k, nVert, nCells, nEdges
 
       if (.not. hts_masking) return
-      if (hts_max_level_used <= 0) return
+      if (.not. hts_path_live) return
       if (.not. allocated(hts_cell_level)) return
       if (.not. allocated(hts_edge_level)) return
 
@@ -1768,7 +1802,7 @@ module mpas_atm_hts
       hts_ah_ready = .false.
       hts_ah_nsend(:) = 0
       hts_ah_nrecv(:) = 0
-      if (hts_max_level_used < 1) return
+      if (hts_max_level_used < 1 .and. .not. hts_force_path) return
       if (.not. allocated(hts_cell_level)) return
 
       nullify(diag, mesh, fld)

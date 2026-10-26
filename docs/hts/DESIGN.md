@@ -300,14 +300,28 @@ A coarse interior column was compared with the all-fine step on every field it c
 
 The default is now that surface call at `config_dt`. `config_hts_pbl_substeps = 0` runs surface, Noah, PBL, and GWDO at `config_dt` on every moist level above 0 (`2^L` calls). Each increment is folded into the state and those rates are zeroed, then one SRK3 and one Kessler call still use the level dt. Radiation stays a per-second rate on that long step. The short rate is not left for the long acoustic restart, which is what grew edge 64121. Dry runs are unchanged. Level 0 is still one `config_dt` physics call and one SRK3. A namelist that still sets `config_hts_pbl_substeps = 1` keeps the old surface call. Delete that line, or set it to 0, before the 2 h pair.
 
-`config_hts_max_level = 0` does not turn `config_hts` off and does not run the hold. Setup clamps the mesh to a single level, logs that the integrator is masked with no subcycling, and returns before the level lists. The time step is one SRK3 of `config_dt`. Physics uses the stock driver, because the HTS physics branch requires `hts_max_level_used > 0`, and the masks are no-ops. Job 199662 was bit-identical to all-fine for 45 min on that setting. It is the negative control for the hold. There is no namelist that forces the hold and the level driver while every cell stays at level 0. A uniform mesh takes the same early return. `config_hts = false` is a different path and is not that control.
+`config_hts_max_level = 0` does not turn `config_hts` off and does not run the hold. Setup clamps the mesh to a single level, logs that the integrator is masked with no subcycling, and returns before the level lists. The time step is one SRK3 of `config_dt`. Physics uses the stock driver, and the masks are no-ops. Job 199662 was bit-identical to all-fine for 45 min on that setting. It does not exercise the bookkeeping. A uniform mesh takes the same early return. `config_hts = false` is a different path.
+
+`config_hts_debug_force_path = true` with `config_hts_max_level = 0` keeps every cell at level 0 and still runs the level-0 advance: ring and hold lists, the acoustic halo, snapshot and restore, flux accumulation, the idle-scalar copy, and HTS column physics. There is no coarser column, so the hold and the idle copy do not rewrite state. The run should match all-fine on `u`, `w`, `theta`, `qv`, `qc`, `qr`, and `rho`. A mesh that already has a coarse level logs that the switch is ignored.
 
 Four namelist integers remain.
 
 - `config_hts_moist_max_level` (default 2). Dry runs ignore it.
-- `config_hts_micro_substeps` (default 1). Splits dynamics, scalars, and Kessler on the coarsest moist level and averages `ruAvg` before the single mass correction. The acoustic dt stays `config_dt / config_number_of_sub_steps`. With `pbl_substeps = 0` the surface count matches this split.
+- `config_hts_micro_substeps` (default 1). `0` steps dynamics, scalars, and Kessler at `config_dt` on every moist level above 0 and averages `ruAvg` before the single mass correction. A positive integer is that many steps on the coarsest moist level only. The acoustic dt stays `config_dt / config_number_of_sub_steps`. With `pbl_substeps = 0` the surface count matches this split. With `pbl_substeps = 1` the surface call stays one level step, which is the edge 64121 path.
 - `config_hts_pbl_substeps` (default 0). Zero is `config_dt` on every moist level above 0, folded, one dynamics step. A positive integer is that many calls on the coarsest moist level only. 1 is one call of the level dt. With both counts greater than 1, an explicit mismatch is raised to the shorter dt so the stored YSU rate is not integrated by a longer dynamics step.
-- `config_hts_kessler_substeps` (default 1). Kessler calls inside one coarsest-level dynamics step. Ignored when `micro_substeps` is greater than 1.
+- `config_hts_kessler_substeps` (default 1). `0` calls Kessler at `config_dt` inside the one dynamics step on every moist level above 0. A positive integer greater than 1 is that many calls on the coarsest moist level only. Ignored when `micro_substeps` is 0 or greater than 1, because that split is already one Kessler call per short step.
+- `config_hts_debug_force_path` (default false). Level-0 bookkeeping test described above.
+
+On `config_hts_max_level = 1` the coarse step is 60 s. Each coupling can move to 30 s on its own. The surface row is the default fix. Set `config_hts_pbl_substeps = 1` before the Kessler-only or dynamics-only rows, or the surface call is already at 30 s.
+
+| ablation | namelist besides `config_hts_max_level = 1` |
+| --- | --- |
+| surface only | defaults (`pbl_substeps = 0`) |
+| Kessler only | `pbl_substeps = 1`, `kessler_substeps = 0` |
+| dynamics and scalars only | `pbl_substeps = 1`, `micro_substeps = 0` |
+| surface and Kessler | `kessler_substeps = 0` |
+| all three at 30 s | `micro_substeps = 0` |
+| 60 s baseline (job 201388) | `pbl_substeps = 1` |
 
 Expected cost against the 201338 pair (integration 1094 s, all-fine 1526 s, 1.40×). The coarse region is about 95% of the cells. Physics there moves from one 120 s call toward the all-fine cost (physics driver 141 s versus 217 s). Tendencies, scalars, and acoustics stay on the coarse step. The default should land near 1.25–1.35×, not the 1.22× of the level-1 run and not the old 1.40×.
 
