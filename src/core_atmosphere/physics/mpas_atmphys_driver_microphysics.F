@@ -373,10 +373,7 @@
  microp_select: select case(trim(microp_scheme))
     case ("mp_kessler")
        call mpas_timer_start('mp_kessler')
-       ! A coarse HTS step splits Kessler into fine dt_microp pieces. One
-       ! 2^L step condenses the whole interval at once and, with Noah
-       ! feeding the column, that latent-heat jump NaNs after the PBL has
-       ! moistened. n_microp is 1 on a fine step, so this loop is a no-op.
+       ! n_microp is 1 for Kessler. The loop is one call of dt_microp.
        istep = 1
        do while (istep .le. n_microp)
        call kessler( &
