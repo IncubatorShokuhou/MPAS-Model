@@ -2554,7 +2554,7 @@ module atm_time_integration
 
       real (kind=RKIND), dimension(:,:), pointer :: w
       real (kind=RKIND), dimension(:,:), pointer :: u, uReconstructZonal, uReconstructMeridional, uReconstructX, uReconstructY, uReconstructZ
-      real (kind=RKIND), dimension(:,:,:), pointer :: scalars, scalars_1, scalars_2
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars, scalars_1, scalars_2, tend_scalars
 
       real (kind=RKIND), dimension(:,:), pointer :: rqvdynten, rthdynten, theta_m
       real (kind=RKIND), dimension(:,:), pointer :: pressure_p, rtheta_p, exner, tend_u
@@ -2818,7 +2818,8 @@ module atm_time_integration
 
       ! Multi-level HTS only. All-fine and a single level do not enter the
       ! subroutine, so those tendency arrays stay bit-identical.
-      call hts_restrict_physics_tendencies(tend_ru_physics, tend_rtheta_physics, tend_rho_physics)
+      call mpas_pool_get_array(tend, 'scalars_tend', tend_scalars)
+      call hts_restrict_physics_tendencies(tend_ru_physics, tend_rtheta_physics, tend_rho_physics, tend_scalars)
 
 
 
@@ -6047,6 +6048,16 @@ module atm_time_integration
 
       !$acc loop gang worker
       do iCell=cellSolveStart,cellSolveEnd
+#ifndef MPAS_OPENACC
+         ! This stage writes sources into time level 1 before transport.
+         ! hts_restrict_physics_tendencies zeros the idle rates. The guard
+         ! keeps a stale rqvblten from advancing qv while theta_m is held.
+         if (hts_masking .and. hts_path_live) then
+            if (iCell >= 1 .and. iCell < size(hts_cell_level)) then
+               if (hts_cell_level(iCell) /= hts_active_level) cycle
+            end if
+         end if
+#endif
 
          !$acc loop vector collapse(2)
          do k = 1,nVertLevels

@@ -1788,14 +1788,17 @@ module mpas_atm_hts
    end subroutine atm_hts_correct_mass
 
 
-   subroutine hts_restrict_physics_tendencies(tend_ru, tend_rtheta, tend_rho)
+   subroutine hts_restrict_physics_tendencies(tend_ru, tend_rtheta, tend_rho, tend_scalars)
 
       ! Column physics runs on the active level only and writes per-second
       ! rates there. physics_get_tend copies those rates, including rates
       ! left from the previous step on columns this call did not touch, and
       ! the RK multiplies by this step's dt. Keep the copy only on the
       ! active level so a coarse column is not forced on a fine tick and a
-      ! fine column is not forced again over the long step. Single-level
+      ! fine column is not forced again over the long step. scalars_tend
+      ! is the moisture part of that copy. The monotonic final RK stage
+      ! adds it to time level 1 on every owned cell, so leaving it set on
+      ! an idle column advances qv and leaves theta_m behind. Single-level
       ! and all-fine return without writing.
 
       implicit none
@@ -1803,8 +1806,9 @@ module mpas_atm_hts
       real (kind=RKIND), intent(inout) :: tend_ru(:,:)
       real (kind=RKIND), intent(inout) :: tend_rtheta(:,:)
       real (kind=RKIND), intent(inout) :: tend_rho(:,:)
+      real (kind=RKIND), intent(inout) :: tend_scalars(:,:,:)
 
-      integer :: iCell, iEdge, k, nVert, nCells, nEdges
+      integer :: iCell, iEdge, k, j, nVert, nCells, nEdges, nScal, nVertS
 
       if (.not. hts_masking) return
       if (.not. hts_path_live) return
@@ -1820,6 +1824,18 @@ module mpas_atm_hts
          do k = 1, nVert
             tend_rtheta(k, iCell) = 0.0_RKIND
             tend_rho(k, iCell) = 0.0_RKIND
+         end do
+      end do
+
+      nScal = size(tend_scalars, 1)
+      nVertS = size(tend_scalars, 2)
+      nCells = min(nCells, size(tend_scalars, 3))
+      do iCell = 1, nCells
+         if (hts_cell_level(iCell) == hts_active_level) cycle
+         do k = 1, nVertS
+            do j = 1, nScal
+               tend_scalars(j, k, iCell) = 0.0_RKIND
+            end do
          end do
       end do
 
