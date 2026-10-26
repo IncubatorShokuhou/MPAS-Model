@@ -343,17 +343,11 @@ That probe is the write. With `config_monotonic` true (the default), RK stages 1
 
 The final RK stage now skips that source update on a column whose level is not active, and `hts_restrict_physics_tendencies` zeros `scalars_tend` there too. Active columns, a single level, and all-fine still take the stock update. The idle prognostic copy stays: it keeps time level 2 equal to the committed time level 1 on a column that did not step.
 
-The next eds pair is the same run B, probe on, other debug switches off:
+`d0cc0b23f` is the tip those runs used. Run B (`config_hts_max_level = 1`, `micro_substeps = 0`, `pbl_substeps = 0`, probe 3178) for 8 h is job 201733: 08:00 cell 3177 `|w|` is 0.112, equal to all-fine, against 4.076 on `95db9939c` and 4.069 on old B. The 00:30 k0 theta/`qv` split is gone. Speed is 0.86×.
 
-```
-config_hts = true
-config_hts_max_level = 1
-config_hts_micro_substeps = 0
-config_hts_pbl_substeps = 0
-config_hts_debug_probe_cell = 3178
-```
+The production moist cap is `config_hts_max_level = 3` with the defaults (`moist_max_level` 2, `micro_substeps` 1, `pbl_substeps` 1, `kessler_substeps` 1), so the log says the active level is capped at 2 and the coarse step is 120 s. Job 201763 (2 h) passed at 1.51×: critical 0, max `|u|` 89.28/89.34, `w` relative L2 0.21–0.43, cell 3177 on all-fine, k0 theta/`qv` about +0.11 K / −0.06 g/kg. Job 201773 (8 h, 960/960, critical 0) passed at 1.461× (time integration 1044 s versus 1526 s; the old cap was 1.40× at 8 h and 1.48× at 2 h). Cell 3177 `|w|` at 04:00, 05:00, 06:00, 07:00, and 08:00 was 0.046 / 0.048 / 0.058 / 0.080 / 0.118 against all-fine 0.047 / 0.048 / 0.059 / 0.077 / 0.112 and against the old cap 0.160 / 0.438 / 1.635 / 4.188 / 2.928. Edge 64121 k2 stayed −4.4/−4.4 for all 8 h. Edge 41342 `|u|` was 24.8/24.9.
 
-Rebuild the dynamics objects. `gen_includes` is not required when the tree already has the 8db2f20c9 namelist. The probe line must contain `th1`, `qv1`, and `td1`. On an open tick, `qv1` and `td1` should repeat the previous close, as `th1` already did. 2 h is the safety check (no polar fold, edge 64121 quiet, dry-mass drift near 1e-9, `k ≤ 5` `|u|` within a few m/s). 8 h is the cell 3177 test: 00:30 k0 dry theta and `qv` against the old −0.5 K / +1.05 g/kg, and 08:00 `|w|` against all-fine 0.112 and the old B value 4.069. A quiet 2 h is not a pass. The local Kessler mesh has PBL, surface, and radiation off, so it cannot see this column.
+The residual is k0 `|Δu| > 5` on edges at the level-0/1 interface near 27–28°N, the Sahara fine-patch boundary. The count is 17 at 02:00, then 54 / 72 / 114 / 238 / 371 at 04:00 through 08:00. It is not polar, and it is not cell 3177. The same population was about 305 edges at 08:00 on the pre-fix level-1 runs. An interface edge takes the finer cell, so that edge is level 0 and steps every `config_dt`, while the level-1 neighbor is held until the coarse close. The fine surface stress and the pressure gradient therefore see a neighbor whose `rho`, `theta`, and `w` are the last close. That is the local interface truncation already expected from the held snapshot. Moving that face by updating the parent's acoustic pressure, ramping only `rho` and `theta`, leading the wind, or cancelling the face divergence is what jobs 199953, 199977, 200072, and 200144 did, and each of those either NaNed earlier or left the error in place. It stays accuracy debt. Do not add diffusion to hide it.
 
 `pbl_substeps = 1` with `micro_substeps = 1` is the reverted 60 s baseline and should reproduce job 201388. An explicit `pbl_substeps = 0` with `micro_substeps = 1` is the fold that already failed. The 2 h gate still includes the max per-edge `|u|` difference and max `|u|` for `k ≤ 5`.
 
