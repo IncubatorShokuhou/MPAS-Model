@@ -4194,6 +4194,15 @@ module atm_time_integration
            if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
 #ifndef MPAS_OPENACC
               if (hts_masking) then
+                 if (allocated(hts_lock_edge)) then
+                    if (hts_lock_edge(iEdge)) then
+                       do k = 1, nVertLevels
+                          ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                          ruAvg(k,iEdge) = ruAvg(k,iEdge) + ru_p(k,iEdge)
+                       end do
+                       cycle
+                    end if
+                 end if
                  if (hts_edge_level(iEdge) /= hts_active_level) then
                     if (hts_impose .and. hts_impose_edge(iEdge)) then
                        do k = 1, nVertLevels
@@ -4240,6 +4249,15 @@ module atm_time_integration
            if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
 #ifndef MPAS_OPENACC
               if (hts_masking) then
+                 if (allocated(hts_lock_edge)) then
+                    if (hts_lock_edge(iEdge)) then
+                       do k = 1, nVertLevels
+                          ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                          ruAvg(k,iEdge) = ru_p(k,iEdge)
+                       end do
+                       cycle
+                    end if
+                 end if
                  if (hts_edge_level(iEdge) /= hts_active_level) then
                     if (hts_impose .and. hts_impose_edge(iEdge)) then
                        do k = 1, nVertLevels
@@ -4547,6 +4565,9 @@ module atm_time_integration
          if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve ) then
 #ifndef MPAS_OPENACC
             if (hts_masking) then
+               if (allocated(hts_lock_edge)) then
+                  if (hts_lock_edge(iEdge)) cycle
+               end if
                if (hts_edge_level(iEdge) /= hts_active_level) cycle
             end if
 #endif

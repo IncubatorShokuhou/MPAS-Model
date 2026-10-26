@@ -50,6 +50,11 @@ module mpas_atm_hts
    logical, public, allocatable :: hts_cell_live(:)
    logical, public, allocatable :: hts_impose_edge(:)
    real (kind=RKIND), public, allocatable :: hts_ru_target(:,:)
+   ! Coarse cell level of an interface edge, else 0. While a finer level is
+   ! active, an interface edge of that level is held at the previous coarse
+   ! increment. Acoustic parents stay off.
+   integer, public, allocatable :: hts_iface_coarse(:)
+   logical, public, allocatable :: hts_lock_edge(:)
 
    integer, parameter :: hts_level_cap = 8
 
@@ -224,6 +229,8 @@ module mpas_atm_hts
       if (allocated(hts_cell_live)) deallocate(hts_cell_live)
       if (allocated(hts_impose_edge)) deallocate(hts_impose_edge)
       if (allocated(hts_ru_target)) deallocate(hts_ru_target)
+      if (allocated(hts_iface_coarse)) deallocate(hts_iface_coarse)
+      if (allocated(hts_lock_edge)) deallocate(hts_lock_edge)
       if (allocated(hts_flux_sum)) deallocate(hts_flux_sum)
 
       allocate(hts_cell_level(nCells+1))
@@ -232,12 +239,16 @@ module mpas_atm_hts
       allocate(hts_cell_open_iface(nCells+1))
       allocate(hts_cell_live(nCells+1))
       allocate(hts_impose_edge(nEdges+1))
+      allocate(hts_iface_coarse(nEdges+1))
+      allocate(hts_lock_edge(nEdges+1))
       hts_cell_level(:) = 0
       hts_edge_level(:) = 0
       hts_edge_interface(:) = .false.
       hts_cell_open_iface(:) = .false.
       hts_cell_live(:) = .false.
       hts_impose_edge(:) = .false.
+      hts_iface_coarse(:) = 0
+      hts_lock_edge(:) = .false.
 
       mdMin = meshDensity(1)
       mdMax = meshDensity(1)
@@ -278,6 +289,11 @@ module mpas_atm_hts
          if (cell2 < 1 .or. cell2 > nCells) cell2 = nCells + 1
          hts_edge_level(iEdge) = min(hts_cell_level(cell1), hts_cell_level(cell2))
          hts_edge_interface(iEdge) = hts_cell_level(cell1) /= hts_cell_level(cell2)
+         if (hts_edge_interface(iEdge)) then
+            hts_iface_coarse(iEdge) = max(hts_cell_level(cell1), hts_cell_level(cell2))
+         else
+            hts_iface_coarse(iEdge) = 0
+         end if
          if (cell1 >= 1 .and. cell1 <= nCells) then
             if (hts_edge_level(iEdge) < hts_cell_level(cell1)) hts_cell_open_iface(cell1) = .true.
          end if
@@ -398,6 +414,8 @@ module mpas_atm_hts
       if (allocated(hts_cell_live)) deallocate(hts_cell_live)
       if (allocated(hts_impose_edge)) deallocate(hts_impose_edge)
       if (allocated(hts_ru_target)) deallocate(hts_ru_target)
+      if (allocated(hts_iface_coarse)) deallocate(hts_iface_coarse)
+      if (allocated(hts_lock_edge)) deallocate(hts_lock_edge)
       if (allocated(hts_flux_sum)) deallocate(hts_flux_sum)
       if (allocated(snap_rho)) deallocate(snap_rho)
       if (allocated(delta_rho)) deallocate(delta_rho)
@@ -1004,6 +1022,13 @@ module mpas_atm_hts
                   delta_u(k, iEdge, L) = 0.0_RKIND
                end do
             end do
+            do iEdge = 1, hts_nEdges
+               if (hts_iface_coarse(iEdge) /= L) cycle
+               do k = 1, hts_nVert
+                  snap_u(k, iEdge, L) = u1(k, iEdge)
+                  delta_u(k, iEdge, L) = 0.0_RKIND
+               end do
+            end do
             hts_level_started(L) = .true.
             hts_have_delta(L) = .false.
          else
@@ -1025,6 +1050,13 @@ module mpas_atm_hts
             end do
             do i = 1, hts_n_level_edge(L)
                iEdge = hts_level_edge(i, L)
+               do k = 1, hts_nVert
+                  delta_u(k, iEdge, L) = u1(k, iEdge) - snap_u(k, iEdge, L)
+                  snap_u(k, iEdge, L) = u1(k, iEdge)
+               end do
+            end do
+            do iEdge = 1, hts_nEdges
+               if (hts_iface_coarse(iEdge) /= L) cycle
                do k = 1, hts_nVert
                   delta_u(k, iEdge, L) = u1(k, iEdge) - snap_u(k, iEdge, L)
                   snap_u(k, iEdge, L) = u1(k, iEdge)
@@ -1055,6 +1087,7 @@ module mpas_atm_hts
       real (kind=RKIND) :: alpha, rho_here, th_here, u_here
       logical :: any
 
+      if (allocated(hts_lock_edge)) hts_lock_edge(:) = .false.
       if (hts_max_level_used <= activeLevel) return
 
       call mpas_timer_start('hts_apply_interpolation')
@@ -1062,14 +1095,14 @@ module mpas_atm_hts
       ! Interior coarse columns stay on the snapshot. The diagnostic ring the
       ! fine stencil reads is a convex blend of the previous completed coarse
       ! interval, alpha = mod(tick, 2^L) / 2^L, with no half-step lead.
-      ! rho, theta, u, and w move together. The shared interface edge is not
-      ! overwritten: its level is the finer cell, and tend_u_euler integrates
-      ! it against the blended coarse exner. Acoustic parents stay off, and
-      ! the coarse RK still starts from the snapshot after the restore.
+      ! rho, theta, u, and w move together. An interface edge whose level is
+      ! this active level is the same blend of the coarser cell's previous
+      ! increment, and the acoustic step holds ru there. Acoustic parents stay
+      ! off. The coarse RK still starts from the snapshot after the restore.
       ! cf1dc652d ramped rho/theta on top of the acoustic-parent update and
-      ! NaNed u at 00:12:30. A half-step lead on u and w NaNed dry w. Blending
-      ! the whole coarse level toward a parent-first forecast NaNed dry u by
-      ! about 01:50. This path does neither.
+      ! NaNed u at 00:12:30. A half-step lead on u and w NaNed dry w. A parent
+      ! integration of the interface edge NaNed dry w at 00:42. This path does
+      ! neither: the edge follows an increment the coarse step already took.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
@@ -1129,6 +1162,32 @@ module mpas_atm_hts
             rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
          end do
       end do
+
+      ! Interface edges owned by this level (edge level == active) otherwise
+      ! integrate tend_u_euler. Hold them on the coarser level's previous
+      ! increment. Edges the coarse step imposes are not in this set.
+      if (allocated(hts_lock_edge) .and. allocated(hts_iface_coarse) .and. allocated(hts_ru_target)) then
+         do iEdge = 1, hts_nEdges
+            if (hts_edge_level(iEdge) /= activeLevel) cycle
+            L = hts_iface_coarse(iEdge)
+            if (L <= activeLevel .or. L > hts_max_level_used) cycle
+            if (.not. hts_have_delta(L)) cycle
+            ratio = ishft(1, L)
+            alpha = real(mod(hts_tick, ratio), RKIND) / real(ratio, RKIND)
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            hts_lock_edge(iEdge) = .true.
+            do k = 1, hts_nVert
+               u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+               u1(k, iEdge) = u_here
+               u2(k, iEdge) = u_here
+               ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
+               ru_save(k, iEdge) = ru(k, iEdge)
+               rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+               hts_ru_target(k, iEdge) = ru(k, iEdge)
+            end do
+         end do
+      end if
 
       if (.not. any) then
          call mpas_timer_stop('hts_apply_interpolation')
@@ -1265,6 +1324,23 @@ module mpas_atm_hts
             rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
          end do
       end do
+      if (allocated(hts_lock_edge) .and. allocated(hts_iface_coarse)) then
+         do iEdge = 1, hts_nEdges
+            if (.not. hts_lock_edge(iEdge)) cycle
+            L = hts_iface_coarse(iEdge)
+            if (L < 1 .or. L > hts_max_level_used) cycle
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            do k = 1, hts_nVert
+               u1(k, iEdge) = snap_u(k, iEdge, L)
+               u2(k, iEdge) = snap_u(k, iEdge, L)
+               ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * snap_u(k, iEdge, L)
+               ru_save(k, iEdge) = ru(k, iEdge)
+               rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+            end do
+         end do
+         hts_lock_edge(:) = .false.
+      end if
 
       if (.not. any) then
          call mpas_timer_stop('hts_restore_above')
