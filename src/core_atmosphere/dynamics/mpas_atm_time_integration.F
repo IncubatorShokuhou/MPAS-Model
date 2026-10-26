@@ -1979,10 +1979,10 @@ module atm_time_integration
       end if
 
       call atm_hts_begin_intervals(block)
-      ! scalars time level 2 is what the scalar flux reads, and the core
-      ! shift publishes it. Idle coarse columns are not copied in the RK
-      ! setup, so level 2 still holds the previous buffer.
-      call atm_hts_copy_idle_scalars(block, .false.)
+      ! Time level 2 is what the flux reads, and the core shift publishes it.
+      ! The RK setup copies time level 1 onto time level 2 only on the active
+      ! level, so an idle column still holds the previous prognostic buffer.
+      call atm_hts_copy_idle_state(block, .false.)
 
       hts_masking = .true.
       hts_impose = .false.
@@ -2022,11 +2022,10 @@ module atm_time_integration
       call hts_refresh_wind()
       hts_masking = .false.
       hts_active_level = 0
-      ! Columns that did not step still have the previous scalar buffer in
-      ! time level 2. The shift would publish that buffer and the next fine
-      ! step would advect it. Job 200185 matched 200101 because the ring
-      ! never touches scalars.
-      call atm_hts_copy_idle_scalars(block, .true.)
+      ! Columns that did not step still have the previous buffer in time
+      ! level 2. Copy the committed state before the shift. Scalars alone
+      ! leave the new moisture with the old theta_m.
+      call atm_hts_copy_idle_state(block, .true.)
       if (hts_dbg_probe_cell > 0) call hts_probe_cell(domain)
       hts_tick = hts_tick + 1
       hts_acoustic_shift = -1
@@ -2311,13 +2310,22 @@ module atm_time_integration
    end subroutine hts_promote_active_state
 
 
-   subroutine atm_hts_copy_idle_scalars(block, idle_only)
+   subroutine atm_hts_copy_idle_state(block, idle_only)
 
-      ! Copy scalar time level 1 onto time level 2. idle_only false covers
-      ! every coarser column, so the fine flux sees the committed moisture.
-      ! idle_only true covers columns whose level did not close on this tick,
-      ! so the state shift cannot move them backward. A column that closed
-      ! already wrote time level 2.
+      ! Copy the committed state from time level 1 onto time level 2.
+      ! idle_only false runs before the fine step, so that step's flux sees
+      ! the committed column. idle_only true runs after the levels that close
+      ! on this tick have written time level 2, and covers every coarser
+      ! column that did not close. The core shift publishes time level 2.
+      !
+      ! The RK setup copies time level 1 onto time level 2 only for the
+      ! active level. An idle column otherwise keeps the previous rho,
+      ! theta_m, w, and u in time level 2. Copying the scalars alone
+      ! publishes the new moisture with that old theta_m. History theta is
+      ! theta_m / (1 + Rv/Rd * qv), so the surface layer is then cold by
+      ! about (Rv/Rd)*theta*dqv and the next close starts from that split.
+      ! On a level-1 run the open tick is the shift that used to do this.
+      ! config_hts_debug_skip_idle_copy still skips the scalars only.
 
       implicit none
 
@@ -2325,23 +2333,37 @@ module atm_time_integration
       logical, intent(in) :: idle_only
 
       type (mpas_pool_type), pointer :: state
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
       real (kind=RKIND), dimension(:,:,:), pointer :: s1, s2
-      integer :: iCell, k, j, L, ratio, nScalars, nVert, nCopy
+      integer :: iCell, iEdge, k, j, L, ratio, nScalars, nVert, nW, nCopy, nEdges
+      logical :: copy_scalars
 
-      if (hts_dbg_skip_idle) return
       if (hts_max_level_used < 1 .and. .not. hts_force_path) return
       if (.not. allocated(hts_cell_level)) return
 
-      nullify(state, s1, s2)
+      copy_scalars = .not. hts_dbg_skip_idle
+      nullify(state, rho1, rho2, th1, th2, w1, w2, u1, u2, s1, s2)
       call mpas_pool_get_subpool(block % structs, 'state', state)
-      call mpas_pool_get_array(state, 'scalars', s1, 1)
-      call mpas_pool_get_array(state, 'scalars', s2, 2)
-      if (.not. associated(s1) .or. .not. associated(s2)) return
+      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(state, 'theta_m', th1, 1)
+      call mpas_pool_get_array(state, 'theta_m', th2, 2)
+      call mpas_pool_get_array(state, 'w', w1, 1)
+      call mpas_pool_get_array(state, 'w', w2, 2)
+      call mpas_pool_get_array(state, 'u', u1, 1)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+      if (copy_scalars) then
+         call mpas_pool_get_array(state, 'scalars', s1, 1)
+         call mpas_pool_get_array(state, 'scalars', s2, 2)
+      end if
+      if (.not. associated(rho1) .or. .not. associated(th1) .or. .not. associated(w1)) return
+      if (.not. associated(rho2) .or. .not. associated(th2) .or. .not. associated(w2)) return
 
-      nScalars = size(s1, 1)
-      nVert = size(s1, 2)
-      ! hts_cell_level is allocated through the garbage cell.
-      nCopy = min(size(hts_cell_level) - 1, size(s1, 3), size(s2, 3))
+      nVert = min(size(th1, 1), size(th2, 1), size(rho1, 1), size(rho2, 1))
+      nW = min(size(w1, 1), size(w2, 1))
+      nCopy = min(size(hts_cell_level) - 1, size(th1, 2), size(th2, 2), size(rho1, 2), size(rho2, 2))
+      nScalars = 0
+      if (copy_scalars .and. associated(s1) .and. associated(s2)) nScalars = min(size(s1, 1), size(s2, 1))
 
       do iCell = 1, nCopy
          L = hts_cell_level(iCell)
@@ -2351,13 +2373,42 @@ module atm_time_integration
             if (mod(hts_tick, ratio) == ratio - 1) cycle
          end if
          do k = 1, nVert
-            do j = 1, nScalars
-               s2(j, k, iCell) = s1(j, k, iCell)
+            rho2(k, iCell) = rho1(k, iCell)
+            th2(k, iCell) = th1(k, iCell)
+         end do
+         if (iCell <= size(w1, 2) .and. iCell <= size(w2, 2)) then
+            do k = 1, nW
+               w2(k, iCell) = w1(k, iCell)
             end do
+         end if
+         if (nScalars > 0) then
+            if (iCell <= size(s1, 3) .and. iCell <= size(s2, 3)) then
+               do k = 1, min(nVert, size(s1, 2), size(s2, 2))
+                  do j = 1, nScalars
+                     s2(j, k, iCell) = s1(j, k, iCell)
+                  end do
+               end do
+            end if
+         end if
+      end do
+
+      if (.not. allocated(hts_edge_level)) return
+      if (.not. associated(u1) .or. .not. associated(u2)) return
+      nEdges = min(size(hts_edge_level) - 1, size(u1, 2), size(u2, 2))
+      nVert = min(nVert, size(u1, 1), size(u2, 1))
+      do iEdge = 1, nEdges
+         L = hts_edge_level(iEdge)
+         if (L <= 0 .or. L > hts_max_level_used) cycle
+         if (idle_only) then
+            ratio = ishft(1, L)
+            if (mod(hts_tick, ratio) == ratio - 1) cycle
+         end if
+         do k = 1, nVert
+            u2(k, iEdge) = u1(k, iEdge)
          end do
       end do
 
-   end subroutine atm_hts_copy_idle_scalars
+   end subroutine atm_hts_copy_idle_state
 
 
 
@@ -10297,8 +10348,11 @@ module atm_time_integration
    subroutine hts_probe_cell(domain)
 
       ! One line per fine step for config_hts_debug_probe_cell. The index is
-      ! the Fortran cell (a 0-based history id plus one). w, theta, qv, and
-      ! rho are time level 2, which this step is about to publish.
+      ! the Fortran cell (a 0-based history id plus one). w, th, qv, and rho
+      ! are time level 2 at the level of max |w|, which this step is about
+      ! to publish. th1 and qv1 are theta_m and qv at k=1. td1 is
+      ! theta_m / (1 + Rv/Rd * qv) at k=1, the dry potential temperature
+      ! written to history.
 
       use mpas_log, only : mpas_log_write
 
@@ -10316,7 +10370,9 @@ module atm_time_integration
       integer :: iCell, iLocal, iEdge, i, k, kw, L, ratio, closed, own, err_level
       integer :: L_s, closed_s, kw_s
       real (kind=RKIND) :: wmax, thv, qv, rhov, t2, tsk, usfc, gmax, gmax_s
+      real (kind=RKIND) :: th1v, qv1v, td1v
       real (kind=RKIND) :: own_r, own_s, wmax_s, th_s, qv_s, rho_s, t2_s, tsk_s, usfc_s
+      real (kind=RKIND) :: th1_s, qv1_s, td1_s
       real (kind=RKIND) :: L_r, closed_r, kw_r, L_out, closed_out, kw_out
 
       iCell = hts_dbg_probe_cell
@@ -10332,6 +10388,9 @@ module atm_time_integration
       tsk = 0.0_RKIND
       usfc = 0.0_RKIND
       gmax = 0.0_RKIND
+      th1v = 0.0_RKIND
+      qv1v = 0.0_RKIND
+      td1v = 0.0_RKIND
 
       nullify(state, diag_physics, mesh, w, th, rho, u, scalars, t2m, skintemp)
       nullify(edgesOnCell, nEdgesOnCell, indexToCellID, nCellsSolve, index_qv)
@@ -10384,6 +10443,15 @@ module atm_time_integration
                   qv = scalars(index_qv, k, iLocal)
                end if
             end if
+            ! k=1 is the surface. th1 is theta_m. td1 is the dry potential
+            ! temperature history writes from theta_m and qv.
+            if (size(th, 1) >= 1) th1v = th(1, iLocal)
+            if (associated(index_qv) .and. associated(scalars)) then
+               if (index_qv >= 1 .and. index_qv <= size(scalars, 1) .and. size(scalars, 2) >= 1) then
+                  qv1v = scalars(index_qv, 1, iLocal)
+               end if
+            end if
+            td1v = th1v / (1.0_RKIND + rvord * qv1v)
             usfc = 0.0_RKIND
             do i = 1, nEdgesOnCell(iLocal)
                iEdge = edgesOnCell(i, iLocal)
@@ -10438,6 +10506,12 @@ module atm_time_integration
       call mpas_dmpar_sum_real(domain % dminfo, L_r, L_out)
       call mpas_dmpar_sum_real(domain % dminfo, closed_r, closed_out)
       call mpas_dmpar_sum_real(domain % dminfo, kw_r, kw_out)
+      th1_s = real(own, RKIND) * th1v
+      qv1_s = real(own, RKIND) * qv1v
+      td1_s = real(own, RKIND) * td1v
+      call mpas_dmpar_sum_real(domain % dminfo, th1_s, th1v)
+      call mpas_dmpar_sum_real(domain % dminfo, qv1_s, qv1v)
+      call mpas_dmpar_sum_real(domain % dminfo, td1_s, td1v)
       call mpas_dmpar_max_real(domain % dminfo, gmax, gmax_s)
       own = 0
       if (own_s > 0.0_RKIND) own = 1
@@ -10445,10 +10519,10 @@ module atm_time_integration
       closed_s = nint(closed_out)
       kw_s = nint(kw_out)
 
-      call mpas_log_write('HTS probe tick $i cell $i own $i L $i closed $i k $i w $r th $r qv $r rho $r t2 $r tsk $r usfc $r gmax|w| $r', &
+      call mpas_log_write('HTS probe tick $i cell $i own $i L $i closed $i k $i w $r th $r qv $r rho $r t2 $r tsk $r usfc $r gmax|w| $r th1 $r qv1 $r td1 $r', &
                           masterOnly=.true., flushNow=.true., &
                           intArgs=(/hts_tick, iCell, own, L_s, closed_s, kw_s/), &
-                          realArgs=(/wmax, thv, qv, rhov, t2, tsk, usfc, gmax_s/))
+                          realArgs=(/wmax, thv, qv, rhov, t2, tsk, usfc, gmax_s, th1v, qv1v, td1v/))
 
    end subroutine hts_probe_cell
 

@@ -294,7 +294,7 @@ Job 201388 reran `2022d65c7` with `config_hts_max_level = 1` (885 cells at 30 s,
 
 Jobs 200248, 201338, and 201388 made the onset look like a function of the coarse step: about 02:30 at 240 s, 03:30 at 120 s, and 04:00–04:30 at 60 s, with the same ×1.5–2.3 per 30 min once it started. Two `c12f3c629` ablations at `config_hts_max_level = 1` removed that reading. Kessler at `config_dt` (`pbl_substeps = 1`, `kessler_substeps = 0`, log `Kessler uses 2 calls of 30 s`) and every process at `config_dt` (`micro_substeps = 0`, `pbl_substeps = 0`, log `coarse level 1: micro substeps 2, pbl substeps 2`) both tracked the 60 s baseline. Cell 3177 `w` at 04:00, 05:00, 06:00, 07:00, and 08:00 was 0.055 / 0.126 / 0.294 / 0.827 / 3.78 on the baseline, 0.057 / 0.127 / 0.293 / 0.828 / 3.82 with Kessler at 30 s, and 0.066 / 0.123 / 0.294 / 0.904 / 4.07 with every process at 30 s. All-fine was 0.047 at 04:00 and 0.112 at 08:00. Edge 41342 `|u|` was 58.5, 58.9, and 60.6 against all-fine 24.9. Global max `|u|` stayed within 0.05 m/s, `w` relative L2 was 1.39–1.40 at 08:00, edge 64121 was quiet, and dry-mass drift was −2.5×10⁻⁹. The largest edge difference grew from 6.8 to 33 m/s on the level-0 Sahara patch (28°N, 1–3°E, k30–40). About 305 edges at the level-0/1 interface near 27–28°N had k0 `|Δu|` > 5. Run B does twice the dynamics-tendency and scalar-advection calls of all-fine and was 0.83×. The Kessler-only run was 1.155×.
 
-`config_hts_debug_force_path` with every cell at level 0 (job 201473) was bit-identical to all-fine for 8 h, about 2% slower. The 3177 growth turns on when a level ≥ 1 exists. It does not depend on the coarse dt or on the Kessler, PBL, or dynamics cadence. Run B takes two 30 s dynamics steps and two 30 s surface calls through the level-1 path and still matches the single 60 s step. What those runs share, and the level-0 force path does not exercise on a coarse column, is the hold and restore, the time-level promote between substeps, the `ruAvg` mean and the single mass correction, the per-level scalar commit and the idle-scalar copy, the latched radiation alarm (`hts_note_physics_alarms`), diagnostics that physics reads on a coarse column, and the acoustic `*_pp` restart on inactive neighbors. Cell 3177 (16°S, 137°E) is about 99 hops from a finer cell. A 20 m/s signal from the interface does not reach it in 4 h, and the visible growth starts near 13:30 local. The mass correction and the acoustic lock only touch interface edges. They stay in the switch list because run B still executes them.
+`config_hts_debug_force_path` with every cell at level 0 (job 201473) was bit-identical to all-fine for 8 h, about 2% slower. The 3177 growth turns on when a level ≥ 1 exists. It does not depend on the coarse dt or on the Kessler, PBL, or dynamics cadence. Run B takes two 30 s dynamics steps and two 30 s surface calls through the level-1 path and still matches the single 60 s step. What those runs share, and the level-0 force path does not exercise on a coarse column, is the hold and restore, the time-level promote between substeps, the `ruAvg` mean and the single mass correction, the per-level scalar commit and the idle-scalar copy, the latched radiation alarm (`hts_note_physics_alarms`), diagnostics that physics reads on a coarse column, and the acoustic `*_pp` restart on inactive neighbors. Cell 3177 (16°S, 137°E) is about 99 hops from a finer cell. A 20 m/s signal from the interface does not reach it in 4 h, and the visible growth starts near 13:30 local. The mass correction and the acoustic lock only touch interface edges. They stay in the switch list because run B still executes them. The 8db2f20c9 bisect below turned each of those off in turn. The idle copy is the one that moves the column. The open-tick shift after the switch list is the mechanism, and the tip copies the prognostics with the scalars.
 
 The diabatic rate is not long by 2^L. `hts_push_microp_dt` sets `dt_dyn` to the SRK3 dt before Kessler, `post_microphysics` divides the theta change by that dt, and the RK3 subtract removes the same heat from `rtheta_p`. `w` is not subtracted. That is the same one-step lag all-fine has. Extra Kessler calls inside one dynamics step do not move the onset, and the 30 s Kessler ablation above did not either.
 
@@ -313,26 +313,46 @@ Debug switches, all default off. `config_hts_debug_match_fine` turns on the firs
 
 - `config_hts_debug_refresh_diag`. Before each column-physics call on a level above 0, rebuild `exner`, `pressure_p`, `rho_p`, and `rtheta_p` from time level 1 and reconstruct the cell wind after copying `u` time level 2 from time level 1 on that level's edges.
 - `config_hts_debug_rad_every_substep`. While a coarse step takes more than one substep, restore a latched radiation or convection alarm before substeps 2..N. A single level-dt call is unchanged, so on the 60 s baseline this flag does nothing.
-- `config_hts_debug_skip_idle_copy`. Skip both idle-scalar copies.
+- `config_hts_debug_skip_idle_copy`. Skip the scalars inside the idle-state copy. `rho_zz`, `theta_m`, `w`, and `u` are still copied. The 8db2f20c9 switch skipped the whole scalar copy and left every prognostic on the previous buffer.
 - `config_hts_debug_skip_mass_correct`. Skip the interface mass correction.
 - `config_hts_debug_ruavg_last`. Leave `ruAvg` at the last substep. `wwAvg` is already rebuilt inside each SRK3. The mass correction then sees that last flux against the full-interval target.
 - `config_hts_debug_skip_promote`. Do not copy time level 2 onto time level 1 between dynamics substeps.
 - `config_hts_debug_keep_pp`. Do not zero `rho_pp`, `rtheta_pp`, and `rw_p` on inactive acoustic neighbors. That is the job 199953 configuration. It can blow the interface and is not part of `match_fine`.
-- `config_hts_debug_probe_cell`. Fortran cell index, printed every fine step on rank 0. 0 disables it. The eds history cell 3177 is 3178. The line is `HTS probe tick cell own L closed k w th qv rho t2 tsk usfc gmax|w|`. `k` is the vertical index of that `w` (1 is the surface). `L` is the mesh level. `closed` is 1 when that level stepped on this tick.
+- `config_hts_debug_probe_cell`. Fortran cell index, printed every fine step on rank 0. 0 disables it. The eds history cell 3177 is 3178. The line is `HTS probe tick cell own L closed k w th qv rho t2 tsk usfc gmax|w| th1 qv1 td1`. `k` is the vertical index of that `w` (1 is the surface). `L` is the mesh level. `closed` is 1 when that level stepped on this tick. `th` and `qv` are `theta_m` and water vapor at that `k`. `th1` and `qv1` are `theta_m` and water vapor at k=1. `td1` is `theta_m / (1 + Rv/Rd * qv)` at k=1, the dry potential temperature history writes. `qv1` is kg/kg.
 
-Run B is the config_dt path through level-1 machinery: `config_hts_max_level = 1`, `config_hts_micro_substeps = 0`, `config_hts_pbl_substeps = 0`. The log must say `coarse level 1: micro substeps 2, pbl substeps 2` and must not warn about an acoustic restart. `match_fine` on that namelist is the first pair. If cell 3177 still tracks the 60 s series, refresh and radiation are not sufficient and the one-flag runs are next. The probe is the early signal. A 30 min history can still look quiet at 3177 because the visible growth starts near 04:00.
+Run B is the config_dt path through level-1 machinery: `config_hts_max_level = 1`, `config_hts_micro_substeps = 0`, `config_hts_pbl_substeps = 0`. The log must say `coarse level 1: micro substeps 2, pbl substeps 2, dt 60` and must not warn about an acoustic restart.
 
-| run | namelist besides `config_hts_max_level = 1` |
-| --- | --- |
-| B + match_fine | `micro_substeps = 0`, `pbl_substeps = 0`, `debug_match_fine = true`, `debug_probe_cell = 3178` |
-| refresh only | B plus `debug_refresh_diag = true` |
-| radiation only | B plus `debug_rad_every_substep = true` |
-| skip idle copy | B plus `debug_skip_idle_copy = true` |
-| skip mass correction | B plus `debug_skip_mass_correct = true` |
-| last ruAvg | B plus `debug_ruavg_last = true` |
-| skip promote | B plus `debug_skip_promote = true` |
-| keep pp, optional | B plus `debug_keep_pp = true` |
+The 8db2f20c9 bisect ran that namelist for 8 h with one switch at a time (probe cell 3178, all-fine reused). Cell 3177 `|w|`:
 
-`pbl_substeps = 1` with `micro_substeps = 1` is the reverted 60 s baseline and should reproduce job 201388. An explicit `pbl_substeps = 0` with `micro_substeps = 1` is the fold that already failed. The 2 h gate still includes the max per-edge `|u|` difference and max `|u|` for `k ≤ 5`. These switches do not claim to fix cell 3177. They name the first field that moves. A local Kessler run on `sp8.24755` has PBL, surface, and radiation off, so it cannot see this column.
+| t | allfine | B | mf | rad | refresh | mass | ruavg | promote | idle |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 04:00 | 0.047 | 0.066 | 0.068 | 0.061 | 0.066 | 0.066 | 0.066 | 0.066 | 0.044 |
+| 05:00 | 0.048 | 0.123 | 0.126 | 0.125 | 0.123 | 0.123 | 0.123 | 0.122 | 0.066 |
+| 05:30 | 0.051 | 0.192 | 0.197 | 0.195 | 0.192 | 0.193 | 0.190 | 0.181 | 0.079 |
+| 06:00 | 0.059 | 0.294 | 0.299 | 0.298 | 0.294 | | | | 0.102 |
+| 07:00 | 0.077 | 0.904 | | | | | | | 0.184 |
+| 08:00 | 0.112 | 4.069 | | | | | | | 0.388 |
+
+`match_fine`, radiation, and diagnostic refresh tracked B and were cancelled around 06:00–06:30. Mass correction, last `ruAvg`, and skip-promote tracked B and were cancelled around 05:30. Skip-idle ran the full 8 h, critical 0, at 0.834×. Edge 41342 `|u|` followed B on every leg except skip-idle, which stayed near 25.0 against all-fine 24.9 (B was 60.6). Global max `|u|` stayed within 0.05 m/s on every leg. `k ≤ 5` and edge 64121 stayed quiet. The mf probe at 00:30 already had dry theta about −0.5 K and `qv` about +1.05 g/kg at k0 against all-fine, on ocean with SST and skin temperature frozen at 320.5 K. `|w|` growth starts near 04:00 as the modal level drops from about k=36 to k=11 (about 13:00 local). Growth ratios on radiation ticks and on other ticks were about 1.00 and 1.01.
+
+No switch removed the growth. Skip-idle delayed the onset by about 1–1.5 h and cut 08:00 `|w|` from 4.07 to 0.388, and the column was still growing by about ×1.4 per 30 min after 05:00.
+
+The shift publishes time level 2 and rotates the old time level 1 into time level 2 (`mpas_pool_shift_time_levels`: time level 1 becomes time level n). After a level-1 close, time level 2 is the completed step and time level 1 is the state after the first substep, because the promote copies time level 2 onto time level 1 only when another substep remains. The next tick is the open tick. `apply_interpolation` and `restore_above` both skip a level when `mod(hts_tick, 2^L)` is 0, and the RK setup copies time level 1 onto time level 2 only on the active level. The idle-scalar copy then wrote the completed moisture into time level 2 and left `rho_zz`, `theta_m`, `w`, and `u` one substep behind. History theta is `theta_m / (1 + Rv/Rd * qv)`. At about 300 K and `qv` near 0.02 kg/kg, an extra 1.05 g/kg with no matching `theta_m` increment is about −0.5 K. The following close starts from that split. Over a 320.5 K ocean the bulk moisture flux uses `qsat(SST) − qv`, and the too-cold air raises the transfer coefficient, so the extra evaporation accumulates. Skip-idle left theta and `qv` on the same stale buffer, which removes the split and keeps a one-substep lag. That lag is why the growth slowed and did not stop.
+
+`atm_hts_copy_idle_state` now copies `rho_zz`, `theta_m`, `w`, `u`, and the scalars from time level 1 onto time level 2. The call before the fine step makes the fine flux read the committed column. The call before the shift covers every coarser column that did not close, so the shift cannot publish new moisture with the previous `theta_m`. A level that closed on this tick is skipped on the second call, and its new time level 2 is kept. Cells and edges at level 0 are never copied. An edge shared with a finer cell stays at level 0, because the edge level is the minimum of its cells, so the fine step's new `u` is left in place. The force path keeps every cell at level 0 and the copy does nothing. `config_hts_debug_skip_idle_copy` still skips the scalars only.
+
+The next eds pair is run B with the probe and with the other debug switches off:
+
+```
+config_hts = true
+config_hts_max_level = 1
+config_hts_micro_substeps = 0
+config_hts_pbl_substeps = 0
+config_hts_debug_probe_cell = 3178
+```
+
+Rebuild the dynamics objects. `gen_includes` is not required when the tree already has the 8db2f20c9 namelist. The probe line must contain `th1`, `qv1`, and `td1`. 2 h is the safety check (no polar fold, edge 64121 quiet, dry-mass drift near 1e-9, `k ≤ 5` `|u|` within a few m/s). 8 h is the cell 3177 test: 00:30 k0 dry theta and `qv` against the old −0.5 K / +1.05 g/kg, and 08:00 `|w|` against all-fine 0.112 and the old B value 4.069. A quiet 2 h is not a pass. The local Kessler mesh has PBL, surface, and radiation off, so it cannot see this column.
+
+`pbl_substeps = 1` with `micro_substeps = 1` is the reverted 60 s baseline and should reproduce job 201388. An explicit `pbl_substeps = 0` with `micro_substeps = 1` is the fold that already failed. The 2 h gate still includes the max per-edge `|u|` difference and max `|u|` for `k ≤ 5`.
 
 Acoustic work on the 120 s cap does not change relative to the 240 s split: both take 48 acoustic steps of 5 s per 240 s. The measured 120 s pair was 1.48× at 2 h and 1.40× at 8 h (jobs 201325 and 201338). Calling PBL at a fine dt and then multiplying the stored rate by a long dynamics step is the `902a6084d` failure and is not the default.
