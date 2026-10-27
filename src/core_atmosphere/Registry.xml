@@ -173,7 +173,7 @@
 
                 <nml_option name="config_hts_cf_match_acoustic" type="logical" default_value="false"
                      units="-"
-                     description="When config_hts_coarse_first is true, multiply the acoustic substep count by 2^L, which is what the fine-first path always does. Off keeps config_number_of_sub_steps on every level. The fine-first path ignores this switch."
+                     description="When config_hts_coarse_first is true, multiply the acoustic substep count by 2^L, which is what the fine-first path always does. With the default integration order 2 that scales every RK stage, so the acoustic dt matches a fine step. Order 3 leaves stage 1 as one substep of dt/3. Off keeps config_number_of_sub_steps on every level. The fine-first path ignores this switch."
                      possible_values="Logical values"/>
 
                 <nml_option name="config_hts_cf_use_moist_cap" type="logical" default_value="false"

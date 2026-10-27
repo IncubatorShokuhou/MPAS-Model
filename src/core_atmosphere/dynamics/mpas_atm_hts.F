@@ -258,6 +258,9 @@ module mpas_atm_hts
       integer, pointer :: config_hts_micro_substeps
       integer, pointer :: config_hts_pbl_substeps
       integer, pointer :: config_hts_kessler_substeps
+      integer, pointer :: config_time_integration_order, config_number_of_sub_steps
+      integer :: nsub, integOrder, acousticScale
+      real (kind=RKIND) :: dt_coarse, acoustic_dt
       integer, pointer :: nCells, nCellsSolve, nEdges, nEdgesSolve, nVertLevels
       integer, dimension(:,:), pointer :: cellsOnEdge, cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
@@ -557,9 +560,30 @@ module mpas_atm_hts
             call mpas_log_write(' coarse-first: parent steps first; spec zone is $i rings; buffer rings $i', &
                                 intArgs=(/hts_spec_rings, hts_buffer_rings/))
             if (hts_cf_match_acoustic) then
-               call mpas_log_write(' coarse-first acoustic match is on; coarse levels still take 2^L acoustic substeps')
+               call mpas_log_write(' coarse-first acoustic match is on; coarse levels take 2^L acoustic substeps')
             else
                call mpas_log_write(' coarse-first acoustic match is off; each level keeps config_number_of_sub_steps')
+            end if
+            if (associated(config_dt) .and. hts_max_level_used >= 1) then
+               nullify(config_time_integration_order, config_number_of_sub_steps)
+               call mpas_pool_get_config(block % configs, 'config_time_integration_order', config_time_integration_order)
+               call mpas_pool_get_config(block % configs, 'config_number_of_sub_steps', config_number_of_sub_steps)
+               integOrder = 2
+               nsub = 1
+               if (associated(config_time_integration_order)) integOrder = config_time_integration_order
+               if (associated(config_number_of_sub_steps)) nsub = config_number_of_sub_steps
+               if (nsub < 1) nsub = 1
+               acousticScale = 1
+               if (hts_cf_match_acoustic) acousticScale = ishft(1, hts_max_level_used)
+               dt_coarse = config_dt * real(ishft(1, hts_max_level_used), RKIND)
+               if (integOrder == 3) then
+                  call mpas_log_write(' coarse-first order 3: stage 1 is one substep of $r s; stages 2 and 3 use $r s', &
+                                      realArgs=(/dt_coarse / 3.0_RKIND, dt_coarse / real(nsub * acousticScale, RKIND)/))
+               else
+                  acoustic_dt = dt_coarse / real(nsub * acousticScale, RKIND)
+                  call mpas_log_write(' coarse-first order $i: acoustic dt is $r s on every RK stage', &
+                                      intArgs=(/integOrder/), realArgs=(/acoustic_dt/))
+               end if
             end if
             if (hts_cf_use_moist_cap) then
                call mpas_log_write(' coarse-first moist cap is on; moist max level $i applies', intArgs=(/hts_moist_max_level/))
