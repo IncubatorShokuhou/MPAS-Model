@@ -1978,6 +1978,13 @@ module atm_time_integration
          return
       end if
 
+      ! Coarse-first is a separate driver. The fine-first body below, including
+      ! the hold, the lock, and the idle copy, does not run.
+      if (hts_coarse_first .and. hts_max_level_used >= 1) then
+         call hts_coarse_first_driver(domain, dt, itimestep, exchange_halo_group)
+         return
+      end if
+
       call atm_hts_begin_intervals(block)
       ! Time level 2 is what the flux reads, and the core shift publishes it.
       ! The RK setup copies time level 1 onto time level 2 only on the active
@@ -2034,6 +2041,98 @@ module atm_time_integration
       hts_micro_split = .false.
 
    end subroutine atm_hts_advance
+
+
+   subroutine hts_coarse_first_driver(domain, dt, itimestep, exchange_halo_group)
+
+      ! One fine step. Coarser levels that open an interval step first, from
+      ! the top down, and keep both endpoints. The level that is stepping
+      ! reads its specified zone from the parent endpoints at the middle of
+      ! its own step. Interface edges stay with the finer level. Reflux runs
+      ! when that coarser interval closes. This routine does not copy idle
+      ! columns and does not call the fine-first coupled splitter.
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+      real (kind=RKIND), intent(in) :: dt
+      integer, intent(in) :: itimestep
+      procedure (halo_exchange_routine) :: exchange_halo_group
+
+      integer :: L, ratio
+      real (kind=RKIND) :: dt_level
+
+      hts_masking = .true.
+      hts_impose = .false.
+      hts_acoustic_shift = -1
+      hts_acoustic_steps = 0
+
+      ! Time level 2 is what the tendency reads. Match it to the committed
+      ! state before the first coarse step. Levels that step later in this
+      ! call leave the time level 2 they wrote.
+      call atm_hts_cf_commit_to_tl2(block)
+
+      do L = hts_max_level_used, 1, -1
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) /= 0) cycle
+         dt_level = dt * real(ratio, RKIND)
+         hts_active_level = L
+         hts_impose = .false.
+         call atm_hts_cf_apply(block, L)
+         call atm_hts_cf_halo(block)
+         call atm_hts_cf_save(block, L, .true.)
+         ! Hold interface ru for this coarse step. The fine level owns the
+         ! edge and integrates it later; reflux replaces the coarse mass.
+         call atm_hts_cf_zero_ru_p(block, L)
+         hts_impose = .true.
+#ifdef DO_PHYSICS
+         call hts_level_column_physics(domain, itimestep, L, dt_level)
+#endif
+         call atm_srk3(domain, dt_level, itimestep, exchange_halo_group)
+         hts_impose = .false.
+         call atm_hts_cf_disarm()
+#ifdef DO_PHYSICS
+         call hts_clear_column_mask()
+#endif
+         call atm_hts_cf_save(block, L, .false.)
+         call atm_hts_cf_accum(block, L, dt_level)
+         call atm_hts_cf_restore(block, L)
+         call atm_hts_cf_halo(block)
+      end do
+
+      hts_active_level = 0
+      hts_impose = .false.
+      call atm_hts_cf_apply(block, 0)
+      call atm_hts_cf_halo(block)
+#ifdef DO_PHYSICS
+      call hts_level_column_physics(domain, itimestep, 0, dt)
+#endif
+      call atm_srk3(domain, dt, itimestep, exchange_halo_group)
+#ifdef DO_PHYSICS
+      call hts_clear_column_mask()
+#endif
+      call atm_hts_cf_accum(block, 0, dt)
+      call atm_hts_cf_restore(block, 0)
+      call atm_hts_cf_halo(block)
+
+      do L = 1, hts_max_level_used
+         ratio = ishft(1, L)
+         if (mod(hts_tick, ratio) /= ratio - 1) cycle
+         dt_level = dt * real(ratio, RKIND)
+         call atm_hts_cf_reflux(block, L, dt_level)
+      end do
+      call atm_hts_cf_halo(block)
+
+      hts_masking = .false.
+      hts_active_level = 0
+      hts_impose = .false.
+      if (hts_dbg_probe_cell > 0) call hts_probe_cell(domain)
+      hts_tick = hts_tick + 1
+      hts_acoustic_shift = -1
+      hts_acoustic_steps = 0
+
+   end subroutine hts_coarse_first_driver
+
 
 
    subroutine hts_coarse_coupled_step(domain, itimestep, exchange_halo_group, L, dt_level, ratio)
@@ -2697,10 +2796,14 @@ module atm_time_integration
       ! Match the fine acoustic step on coarser levels. A longer acoustic step
       ! put the w error on the interface cells and the solution later became NaN.
       ! A micro substep passes the absolute count that keeps that same acoustic dt.
+      ! Coarse-first keeps the namelist count unless config_hts_cf_match_acoustic
+      ! is set. The fine-first path does not read that switch.
       if (hts_acoustic_steps > 0) then
          number_of_sub_steps = hts_acoustic_steps
       else if (hts_masking .and. hts_active_level > 0) then
-         if (hts_acoustic_shift >= 0) then
+         if (hts_coarse_first .and. .not. hts_cf_match_acoustic) then
+            number_of_sub_steps = config_number_of_sub_steps
+         else if (hts_acoustic_shift >= 0) then
             number_of_sub_steps = number_of_sub_steps * ishft(1, hts_acoustic_shift)
          else
             number_of_sub_steps = number_of_sub_steps * ishft(1, hts_active_level)

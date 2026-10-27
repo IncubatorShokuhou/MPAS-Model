@@ -360,3 +360,34 @@ Cell levels are assigned once from `meshDensity`. `hts_promote_active_state` cop
 `pbl_substeps = 1` with `micro_substeps = 1` is the reverted 60 s baseline and should reproduce job 201388. An explicit `pbl_substeps = 0` with `micro_substeps = 1` is the fold that already failed. The 2 h gate still includes the max per-edge `|u|` difference and max `|u|` for `k ≤ 5`.
 
 Acoustic work on the 120 s cap does not change relative to the 240 s split: both take 48 acoustic steps of 5 s per 240 s. The measured 120 s pair was 1.48× at 2 h and 1.40× at 8 h (jobs 201325 and 201338). Calling PBL at a fine dt and then multiplying the stored rate by a long dynamics step is the `902a6084d` failure and is not the default.
+
+## Coarse-first mode
+
+`config_hts_coarse_first` (default **false**) is a separate driver. The fine-first path above, including the interface lock, the failed interp ramp, the moist cap, and the substep knobs, does not read it. `config_hts_max_level = 0` and `config_hts_debug_force_path` still return before that driver. An off-path `sp8` history (`u`, `w`, `rho`, `theta`, `pressure`) matched the previous binary bit for bit.
+
+The driver steps the coarsest open level first and saves the specified-zone state before and after that step. A finer level then reads that zone by linear interpolation between those two realized states, at the midpoint of its own step, so the weight stays in `[0, 1]`. The zone is the coarser cells within `max(2, config_hts_buffer_rings)` rings of a finer cell. Interface edges stay with the finer level and take a full `tend_u` there. During the coarse step those edges are held at the pre-step `ru` (`ru_save` and the impose target), because the acoustic mass update and the scalar flux both read the edge and a stale `ruAvg` (often zero) dropped the face flux. Reflux, when the coarse interval closes, corrects the coarse cell's mass, theta, and scalars on both time levels and does not write `u` or `ru`. Tendencies read time level 2. The initial time level 2 on this mesh was not the committed state (`theta_m` differed by about 1500 K), so the driver copies time level 1 onto time level 2 once per advance before the first coarse step.
+
+Level smoothing runs only when the switch is on, before edge levels are assigned. Neighbours are brought to `|ΔL| ≤ 1`, then `config_hts_buffer_rings` (default 2) rings are promoted toward a finer neighbour, then a band thinner than that buffer is merged downward. The merge stops after 8 passes so the `|ΔL| ≤ 1` repair cannot walk a one-cell ring across the coarse region. On `sp8` with the switch on and `B = 2`, the logged minimum interior width was 1 at `max_level = 3` (level counts 1069 / 887 / 112 / 22687; the 112 level-2 cells were all in the spec zone) and −1 at `max_level = 1` (one band).
+
+Inside this mode only:
+
+- `config_hts_cf_match_acoustic` (default **false**) keeps `config_number_of_sub_steps` on coarse levels. The fine-first path still multiplies by `2^L`. Stage 1 is still one acoustic substep of `dt/3`, as in the existing integrator. A 4 min `sp8` Kessler run (PBL off) at level 1 (60 s) and at level 3 (240 s) stayed near `|w|` 0.04 and `|u|` 35 with the match off, after the time-level copy. The NaN seen before that copy was the stale theta, and it happened with the match on and off. eds has not run this. If a 2 h leg NaNs, set the match true before adding anything else. Do not add diffusion.
+- `config_hts_cf_use_moist_cap` (default **false**) leaves the active level at `config_hts_max_level`. The fine-first path still caps moist runs at `config_hts_moist_max_level` (2, 120 s). The 240 s cell-3177 failure predates the tendfix and has not been retested on eds. The local 4 min run had PBL off, so it does not speak for cell 3177. If a 2 h leg grows 3177, set this cap true.
+- The driver takes one column-physics call and one SRK3 per level step. It does not call `hts_coarse_coupled_step`, so `micro_substeps = 0` and `pbl_substeps = 0` do not fold or split on this path. Kessler's own sedimentation split stays. The tendfix (mono-stage idle skip and `scalars_tend` zero) stays.
+
+The reference for the existing mode is still the hold, jobs 201773 and 202088, and the failed interp A/B. Do not claim cell 3177 or edge 64121 under the new mode until eds runs it. A quiet 2 h is not a pass. The 8 h then 24 h comparison is against all-fine: the k0 `|Δu| > 5` curve 17 / 54 / 114 / 371, the k≈31 single-edge maximum (48.8 m/s at 24 h), cell 3177, edge 64121, and speedup against 1.46× (0–8 h) and 1.33× overall. If the stuck interface edge is the source, that upper `|Δu|` should fall, because the fine level now integrates it against a boundary that lies between two realized coarse states. A 2 h NaN or `|u|` running away to about 160 means turn the mode off.
+
+With the cap off, the level-3 step is `config_dt * 8` (240 s at `config_dt = 30`). History output has to be a multiple of that step. Hourly output divides 240 s. A 30 min output does not. With the cap on, the coarse step is 120 s and both divide.
+
+`config_dt = 30` s on a minimum spacing of about 16.7 km is about 1.8 s/km. A usual MPAS step on that spacing is about 5–6 s/km. The same 30 s step is what both legs use today. Raising it is a separate choice for both the all-fine leg and this mode; this tree does not change `config_dt`.
+
+eds must run `make gen_includes` before compiling. The generated `inc/` is not part of the commit. The A/B namelist, on top of the production hold, is:
+
+```
+config_hts = true
+config_hts_max_level = 3
+config_hts_coarse_first = true
+config_hts_buffer_rings = 2
+```
+
+Leave `config_hts_cf_match_acoustic` and `config_hts_cf_use_moist_cap` unset so the in-mode defaults (both false) apply. Leave `config_hts_interface_interp` false. Probe off for timing.

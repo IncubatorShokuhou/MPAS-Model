@@ -30,6 +30,10 @@ module mpas_atm_hts
    public :: hts_diagnostics_from_state
    public :: atm_hts_mark_acoustic_cells
    public :: hts_cell_acoustic
+   public :: atm_hts_cf_apply, atm_hts_cf_restore, atm_hts_cf_halo
+   public :: atm_hts_cf_save, atm_hts_cf_zero_ru_p, atm_hts_cf_disarm
+   public :: atm_hts_cf_commit_to_tl2
+   public :: atm_hts_cf_accum, atm_hts_cf_reflux
 
    logical, public :: hts_enabled = .false.
    logical, public :: hts_masking = .false.
@@ -69,6 +73,16 @@ module mpas_atm_hts
    ! kept; levels above stay on the snapshot flux.
    logical, public :: hts_iface_interp = .false.
    integer, parameter, public :: hts_iface_kmax = 6
+   ! config_hts_coarse_first. Off leaves the fine-first hold, the binning,
+   ! the moist cap, and the acoustic 2^L count unchanged. On, the coarser
+   ! level steps first. A finer level reads a specified zone of coarser
+   ! cells interpolated between the two realized coarse states, owns the
+   ! interface edges, and refluxes mass, theta, and scalars at the close.
+   logical, public :: hts_coarse_first = .false.
+   integer, public :: hts_buffer_rings = 2
+   integer, public :: hts_spec_rings = 2
+   logical, public :: hts_cf_match_acoustic = .false.
+   logical, public :: hts_cf_use_moist_cap = .false.
 
    integer, public, allocatable :: hts_cell_level(:)
    integer, public, allocatable :: hts_edge_level(:)
@@ -188,6 +202,24 @@ module mpas_atm_hts
    integer :: hts_index_qv = 0
    logical :: hts_qv_ok = .false.
 
+   ! Coarse-first ring state. Index 3 is the level that owns the ring: cells
+   ! at that level within hts_spec_rings of a finer cell, and edges whose
+   ! level is that level and that touch such a cell. Slot 1 is the state
+   ! before the level step, slot 2 is the state after it.
+   logical, allocatable :: hts_cf_cell(:,:)
+   logical, allocatable :: hts_cf_edge(:,:)
+   logical :: hts_cf_have(0:hts_level_cap) = .false.
+   real (kind=RKIND), allocatable :: hts_cf_rho(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_th(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_w(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_rw(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_sc(:,:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_u(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_ru(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_re(:,:,:,:)
+   real (kind=RKIND), allocatable :: hts_cf_ru_before(:,:)
+   integer :: hts_cf_nscal = 0
+
    logical, allocatable :: hts_level_started(:)
    integer :: hts_nCells, hts_nEdges, hts_nVert
    integer :: hts_correct_logs
@@ -216,6 +248,11 @@ module mpas_atm_hts
       logical, pointer :: config_hts_debug_keep_pp
       integer, pointer :: config_hts_debug_probe_cell
       logical, pointer :: config_hts_interface_interp
+      logical, pointer :: config_hts_coarse_first
+      integer, pointer :: config_hts_buffer_rings
+      logical, pointer :: config_hts_cf_match_acoustic
+      logical, pointer :: config_hts_cf_use_moist_cap
+      real (kind=RKIND), pointer :: config_dt
       integer, pointer :: config_hts_max_level
       integer, pointer :: config_hts_moist_max_level
       integer, pointer :: config_hts_micro_substeps
@@ -229,7 +266,7 @@ module mpas_atm_hts
       integer :: nBlocks
       integer, dimension(0:hts_level_cap) :: localCount, globalCount
       integer :: localIface, globalIface, globalOwned, globalOpen
-      real (kind=RKIND) :: mdMin, mdMax, mdMinG, mdMaxG, spacing, logtwo
+      real (kind=RKIND) :: mdMin, mdMax, mdMinG, mdMaxG, spacing, logtwo, workUnits
       logical :: uniform
 
       hts_enabled = .false.
@@ -241,6 +278,12 @@ module mpas_atm_hts
       hts_force_path = .false.
       hts_path_live = .false.
       hts_iface_interp = .false.
+      hts_coarse_first = .false.
+      hts_buffer_rings = 2
+      hts_spec_rings = 2
+      hts_cf_match_acoustic = .false.
+      hts_cf_use_moist_cap = .false.
+      hts_cf_have(:) = .false.
       hts_qv_ok = .false.
       hts_index_qv = 0
       hts_correct_logs = 0
@@ -268,6 +311,8 @@ module mpas_atm_hts
       nullify(config_hts_debug_rad_every_substep, config_hts_debug_skip_idle_copy, config_hts_debug_skip_mass_correct)
       nullify(config_hts_debug_ruavg_last, config_hts_debug_skip_promote, config_hts_debug_keep_pp)
       nullify(config_hts_debug_probe_cell, config_hts_interface_interp)
+      nullify(config_hts_coarse_first, config_hts_buffer_rings, config_hts_cf_match_acoustic, config_hts_cf_use_moist_cap)
+      nullify(config_dt)
       call mpas_pool_get_config(block % configs, 'config_hts_moist_max_level', config_hts_moist_max_level)
       call mpas_pool_get_config(block % configs, 'config_hts_micro_substeps', config_hts_micro_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_pbl_substeps', config_hts_pbl_substeps)
@@ -283,6 +328,11 @@ module mpas_atm_hts
       call mpas_pool_get_config(block % configs, 'config_hts_debug_keep_pp', config_hts_debug_keep_pp)
       call mpas_pool_get_config(block % configs, 'config_hts_debug_probe_cell', config_hts_debug_probe_cell)
       call mpas_pool_get_config(block % configs, 'config_hts_interface_interp', config_hts_interface_interp)
+      call mpas_pool_get_config(block % configs, 'config_hts_coarse_first', config_hts_coarse_first)
+      call mpas_pool_get_config(block % configs, 'config_hts_buffer_rings', config_hts_buffer_rings)
+      call mpas_pool_get_config(block % configs, 'config_hts_cf_match_acoustic', config_hts_cf_match_acoustic)
+      call mpas_pool_get_config(block % configs, 'config_hts_cf_use_moist_cap', config_hts_cf_use_moist_cap)
+      call mpas_pool_get_config(block % configs, 'config_dt', config_dt)
       hts_enabled = config_hts
       hts_moist_max_level = 2
       hts_micro_substeps = 1
@@ -320,6 +370,17 @@ module mpas_atm_hts
       if (hts_dbg_probe_cell < 0) hts_dbg_probe_cell = 0
       hts_iface_interp = .false.
       if (associated(config_hts_interface_interp)) hts_iface_interp = config_hts_interface_interp
+      hts_coarse_first = .false.
+      hts_buffer_rings = 2
+      hts_cf_match_acoustic = .false.
+      hts_cf_use_moist_cap = .false.
+      if (associated(config_hts_coarse_first)) hts_coarse_first = config_hts_coarse_first
+      if (associated(config_hts_buffer_rings)) hts_buffer_rings = config_hts_buffer_rings
+      if (associated(config_hts_cf_match_acoustic)) hts_cf_match_acoustic = config_hts_cf_match_acoustic
+      if (associated(config_hts_cf_use_moist_cap)) hts_cf_use_moist_cap = config_hts_cf_use_moist_cap
+      if (hts_buffer_rings < 0) hts_buffer_rings = 0
+      if (hts_buffer_rings > hts_level_cap) hts_buffer_rings = hts_level_cap
+      hts_spec_rings = max(2, hts_buffer_rings)
       if (hts_dbg_match) then
          hts_dbg_refresh = .true.
          hts_dbg_rad_every = .true.
@@ -393,8 +454,12 @@ module mpas_atm_hts
       ! (0fa07c436) left that w on the same path and grew a near-surface u
       ! oscillation on interior edge 64121 (job 201240). The default cap is
       ! level 2. config_hts_moist_max_level selects the cap for ablations.
-      ! Dry dynamics keeps config_hts_max_level.
-      if (moist_physics .and. L > hts_moist_max_level) L = hts_moist_max_level
+      ! Dry dynamics keeps config_hts_max_level. Coarse-first leaves the cap
+      ! off unless config_hts_cf_use_moist_cap is set. The fine-first path
+      ! always clamps, and that assignment is unchanged when coarse-first is off.
+      if (moist_physics .and. L > hts_moist_max_level) then
+         if (.not. hts_coarse_first .or. hts_cf_use_moist_cap) L = hts_moist_max_level
+      end if
 
       do iCell = 1, nCells
          if (uniform .or. meshDensity(iCell) <= 0.0_RKIND) then
@@ -408,6 +473,11 @@ module mpas_atm_hts
          end if
       end do
       hts_cell_level(nCells+1) = 0
+
+      ! Smoothing changes cell levels only when coarse-first is on. Off keeps
+      ! the nint bins above, including the halo cells, so the edge levels that
+      ! follow are the same bits as before.
+      if (hts_coarse_first) call hts_smooth_cell_levels(domain, block, cellsOnCell, nEdgesOnCell, nCells, nCellsSolve)
 
       ! A cell that touches a finer neighbor is pulled down to that neighbor's
       ! level only at the edge. Cell levels stay as binned. Edges take the finer cell.
@@ -483,6 +553,26 @@ module mpas_atm_hts
             call mpas_log_write(' interface_interp: halo ramp alpha = mod(tick,2^L)/2^L; level-0 interface edges integrate k=1..$i', &
                                 intArgs=(/hts_iface_kmax/))
          end if
+         if (hts_coarse_first) then
+            call mpas_log_write(' coarse-first: parent steps first; spec zone is $i rings; buffer rings $i', &
+                                intArgs=(/hts_spec_rings, hts_buffer_rings/))
+            if (hts_cf_match_acoustic) then
+               call mpas_log_write(' coarse-first acoustic match is on; coarse levels still take 2^L acoustic substeps')
+            else
+               call mpas_log_write(' coarse-first acoustic match is off; each level keeps config_number_of_sub_steps')
+            end if
+            if (hts_cf_use_moist_cap) then
+               call mpas_log_write(' coarse-first moist cap is on; moist max level $i applies', intArgs=(/hts_moist_max_level/))
+            else
+               call mpas_log_write(' coarse-first moist cap is off; active level follows config_hts_max_level')
+            end if
+            call mpas_log_write(' coarse-first uses one physics call and one SRK3 per level step; micro, pbl, and kessler substep counts are not applied')
+            if (associated(config_dt) .and. hts_max_level_used >= 1) then
+               call mpas_log_write(' coarse-first level $i step is $r s; history output should be a multiple of that step', &
+                                   intArgs=(/hts_max_level_used/), &
+                                   realArgs=(/config_dt * real(ishft(1, hts_max_level_used), RKIND)/))
+            end if
+         end if
          if (hts_micro_substeps == 0) then
             call mpas_log_write(' micro_substeps = 0: moist levels above 0 step dynamics, scalars, and Kessler at config_dt')
          end if
@@ -496,9 +586,15 @@ module mpas_atm_hts
          call mpas_log_write(' config_hts = false (integrator is unchanged)')
       end if
       call mpas_log_write(' owned cells = $i', intArgs=(/globalOwned/))
+      workUnits = 0.0_RKIND
       do L = 0, hts_max_level_used
          call mpas_log_write(' level $i cells = $i', intArgs=(/L, globalCount(L)/))
+         if (hts_coarse_first) workUnits = workUnits + real(globalCount(L), RKIND) / real(ishft(1, L), RKIND)
       end do
+      if (hts_coarse_first .and. hts_enabled) then
+         call mpas_log_write(' coarse-first dynamics work is $r cell-steps per fine step, promoted rings included', &
+                             realArgs=(/workUnits/))
+      end if
       call mpas_log_write(' interface edges = $i', intArgs=(/globalIface/))
       call mpas_log_write(' open-interface cells = $i', intArgs=(/globalOpen/))
       if (uniform) then
@@ -577,6 +673,8 @@ module mpas_atm_hts
          end if
       end if
 
+      if (hts_coarse_first) call atm_hts_cf_allocate(block)
+
       ! Silence unused-variable warnings on builds that do not walk neighbors here.
       iNbr = nEdgesOnCell(1)
       nbr = cellsOnCell(1, 1)
@@ -621,6 +719,17 @@ module mpas_atm_hts
       if (allocated(hts_u_keep)) deallocate(hts_u_keep)
       if (allocated(hts_u_kept)) deallocate(hts_u_kept)
       if (allocated(hts_level_started)) deallocate(hts_level_started)
+      if (allocated(hts_cf_cell)) deallocate(hts_cf_cell)
+      if (allocated(hts_cf_edge)) deallocate(hts_cf_edge)
+      if (allocated(hts_cf_rho)) deallocate(hts_cf_rho)
+      if (allocated(hts_cf_th)) deallocate(hts_cf_th)
+      if (allocated(hts_cf_w)) deallocate(hts_cf_w)
+      if (allocated(hts_cf_rw)) deallocate(hts_cf_rw)
+      if (allocated(hts_cf_sc)) deallocate(hts_cf_sc)
+      if (allocated(hts_cf_u)) deallocate(hts_cf_u)
+      if (allocated(hts_cf_ru)) deallocate(hts_cf_ru)
+      if (allocated(hts_cf_re)) deallocate(hts_cf_re)
+      if (allocated(hts_cf_ru_before)) deallocate(hts_cf_ru_before)
       if (allocated(hts_work_own)) deallocate(hts_work_own)
       if (allocated(hts_work_all)) deallocate(hts_work_all)
       if (allocated(hts_active_own)) deallocate(hts_active_own)
@@ -2356,6 +2465,886 @@ module mpas_atm_hts
       call mpas_timer_stop('hts_acoustic_halo')
 
    end subroutine hts_exch_layer1
+
+
+   subroutine hts_exch_int_halo(block, nCells, nCellsSolve, vals)
+
+      ! Ship one integer per owned cell through the meshDensity halo and
+      ! put the received halo back into vals. meshDensity is restored.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: nCells, nCellsSolve
+      integer, intent(inout) :: vals(:)
+
+      type (mpas_pool_type), pointer :: mesh
+      type (field1dReal), pointer :: fld
+      real (kind=RKIND), allocatable :: saved(:)
+      integer :: iCell, n
+
+      nullify(mesh, fld)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_field(mesh, 'meshDensity', fld)
+      if (.not. associated(fld)) return
+      if (.not. associated(fld % sendList)) return
+      n = min(nCells, size(fld % array), size(vals))
+      allocate(saved(size(fld % array)))
+      saved(:) = fld % array(:)
+      do iCell = 1, n
+         fld % array(iCell) = real(vals(iCell), RKIND)
+      end do
+      call mpas_dmpar_exch_halo_field(fld)
+      do iCell = nCellsSolve + 1, n
+         vals(iCell) = nint(fld % array(iCell))
+      end do
+      fld % array(:) = saved(:)
+      call mpas_dmpar_exch_halo_field(fld)
+      deallocate(saved)
+
+   end subroutine hts_exch_int_halo
+
+
+   subroutine hts_smooth_cell_levels(domain, block, cellsOnCell, nEdgesOnCell, nCells, nCellsSolve)
+
+      ! |dL| <= 1, then B rings of promotion toward a finer neighbor, then
+      ! merge a band whose width is under 2B. Promotion only. Off-path
+      ! binning never calls this.
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+      type (block_type), intent(in) :: block
+      integer, dimension(:,:), intent(in) :: cellsOnCell
+      integer, dimension(:), intent(in) :: nEdgesOnCell
+      integer, intent(in) :: nCells, nCellsSolve
+
+      integer, allocatable :: cur(:), nxt(:), df(:), dc(:)
+      integer :: iCell, j, nbr, ell, B, guard, sweep, radius
+      integer :: width, widthG, npro, nproG, passes
+      integer :: big
+
+      B = hts_buffer_rings
+      allocate(cur(nCells+1), nxt(nCells+1), df(nCells+1), dc(nCells+1))
+      cur(1:nCells) = hts_cell_level(1:nCells)
+      cur(nCells+1) = 0
+      call hts_exch_int_halo(block, nCells, nCellsSolve, cur)
+
+      call hts_enforce_level_grad(domain, block, cellsOnCell, nEdgesOnCell, nCells, nCellsSolve, cur)
+
+      do passes = 1, B
+         nxt(:) = cur(:)
+         do iCell = 1, nCells
+            do j = 1, nEdgesOnCell(iCell)
+               nbr = cellsOnCell(j, iCell)
+               if (nbr < 1 .or. nbr > nCells) cycle
+               if (cur(nbr) < nxt(iCell)) nxt(iCell) = cur(nbr)
+            end do
+         end do
+         cur(:) = nxt(:)
+         call hts_exch_int_halo(block, nCells, nCellsSolve, cur)
+      end do
+      if (B > 0) call hts_enforce_level_grad(domain, block, cellsOnCell, nEdgesOnCell, nCells, nCellsSolve, cur)
+
+      radius = 2 * B
+      big = radius + 1
+      nproG = 0
+      if (radius >= 2) then
+         do guard = 1, 8
+            npro = 0
+            do ell = 1, hts_level_cap
+               df(:) = big
+               dc(:) = big
+               do iCell = 1, nCells
+                  if (cur(iCell) < ell) df(iCell) = 0
+                  if (cur(iCell) > ell) dc(iCell) = 0
+               end do
+               do sweep = 1, radius
+                  nxt(:) = df(:)
+                  do iCell = 1, nCells
+                     do j = 1, nEdgesOnCell(iCell)
+                        nbr = cellsOnCell(j, iCell)
+                        if (nbr < 1 .or. nbr > nCells) cycle
+                        if (df(nbr) + 1 < nxt(iCell)) nxt(iCell) = df(nbr) + 1
+                     end do
+                  end do
+                  df(:) = nxt(:)
+                  call hts_exch_int_halo(block, nCells, nCellsSolve, df)
+                  nxt(:) = dc(:)
+                  do iCell = 1, nCells
+                     do j = 1, nEdgesOnCell(iCell)
+                        nbr = cellsOnCell(j, iCell)
+                        if (nbr < 1 .or. nbr > nCells) cycle
+                        if (dc(nbr) + 1 < nxt(iCell)) nxt(iCell) = dc(nbr) + 1
+                     end do
+                  end do
+                  dc(:) = nxt(:)
+                  call hts_exch_int_halo(block, nCells, nCellsSolve, dc)
+               end do
+               do iCell = 1, nCellsSolve
+                  if (cur(iCell) /= ell) cycle
+                  if (df(iCell) > 0 .and. dc(iCell) > 0 .and. df(iCell) + dc(iCell) < radius) then
+                     cur(iCell) = ell - 1
+                     npro = npro + 1
+                  end if
+               end do
+               call hts_exch_int_halo(block, nCells, nCellsSolve, cur)
+            end do
+            call mpas_dmpar_sum_int(domain % dminfo, npro, nproG)
+            if (nproG == 0) exit
+            call hts_enforce_level_grad(domain, block, cellsOnCell, nEdgesOnCell, nCells, nCellsSolve, cur)
+         end do
+      end if
+
+      width = big
+      do ell = 1, hts_level_cap
+         df(:) = big
+         dc(:) = big
+         do iCell = 1, nCells
+            if (cur(iCell) < ell) df(iCell) = 0
+            if (cur(iCell) > ell) dc(iCell) = 0
+         end do
+         do sweep = 1, max(radius, 1)
+            nxt(:) = df(:)
+            do iCell = 1, nCells
+               do j = 1, nEdgesOnCell(iCell)
+                  nbr = cellsOnCell(j, iCell)
+                  if (nbr < 1 .or. nbr > nCells) cycle
+                  if (df(nbr) + 1 < nxt(iCell)) nxt(iCell) = df(nbr) + 1
+               end do
+            end do
+            df(:) = nxt(:)
+            nxt(:) = dc(:)
+            do iCell = 1, nCells
+               do j = 1, nEdgesOnCell(iCell)
+                  nbr = cellsOnCell(j, iCell)
+                  if (nbr < 1 .or. nbr > nCells) cycle
+                  if (dc(nbr) + 1 < nxt(iCell)) nxt(iCell) = dc(nbr) + 1
+               end do
+            end do
+            dc(:) = nxt(:)
+         end do
+         do iCell = 1, nCellsSolve
+            if (cur(iCell) /= ell) cycle
+            if (df(iCell) > 0 .and. dc(iCell) > 0 .and. dc(iCell) < big) then
+               width = min(width, df(iCell) + dc(iCell) - 1)
+            end if
+         end do
+      end do
+      ! A rank with no interior band would report the sentinel and win a
+      ! minimum. Ranks that measured a width keep it.
+      if (width >= big) width = 999999
+      call mpas_dmpar_min_int(domain % dminfo, width, widthG)
+      if (widthG >= 999999) widthG = -1
+      call mpas_log_write(' coarse-first level smoothing: buffer rings $i, spec rings $i, minimum zone width $i (-1 means one band)', &
+                          intArgs=(/B, hts_spec_rings, widthG/))
+
+      hts_cell_level(1:nCells) = cur(1:nCells)
+      hts_cell_level(nCells+1) = 0
+      deallocate(cur, nxt, df, dc)
+
+   end subroutine hts_smooth_cell_levels
+
+
+   subroutine hts_enforce_level_grad(domain, block, cellsOnCell, nEdgesOnCell, nCells, nCellsSolve, cur)
+
+      implicit none
+
+      type (domain_type), intent(inout) :: domain
+      type (block_type), intent(in) :: block
+      integer, dimension(:,:), intent(in) :: cellsOnCell
+      integer, dimension(:), intent(in) :: nEdgesOnCell
+      integer, intent(in) :: nCells, nCellsSolve
+      integer, intent(inout) :: cur(:)
+
+      integer, allocatable :: nxt(:)
+      integer :: iCell, j, nbr, iter, neighborMin, changed, changedG
+
+      allocate(nxt(nCells+1))
+      do iter = 1, max(nCellsSolve, 1)
+         changed = 0
+         nxt(:) = cur(:)
+         do iCell = 1, nCells
+            neighborMin = cur(iCell)
+            do j = 1, nEdgesOnCell(iCell)
+               nbr = cellsOnCell(j, iCell)
+               if (nbr < 1 .or. nbr > nCells) cycle
+               if (cur(nbr) + 1 < neighborMin) neighborMin = cur(nbr) + 1
+            end do
+            if (neighborMin < cur(iCell)) then
+               nxt(iCell) = neighborMin
+               if (iCell <= nCellsSolve) changed = changed + 1
+            end if
+         end do
+         cur(:) = nxt(:)
+         call hts_exch_int_halo(block, nCells, nCellsSolve, cur)
+         call mpas_dmpar_sum_int(domain % dminfo, changed, changedG)
+         if (changedG == 0) exit
+      end do
+      deallocate(nxt)
+
+   end subroutine hts_enforce_level_grad
+
+
+   subroutine atm_hts_cf_allocate(block)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: mesh, state
+      integer, dimension(:,:), pointer :: cellsOnCell, cellsOnEdge
+      integer, dimension(:), pointer :: nEdgesOnCell
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      integer, allocatable :: dist(:), nxt(:)
+      integer :: iCell, iEdge, j, nbr, L, sweep, cell1, cell2, nScal, ownedRing, ownedRingG
+
+      if (.not. hts_coarse_first) return
+      if (.not. hts_path_live) return
+      if (hts_max_level_used < 1) return
+
+      nullify(mesh, state, cellsOnCell, cellsOnEdge, nEdgesOnCell, scalars)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 1)
+      nScal = 0
+      if (associated(scalars)) nScal = size(scalars, 1)
+      if (nScal < 0) nScal = 0
+      hts_cf_nscal = nScal
+
+      if (allocated(hts_cf_cell)) deallocate(hts_cf_cell)
+      if (allocated(hts_cf_edge)) deallocate(hts_cf_edge)
+      allocate(hts_cf_cell(hts_nCells+1, 0:hts_max_level_used))
+      allocate(hts_cf_edge(hts_nEdges+1, 0:hts_max_level_used))
+      hts_cf_cell(:, :) = .false.
+      hts_cf_edge(:, :) = .false.
+
+      allocate(dist(hts_nCells+1), nxt(hts_nCells+1))
+      do L = 1, hts_max_level_used
+         dist(:) = hts_spec_rings + 1
+         do iCell = 1, hts_nCells
+            if (hts_cell_level(iCell) < L) dist(iCell) = 0
+         end do
+         do sweep = 1, hts_spec_rings
+            nxt(:) = dist(:)
+            do iCell = 1, hts_nCells
+               do j = 1, nEdgesOnCell(iCell)
+                  nbr = cellsOnCell(j, iCell)
+                  if (nbr < 1 .or. nbr > hts_nCells) cycle
+                  if (dist(nbr) + 1 < nxt(iCell)) nxt(iCell) = dist(nbr) + 1
+               end do
+            end do
+            dist(:) = nxt(:)
+            call hts_exch_int_halo(block, hts_nCells, hts_nCellsSolve, dist)
+         end do
+         ownedRing = 0
+         do iCell = 1, hts_nCells
+            if (hts_cell_level(iCell) == L .and. dist(iCell) >= 1 .and. dist(iCell) <= hts_spec_rings) then
+               hts_cf_cell(iCell, L) = .true.
+               if (iCell <= hts_nCellsSolve) ownedRing = ownedRing + 1
+            end if
+         end do
+         call mpas_dmpar_sum_int(block % domain % dminfo, ownedRing, ownedRingG)
+         call mpas_log_write(' coarse-first level $i spec-zone cells = $i', intArgs=(/L, ownedRingG/))
+         do iEdge = 1, hts_nEdges
+            if (hts_edge_level(iEdge) /= L) cycle
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 < 1 .or. cell1 > hts_nCells) cell1 = hts_nCells + 1
+            if (cell2 < 1 .or. cell2 > hts_nCells) cell2 = hts_nCells + 1
+            if (hts_cf_cell(cell1, L) .or. hts_cf_cell(cell2, L)) hts_cf_edge(iEdge, L) = .true.
+         end do
+      end do
+      deallocate(dist, nxt)
+
+      allocate(hts_cf_rho(hts_nVert, hts_nCells+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_th(hts_nVert, hts_nCells+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_w(hts_nVert+1, hts_nCells+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_rw(hts_nVert+1, hts_nCells+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_u(hts_nVert, hts_nEdges+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_ru(hts_nVert, hts_nEdges+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_re(hts_nVert, hts_nEdges+1, 2, 0:hts_max_level_used))
+      allocate(hts_cf_ru_before(hts_nVert, hts_nEdges+1))
+      hts_cf_rho = 0.0_RKIND
+      hts_cf_th = 0.0_RKIND
+      hts_cf_w = 0.0_RKIND
+      hts_cf_rw = 0.0_RKIND
+      hts_cf_u = 0.0_RKIND
+      hts_cf_ru = 0.0_RKIND
+      hts_cf_re = 0.0_RKIND
+      hts_cf_ru_before = 0.0_RKIND
+      if (nScal > 0) then
+         allocate(hts_cf_sc(nScal, hts_nVert, hts_nCells+1, 2, 0:hts_max_level_used))
+         hts_cf_sc = 0.0_RKIND
+      end if
+      hts_cf_have(:) = .false.
+
+   end subroutine atm_hts_cf_allocate
+
+
+   function hts_cf_alpha(child) result(alpha)
+
+      ! Midpoint of this child step inside the parent interval. The parent
+      ! endpoints are the two realized states, so the value stays in [0, 1].
+
+      implicit none
+
+      integer, intent(in) :: child
+      real (kind=RKIND) :: alpha
+      integer :: span, halfStep
+
+      alpha = 0.0_RKIND
+      if (child < 0) return
+      span = ishft(1, child + 1)
+      if (child == 0) then
+         alpha = (real(mod(hts_tick, span), RKIND) + 0.5_RKIND) / real(span, RKIND)
+      else
+         halfStep = ishft(1, child - 1)
+         alpha = real(mod(hts_tick, span) + halfStep, RKIND) / real(span, RKIND)
+      end if
+      if (alpha < 0.0_RKIND) alpha = 0.0_RKIND
+      if (alpha > 1.0_RKIND) alpha = 1.0_RKIND
+
+   end function hts_cf_alpha
+
+
+   subroutine atm_hts_cf_save(block, level, before)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+      logical, intent(in) :: before
+
+      type (mpas_pool_type), pointer :: state, diag
+      real (kind=RKIND), dimension(:,:), pointer :: rho, th, w, u, ru, rw, rho_edge
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      integer :: slot, timeLev, iCell, iEdge, k, j
+
+      if (.not. allocated(hts_cf_cell)) return
+      if (level < 1 .or. level > hts_max_level_used) return
+      slot = 2
+      timeLev = 2
+      if (before) then
+         slot = 1
+         timeLev = 1
+      end if
+
+      nullify(state, diag, rho, th, w, u, ru, rw, rho_edge, scalars)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_array(state, 'rho_zz', rho, timeLev)
+      call mpas_pool_get_array(state, 'theta_m', th, timeLev)
+      call mpas_pool_get_array(state, 'w', w, timeLev)
+      call mpas_pool_get_array(state, 'u', u, timeLev)
+      call mpas_pool_get_array(state, 'scalars', scalars, timeLev)
+      call mpas_pool_get_array(diag, 'ru', ru)
+      call mpas_pool_get_array(diag, 'rw', rw)
+      call mpas_pool_get_array(diag, 'rho_edge', rho_edge)
+
+      do iCell = 1, hts_nCellsSolve
+         if (.not. hts_cf_cell(iCell, level)) cycle
+         do k = 1, hts_nVert
+            hts_cf_rho(k, iCell, slot, level) = rho(k, iCell)
+            hts_cf_th(k, iCell, slot, level) = th(k, iCell)
+         end do
+         do k = 1, hts_nVert + 1
+            hts_cf_w(k, iCell, slot, level) = w(k, iCell)
+            hts_cf_rw(k, iCell, slot, level) = rw(k, iCell)
+         end do
+         if (hts_cf_nscal > 0 .and. associated(scalars)) then
+            do k = 1, hts_nVert
+               do j = 1, hts_cf_nscal
+                  hts_cf_sc(j, k, iCell, slot, level) = scalars(j, k, iCell)
+               end do
+            end do
+         end if
+      end do
+
+      do iEdge = 1, hts_nEdgesSolve
+         if (.not. hts_cf_edge(iEdge, level)) cycle
+         do k = 1, hts_nVert
+            hts_cf_u(k, iEdge, slot, level) = u(k, iEdge)
+            hts_cf_ru(k, iEdge, slot, level) = ru(k, iEdge)
+            hts_cf_re(k, iEdge, slot, level) = rho_edge(k, iEdge)
+         end do
+      end do
+
+      if (.not. before) hts_cf_have(level) = .true.
+
+   end subroutine atm_hts_cf_save
+
+
+   subroutine hts_cf_write_parent(block, child, alpha)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: child
+      real (kind=RKIND), intent(in) :: alpha
+
+      type (mpas_pool_type), pointer :: state, diag, mesh
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:), pointer :: ru, rw, rho_edge
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rtheta_p, exner, pressure_p
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p_save, rtheta_p_save
+      real (kind=RKIND), dimension(:,:), pointer :: exner_base, rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:,:), pointer :: sc1, sc2
+      integer :: parent, iCell, iEdge, k, j
+      real (kind=RKIND) :: oma, rho, th
+
+      parent = child + 1
+      if (.not. allocated(hts_cf_cell)) return
+      if (parent < 1 .or. parent > hts_max_level_used) return
+      if (.not. hts_cf_have(parent)) return
+
+      oma = 1.0_RKIND - alpha
+      nullify(state, diag, mesh)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(state, 'theta_m', th1, 1)
+      call mpas_pool_get_array(state, 'theta_m', th2, 2)
+      call mpas_pool_get_array(state, 'w', w1, 1)
+      call mpas_pool_get_array(state, 'w', w2, 2)
+      call mpas_pool_get_array(state, 'u', u1, 1)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+      call mpas_pool_get_array(state, 'scalars', sc1, 1)
+      call mpas_pool_get_array(state, 'scalars', sc2, 2)
+      call mpas_pool_get_array(diag, 'ru', ru)
+      call mpas_pool_get_array(diag, 'rw', rw)
+      call mpas_pool_get_array(diag, 'rho_edge', rho_edge)
+      call mpas_pool_get_array(diag, 'rho_p', rho_p)
+      call mpas_pool_get_array(diag, 'rho_p_save', rho_p_save)
+      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
+      call mpas_pool_get_array(diag, 'rtheta_p_save', rtheta_p_save)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'exner_base', exner_base)
+      call mpas_pool_get_array(diag, 'rtheta_base', rtheta_base)
+      call mpas_pool_get_array(diag, 'rho_base', rho_base)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+
+      do iCell = 1, hts_nCellsSolve
+         if (.not. hts_cf_cell(iCell, parent)) cycle
+         do k = 1, hts_nVert
+            rho = oma * hts_cf_rho(k, iCell, 1, parent) + alpha * hts_cf_rho(k, iCell, 2, parent)
+            th = oma * hts_cf_th(k, iCell, 1, parent) + alpha * hts_cf_th(k, iCell, 2, parent)
+            rho1(k, iCell) = rho
+            rho2(k, iCell) = rho
+            th1(k, iCell) = th
+            th2(k, iCell) = th
+            call hts_diagnostics_from_state(k, iCell, rho, th, rho_base(k, iCell), rtheta_base(k, iCell), &
+                 zz(k, iCell), exner_base(k, iCell), rho_p(k, iCell), rtheta_p(k, iCell), &
+                 exner(k, iCell), pressure_p(k, iCell))
+            rho_p_save(k, iCell) = rho_p(k, iCell)
+            rtheta_p_save(k, iCell) = rtheta_p(k, iCell)
+         end do
+         do k = 1, hts_nVert + 1
+            w1(k, iCell) = oma * hts_cf_w(k, iCell, 1, parent) + alpha * hts_cf_w(k, iCell, 2, parent)
+            w2(k, iCell) = w1(k, iCell)
+            rw(k, iCell) = oma * hts_cf_rw(k, iCell, 1, parent) + alpha * hts_cf_rw(k, iCell, 2, parent)
+         end do
+         if (hts_cf_nscal > 0 .and. associated(sc1) .and. associated(sc2)) then
+            do k = 1, hts_nVert
+               do j = 1, hts_cf_nscal
+                  sc1(j, k, iCell) = oma * hts_cf_sc(j, k, iCell, 1, parent) + alpha * hts_cf_sc(j, k, iCell, 2, parent)
+                  sc2(j, k, iCell) = sc1(j, k, iCell)
+               end do
+            end do
+         end if
+      end do
+
+      do iEdge = 1, hts_nEdgesSolve
+         if (.not. hts_cf_edge(iEdge, parent)) cycle
+         do k = 1, hts_nVert
+            u1(k, iEdge) = oma * hts_cf_u(k, iEdge, 1, parent) + alpha * hts_cf_u(k, iEdge, 2, parent)
+            u2(k, iEdge) = u1(k, iEdge)
+            ru(k, iEdge) = oma * hts_cf_ru(k, iEdge, 1, parent) + alpha * hts_cf_ru(k, iEdge, 2, parent)
+            rho_edge(k, iEdge) = oma * hts_cf_re(k, iEdge, 1, parent) + alpha * hts_cf_re(k, iEdge, 2, parent)
+         end do
+      end do
+
+   end subroutine hts_cf_write_parent
+
+
+   subroutine atm_hts_cf_apply(block, child)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: child
+
+      call hts_cf_write_parent(block, child, hts_cf_alpha(child))
+
+   end subroutine atm_hts_cf_apply
+
+
+   subroutine atm_hts_cf_restore(block, child)
+
+      ! Put the parent endpoint back so the core shift publishes that state
+      ! rather than the midpoint sample the child just read.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: child
+
+      call hts_cf_write_parent(block, child, 1.0_RKIND)
+
+   end subroutine atm_hts_cf_restore
+
+
+   subroutine atm_hts_cf_halo(block)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: state, diag
+      type (field2dReal), pointer :: f2
+      type (field3dReal), pointer :: f3
+      integer :: timeLev
+
+      if (.not. hts_coarse_first) return
+      nullify(state, diag, f2, f3)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+
+      do timeLev = 1, 2
+         call mpas_pool_get_field(state, 'rho_zz', f2, timeLev)
+         if (associated(f2)) then
+            if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+         end if
+         call mpas_pool_get_field(state, 'theta_m', f2, timeLev)
+         if (associated(f2)) then
+            if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+         end if
+         call mpas_pool_get_field(state, 'w', f2, timeLev)
+         if (associated(f2)) then
+            if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+         end if
+         call mpas_pool_get_field(state, 'u', f2, timeLev)
+         if (associated(f2)) then
+            if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+         end if
+         call mpas_pool_get_field(state, 'scalars', f3, timeLev)
+         if (associated(f3)) then
+            if (associated(f3 % sendList)) call mpas_dmpar_exch_halo_field(f3)
+         end if
+      end do
+
+      call mpas_pool_get_field(diag, 'exner', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+      call mpas_pool_get_field(diag, 'pressure_p', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+      call mpas_pool_get_field(diag, 'rtheta_p', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+      call mpas_pool_get_field(diag, 'rho_p', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+      call mpas_pool_get_field(diag, 'ru', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+      call mpas_pool_get_field(diag, 'rw', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+      call mpas_pool_get_field(diag, 'rho_edge', f2)
+      if (associated(f2)) then
+         if (associated(f2 % sendList)) call mpas_dmpar_exch_halo_field(f2)
+      end if
+
+   end subroutine atm_hts_cf_halo
+
+
+   subroutine atm_hts_cf_zero_ru_p(block, level)
+
+      ! Interface edges belong to the finer level, so this coarse step does
+      ! not integrate them. The acoustic cell update still adds ru_p, and
+      ! scalar transport reads ruAvg. Leaving ruAvg stale (often zero) drops
+      ! the face flux and the column blows up. Hold the pre-step ru for the
+      ! whole acoustic subcycle: ru_save and the impose target are that
+      ! value, so the perturbation is zero and the recovered ruAvg is the
+      ! held flux. The large-step tend_rho already contains div(ru).
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+
+      type (mpas_pool_type), pointer :: diag, mesh
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      real (kind=RKIND), dimension(:,:), pointer :: ru, ru_p, ru_save, ruAvg
+      integer :: iEdge, cell1, cell2, k
+
+      if (.not. allocated(hts_cf_ru_before)) return
+      if (.not. allocated(hts_impose_edge)) return
+      if (.not. allocated(hts_ru_target)) return
+      if (level < 1) return
+      hts_impose_edge(:) = .false.
+      nullify(diag, mesh, cellsOnEdge, ru, ru_p, ru_save, ruAvg)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(diag, 'ru', ru)
+      call mpas_pool_get_array(diag, 'ru_p', ru_p)
+      call mpas_pool_get_array(diag, 'ru_save', ru_save)
+      call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
+
+      do iEdge = 1, hts_nEdges
+         if (hts_iface_coarse(iEdge) /= level) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         if (cell1 > hts_nCellsSolve .and. cell2 > hts_nCellsSolve) cycle
+         hts_impose_edge(iEdge) = .true.
+         do k = 1, hts_nVert
+            hts_cf_ru_before(k, iEdge) = ru(k, iEdge)
+            hts_ru_target(k, iEdge) = ru(k, iEdge)
+            ru_save(k, iEdge) = ru(k, iEdge)
+            ru_p(k, iEdge) = 0.0_RKIND
+            ruAvg(k, iEdge) = ru(k, iEdge)
+         end do
+      end do
+
+   end subroutine atm_hts_cf_zero_ru_p
+
+
+   subroutine atm_hts_cf_disarm()
+
+      ! Drop the coarse-step impose so the fine step integrates the same
+      ! edges. hts_impose itself is cleared by the driver.
+
+      implicit none
+
+      if (allocated(hts_impose_edge)) hts_impose_edge(:) = .false.
+
+   end subroutine atm_hts_cf_disarm
+
+
+   subroutine atm_hts_cf_commit_to_tl2(block)
+
+      ! Tendencies read time level 2. The RK setup copies time level 1 onto
+      ! time level 2 only for the level that is stepping, and the initial
+      ! time level 2 is not the committed state (theta differed by ~1500 K
+      ! on this mesh). Copy the committed columns, including the halo, once
+      ! per advance before any level steps. Later levels in the same advance
+      ! keep the time level 2 they just wrote.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: state
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2, w1, w2, u1, u2
+      real (kind=RKIND), dimension(:,:,:), pointer :: s1, s2
+      integer :: iCell, iEdge, k, j, nCells, nEdges, nVert, nW, nScalars
+
+      nullify(state, rho1, rho2, th1, th2, w1, w2, u1, u2, s1, s2)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(state, 'theta_m', th1, 1)
+      call mpas_pool_get_array(state, 'theta_m', th2, 2)
+      call mpas_pool_get_array(state, 'w', w1, 1)
+      call mpas_pool_get_array(state, 'w', w2, 2)
+      call mpas_pool_get_array(state, 'u', u1, 1)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+      call mpas_pool_get_array(state, 'scalars', s1, 1)
+      call mpas_pool_get_array(state, 'scalars', s2, 2)
+      if (.not. associated(rho1) .or. .not. associated(rho2)) return
+      if (.not. associated(th1) .or. .not. associated(th2)) return
+
+      nCells = min(hts_nCells, size(th1, 2), size(th2, 2), size(rho1, 2), size(rho2, 2))
+      nVert = min(hts_nVert, size(th1, 1), size(th2, 1), size(rho1, 1), size(rho2, 1))
+      nW = 0
+      if (associated(w1) .and. associated(w2)) nW = min(hts_nVert + 1, size(w1, 1), size(w2, 1))
+      do iCell = 1, nCells
+         do k = 1, nVert
+            rho2(k, iCell) = rho1(k, iCell)
+            th2(k, iCell) = th1(k, iCell)
+         end do
+         if (nW > 0 .and. iCell <= size(w1, 2) .and. iCell <= size(w2, 2)) then
+            do k = 1, nW
+               w2(k, iCell) = w1(k, iCell)
+            end do
+         end if
+         if (associated(s1) .and. associated(s2)) then
+            if (iCell <= size(s1, 3) .and. iCell <= size(s2, 3)) then
+               nScalars = min(size(s1, 1), size(s2, 1))
+               do k = 1, min(nVert, size(s1, 2), size(s2, 2))
+                  do j = 1, nScalars
+                     s2(j, k, iCell) = s1(j, k, iCell)
+                  end do
+               end do
+            end if
+         end if
+      end do
+
+      if (.not. associated(u1) .or. .not. associated(u2)) return
+      nEdges = min(hts_nEdges, size(u1, 2), size(u2, 2))
+      nVert = min(nVert, size(u1, 1), size(u2, 1))
+      do iEdge = 1, nEdges
+         do k = 1, nVert
+            u2(k, iEdge) = u1(k, iEdge)
+         end do
+      end do
+
+   end subroutine atm_hts_cf_commit_to_tl2
+
+
+   subroutine atm_hts_cf_accum(block, level, dt_level)
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+      real (kind=RKIND), intent(in) :: dt_level
+
+      type (mpas_pool_type), pointer :: diag, mesh
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      real (kind=RKIND), dimension(:,:), pointer :: ruAvg
+      integer :: iEdge, cell1, cell2, k
+
+      if (.not. allocated(hts_flux_sum)) return
+      if (level < 0 .or. level >= hts_max_level_used) return
+      nullify(diag, mesh, cellsOnEdge, ruAvg)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
+
+      do iEdge = 1, hts_nEdges
+         if (.not. hts_edge_interface(iEdge)) cycle
+         if (hts_edge_level(iEdge) /= level) cycle
+         if (hts_iface_coarse(iEdge) /= level + 1) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         if (cell1 > hts_nCellsSolve .and. cell2 > hts_nCellsSolve) cycle
+         do k = 1, hts_nVert
+            hts_flux_sum(k, iEdge) = hts_flux_sum(k, iEdge) + real(ruAvg(k, iEdge), R8KIND) * real(dt_level, R8KIND)
+         end do
+      end do
+
+   end subroutine atm_hts_cf_accum
+
+
+   subroutine atm_hts_cf_reflux(block, level, dt_level)
+
+      ! Replace the held coarse flux with the sum of the fine fluxes on the
+      ! coarse cell only. The edge wind stays on the value the fine level
+      ! integrated.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+      integer, intent(in) :: level
+      real (kind=RKIND), intent(in) :: dt_level
+
+      type (mpas_pool_type), pointer :: mesh, diag, state
+      integer, dimension(:,:), pointer :: cellsOnEdge, edgesOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      real (kind=RKIND), dimension(:,:), pointer :: edgesOnCell_sign
+      real (kind=RKIND), dimension(:), pointer :: dvEdge, invAreaCell
+      real (kind=RKIND), dimension(:,:), pointer :: rho1, rho2, th1, th2
+      real (kind=RKIND), dimension(:,:), pointer :: rho_p, rtheta_p, pressure_p, exner, exner_base
+      real (kind=RKIND), dimension(:,:), pointer :: rtheta_base, rho_base, zz
+      real (kind=RKIND), dimension(:,:,:), pointer :: sc1, sc2
+      integer :: iCell, iEdge, i, k, j, cell1, cell2
+      real (kind=RKIND) :: drho, theta_edge, q_edge, rho_old, q_old, fine_mean, rcv, p0, rtheta_tot
+
+      if (.not. allocated(hts_cf_ru_before)) return
+      if (.not. allocated(hts_flux_sum)) return
+      if (level < 1) return
+      if (dt_level == 0.0_RKIND) return
+
+      rcv = rgas / (cp - rgas)
+      p0 = 1.0e5_RKIND
+      nullify(mesh, diag, state)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'edgesOnCell_sign', edgesOnCell_sign)
+      call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
+      call mpas_pool_get_array(mesh, 'invAreaCell', invAreaCell)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(diag, 'rho_p', rho_p)
+      call mpas_pool_get_array(diag, 'rtheta_p', rtheta_p)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'exner_base', exner_base)
+      call mpas_pool_get_array(diag, 'rtheta_base', rtheta_base)
+      call mpas_pool_get_array(diag, 'rho_base', rho_base)
+      call mpas_pool_get_array(state, 'rho_zz', rho1, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(state, 'theta_m', th1, 1)
+      call mpas_pool_get_array(state, 'theta_m', th2, 2)
+      call mpas_pool_get_array(state, 'scalars', sc1, 1)
+      call mpas_pool_get_array(state, 'scalars', sc2, 2)
+
+      do iCell = 1, hts_nCellsSolve
+         if (hts_cell_level(iCell) /= level) cycle
+         do i = 1, nEdgesOnCell(iCell)
+            iEdge = edgesOnCell(i, iCell)
+            if (iEdge < 1 .or. iEdge > hts_nEdges) cycle
+            if (hts_iface_coarse(iEdge) /= level) cycle
+            cell1 = cellsOnEdge(1, iEdge)
+            cell2 = cellsOnEdge(2, iEdge)
+            if (cell1 < 1 .or. cell1 > hts_nCells .or. cell2 < 1 .or. cell2 > hts_nCells) cycle
+            do k = 1, hts_nVert
+               fine_mean = real(hts_flux_sum(k, iEdge) / real(dt_level, R8KIND), RKIND)
+               drho = -edgesOnCell_sign(i, iCell) * dvEdge(iEdge) * invAreaCell(iCell) * dt_level &
+                      * (fine_mean - hts_cf_ru_before(k, iEdge))
+               theta_edge = 0.5_RKIND * (th2(k, cell1) + th2(k, cell2))
+               rho_old = rho2(k, iCell)
+               rho2(k, iCell) = rho_old + drho
+               rho1(k, iCell) = rho2(k, iCell)
+               rho_p(k, iCell) = rho_p(k, iCell) + drho
+               rtheta_p(k, iCell) = rtheta_p(k, iCell) + theta_edge * drho
+               rtheta_tot = rtheta_p(k, iCell) + rtheta_base(k, iCell)
+               if (rho2(k, iCell) /= 0.0_RKIND) then
+                  th2(k, iCell) = rtheta_tot / rho2(k, iCell)
+                  th1(k, iCell) = th2(k, iCell)
+               end if
+               exner(k, iCell) = (zz(k, iCell) * (rgas / p0) * rtheta_tot) ** rcv
+               pressure_p(k, iCell) = zz(k, iCell) * rgas * (exner(k, iCell) * rtheta_p(k, iCell) &
+                    + rtheta_base(k, iCell) * (exner(k, iCell) - exner_base(k, iCell)))
+               if (hts_cf_nscal > 0 .and. associated(sc1) .and. associated(sc2) .and. rho2(k, iCell) /= 0.0_RKIND) then
+                  do j = 1, hts_cf_nscal
+                     q_old = sc2(j, k, iCell)
+                     q_edge = 0.5_RKIND * (sc2(j, k, cell1) + sc2(j, k, cell2))
+                     sc2(j, k, iCell) = (rho_old * q_old + q_edge * drho) / rho2(k, iCell)
+                     sc1(j, k, iCell) = sc2(j, k, iCell)
+                  end do
+               end if
+            end do
+         end do
+      end do
+
+      do iEdge = 1, hts_nEdges
+         if (hts_iface_coarse(iEdge) /= level) cycle
+         do k = 1, hts_nVert
+            hts_flux_sum(k, iEdge) = 0.0_R8KIND
+         end do
+      end do
+
+   end subroutine atm_hts_cf_reflux
 
 
 end module mpas_atm_hts

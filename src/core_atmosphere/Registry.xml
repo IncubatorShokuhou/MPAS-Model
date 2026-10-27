@@ -161,6 +161,26 @@
                      description="Time-interpolate the coarse halo the fine step reads. alpha = mod(tick, 2^L) / 2^L times the previous coarse increment of rho, theta_m, qv, and coarse-edge u, with no half-step lead. w stays on the snapshot. The coarse column is restored before its RK step. Levels k=1..6 of a level-0 interface edge integrate against that ramp and are kept; levels above stay on the snapshot flux. Off is the held snapshot."
                      possible_values="Logical values"/>
 
+                <nml_option name="config_hts_coarse_first" type="logical" default_value="false"
+                     units="-"
+                     description="Coarse-first hierarchical stepping. The coarser level advances first and saves both endpoints. Each finer level then takes its substeps with a specified zone of at least two coarser rings set by linear interpolation between those endpoints. The finer level owns interface edges and integrates the full u tendency. Mass, theta, and scalars are refluxed onto the coarse cell when the coarse interval closes. Off keeps the fine-first hold. Level smoothing and the two switches below apply only when this is true."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_buffer_rings" type="integer" default_value="2"
+                     units="-"
+                     description="When config_hts_coarse_first is true, promote a cell within this many rings of a finer neighbor down to that neighbor's level, then merge a level band thinner than about twice this width into the next finer level. Neighbors then differ by at most one level. The specified zone is max(2, this) rings of the remaining coarser cells. Ignored when coarse-first is false, so the existing binning is unchanged."
+                     possible_values="Integers from 0 through 8"/>
+
+                <nml_option name="config_hts_cf_match_acoustic" type="logical" default_value="false"
+                     units="-"
+                     description="When config_hts_coarse_first is true, multiply the acoustic substep count by 2^L, which is what the fine-first path always does. Off keeps config_number_of_sub_steps on every level. The fine-first path ignores this switch."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_cf_use_moist_cap" type="logical" default_value="false"
+                     units="-"
+                     description="When config_hts_coarse_first is true, apply config_hts_moist_max_level. Off lets a moist run use config_hts_max_level. The fine-first path always applies the cap and ignores this switch. The 240 s cell-3177 failure predates the idle-column moisture fix and has not been retested with this mode."
+                     possible_values="Logical values"/>
+
                 <nml_option name="config_calendar_type" type="character" default_value="gregorian" in_defaults="false"
                      units="-"
                      description="Simulation calendar type"
