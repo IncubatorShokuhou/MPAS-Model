@@ -156,6 +156,11 @@
                      description="Fortran cell index to print every fine step (0 disables). A 0-based history id is one less: the eds cell 3177 is 3178 here. The line is wmax, its level, theta, qv, rho, t2m, skintemp, surface |u| max on the cell edges, and global max |w|."
                      possible_values="Integers from 0 up"/>
 
+                <nml_option name="config_hts_interface_interp" type="logical" default_value="false"
+                     units="-"
+                     description="Time-interpolate the coarse halo the fine step reads. alpha = mod(tick, 2^L) / 2^L times the previous coarse increment of rho, theta_m, qv, and coarse-edge u, with no half-step lead. w stays on the snapshot. The coarse column is restored before its RK step. Levels k=1..6 of a level-0 interface edge integrate against that ramp and are kept; levels above stay on the snapshot flux. Off is the held snapshot."
+                     possible_values="Logical values"/>
+
                 <nml_option name="config_calendar_type" type="character" default_value="gregorian" in_defaults="false"
                      units="-"
                      description="Simulation calendar type"

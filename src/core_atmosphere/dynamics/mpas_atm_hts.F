@@ -24,7 +24,7 @@ module mpas_atm_hts
    public :: atm_hts_setup, atm_hts_finalize
    public :: atm_hts_begin_intervals, atm_hts_apply_interpolation, atm_hts_restore_above
    public :: atm_hts_sync_finer, atm_hts_accumulate_flux, atm_hts_prepare_targets
-   public :: atm_hts_clear_consumed, atm_hts_correct_mass
+   public :: atm_hts_clear_consumed, atm_hts_correct_mass, atm_hts_commit_interface_u
    public :: hts_restrict_physics_tendencies
    public :: hts_exch_layer1
    public :: hts_diagnostics_from_state
@@ -61,6 +61,14 @@ module mpas_atm_hts
    ! or any run that actually has a coarse level.
    logical, public :: hts_force_path = .false.
    logical, public :: hts_path_live = .false.
+   ! config_hts_interface_interp. Off is the held snapshot (d0cc0b23). On,
+   ! the fine step reads a linear ramp of the last coarse increment on rho,
+   ! theta_m, qv, and coarse-edge u. alpha = mod(tick, 2^L) / 2^L, with no
+   ! half-step lead. w stays on the snapshot. The lowest hts_iface_kmax
+   ! levels of a level-0 interface edge integrate against that ramp and are
+   ! kept; levels above stay on the snapshot flux.
+   logical, public :: hts_iface_interp = .false.
+   integer, parameter, public :: hts_iface_kmax = 6
 
    integer, public, allocatable :: hts_cell_level(:)
    integer, public, allocatable :: hts_edge_level(:)
@@ -172,6 +180,13 @@ module mpas_atm_hts
    real (kind=RKIND), allocatable :: snap_w(:,:,:), delta_w(:,:,:)
    real (kind=RKIND), allocatable :: snap_rw(:,:,:), delta_rw(:,:,:)
    real (kind=RKIND), allocatable :: snap_u(:,:,:), delta_u(:,:,:)
+   real (kind=RKIND), allocatable :: snap_qv(:,:,:), delta_qv(:,:,:)
+   ! Integrated level-0 interface wind at k = 1..hts_iface_kmax, saved before
+   ! the coarse close replaces time level 2 and written back afterward.
+   real (kind=RKIND), allocatable :: hts_u_keep(:,:)
+   logical, allocatable :: hts_u_kept(:)
+   integer :: hts_index_qv = 0
+   logical :: hts_qv_ok = .false.
 
    logical, allocatable :: hts_level_started(:)
    integer :: hts_nCells, hts_nEdges, hts_nVert
@@ -200,6 +215,7 @@ module mpas_atm_hts
       logical, pointer :: config_hts_debug_skip_promote
       logical, pointer :: config_hts_debug_keep_pp
       integer, pointer :: config_hts_debug_probe_cell
+      logical, pointer :: config_hts_interface_interp
       integer, pointer :: config_hts_max_level
       integer, pointer :: config_hts_moist_max_level
       integer, pointer :: config_hts_micro_substeps
@@ -224,6 +240,9 @@ module mpas_atm_hts
       hts_max_level_used = 0
       hts_force_path = .false.
       hts_path_live = .false.
+      hts_iface_interp = .false.
+      hts_qv_ok = .false.
+      hts_index_qv = 0
       hts_correct_logs = 0
       hts_max_flux_resid = 0.0_RKIND
       hts_hold_valid(:) = .false.
@@ -248,7 +267,7 @@ module mpas_atm_hts
       nullify(config_hts_debug_force_path, config_hts_debug_match_fine, config_hts_debug_refresh_diag)
       nullify(config_hts_debug_rad_every_substep, config_hts_debug_skip_idle_copy, config_hts_debug_skip_mass_correct)
       nullify(config_hts_debug_ruavg_last, config_hts_debug_skip_promote, config_hts_debug_keep_pp)
-      nullify(config_hts_debug_probe_cell)
+      nullify(config_hts_debug_probe_cell, config_hts_interface_interp)
       call mpas_pool_get_config(block % configs, 'config_hts_moist_max_level', config_hts_moist_max_level)
       call mpas_pool_get_config(block % configs, 'config_hts_micro_substeps', config_hts_micro_substeps)
       call mpas_pool_get_config(block % configs, 'config_hts_pbl_substeps', config_hts_pbl_substeps)
@@ -263,6 +282,7 @@ module mpas_atm_hts
       call mpas_pool_get_config(block % configs, 'config_hts_debug_skip_promote', config_hts_debug_skip_promote)
       call mpas_pool_get_config(block % configs, 'config_hts_debug_keep_pp', config_hts_debug_keep_pp)
       call mpas_pool_get_config(block % configs, 'config_hts_debug_probe_cell', config_hts_debug_probe_cell)
+      call mpas_pool_get_config(block % configs, 'config_hts_interface_interp', config_hts_interface_interp)
       hts_enabled = config_hts
       hts_moist_max_level = 2
       hts_micro_substeps = 1
@@ -298,6 +318,8 @@ module mpas_atm_hts
       if (associated(config_hts_debug_keep_pp)) hts_dbg_keep_pp = config_hts_debug_keep_pp
       if (associated(config_hts_debug_probe_cell)) hts_dbg_probe_cell = config_hts_debug_probe_cell
       if (hts_dbg_probe_cell < 0) hts_dbg_probe_cell = 0
+      hts_iface_interp = .false.
+      if (associated(config_hts_interface_interp)) hts_iface_interp = config_hts_interface_interp
       if (hts_dbg_match) then
          hts_dbg_refresh = .true.
          hts_dbg_rad_every = .true.
@@ -457,6 +479,10 @@ module mpas_atm_hts
             call mpas_log_write(' debug probe cell $i (Fortran index; 0-based history id is $i)', &
                                 intArgs=(/hts_dbg_probe_cell, hts_dbg_probe_cell - 1/))
          end if
+         if (hts_iface_interp) then
+            call mpas_log_write(' interface_interp: halo ramp alpha = mod(tick,2^L)/2^L; level-0 interface edges integrate k=1..$i', &
+                                intArgs=(/hts_iface_kmax/))
+         end if
          if (hts_micro_substeps == 0) then
             call mpas_log_write(' micro_substeps = 0: moist levels above 0 step dynamics, scalars, and Kessler at config_dt')
          end if
@@ -536,6 +562,21 @@ module mpas_atm_hts
       delta_u = 0.0_RKIND
       hts_level_started(:) = .false.
 
+      if (hts_iface_interp .and. hts_max_level_used >= 1) then
+         allocate(snap_qv(nVertLevels, nCells+1, hts_max_level_used))
+         allocate(delta_qv(nVertLevels, nCells+1, hts_max_level_used))
+         allocate(hts_u_keep(hts_iface_kmax, nEdges+1))
+         allocate(hts_u_kept(nEdges+1))
+         snap_qv = 0.0_RKIND
+         delta_qv = 0.0_RKIND
+         hts_u_keep = 0.0_RKIND
+         hts_u_kept(:) = .false.
+         call hts_find_qv(block)
+         if (.not. hts_qv_ok) then
+            call mpas_log_write(' interface_interp: index_qv is absent; qv stays on the snapshot')
+         end if
+      end if
+
       ! Silence unused-variable warnings on builds that do not walk neighbors here.
       iNbr = nEdgesOnCell(1)
       nbr = cellsOnCell(1, 1)
@@ -575,6 +616,10 @@ module mpas_atm_hts
       if (allocated(delta_rw)) deallocate(delta_rw)
       if (allocated(snap_u)) deallocate(snap_u)
       if (allocated(delta_u)) deallocate(delta_u)
+      if (allocated(snap_qv)) deallocate(snap_qv)
+      if (allocated(delta_qv)) deallocate(delta_qv)
+      if (allocated(hts_u_keep)) deallocate(hts_u_keep)
+      if (allocated(hts_u_kept)) deallocate(hts_u_kept)
       if (allocated(hts_level_started)) deallocate(hts_level_started)
       if (allocated(hts_work_own)) deallocate(hts_work_own)
       if (allocated(hts_work_all)) deallocate(hts_work_all)
@@ -1122,6 +1167,49 @@ module mpas_atm_hts
    end subroutine hts_diagnostics_from_state
 
 
+   subroutine hts_find_qv(block)
+
+      ! index_qv is absent on a dry state. The ramp then skips qv.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: state
+      integer, pointer :: index_qv
+
+      hts_qv_ok = .false.
+      hts_index_qv = 0
+      nullify(state, index_qv)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+      if (.not. associated(index_qv)) return
+      if (index_qv < 1) return
+      hts_index_qv = index_qv
+      hts_qv_ok = .true.
+
+   end subroutine hts_find_qv
+
+
+   function hts_iface_alpha(L) result(alpha)
+
+      ! Fraction of this coarse interval already elapsed. The open tick is 0.
+      ! There is no +0.5. Callers that skip mod == 0 never see the open.
+
+      implicit none
+
+      integer, intent(in) :: L
+      real (kind=RKIND) :: alpha
+      integer :: ratio
+
+      alpha = 0.0_RKIND
+      if (L < 1) return
+      ratio = ishft(1, L)
+      alpha = real(mod(hts_tick, ratio), RKIND) / real(ratio, RKIND)
+
+   end function hts_iface_alpha
+
+
    subroutine atm_hts_begin_intervals(block)
 
       implicit none
@@ -1133,6 +1221,8 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer :: L, i, iCell, iEdge, k, ratio
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars1
+      type (mpas_pool_type), pointer :: state
 
       if (hts_max_level_used < 1 .and. .not. hts_force_path) return
 
@@ -1142,6 +1232,11 @@ module mpas_atm_hts
                             rho_p, rho_p_save, rtheta_p, rtheta_p_save, &
                             pressure_p, exner, exner_base, rtheta_base, rho_base, zz, &
                             ru, ru_save, rw, rw_save, rho_edge)
+      nullify(scalars1, state)
+      if (hts_iface_interp .and. hts_qv_ok) then
+         call mpas_pool_get_subpool(block % structs, 'state', state)
+         call mpas_pool_get_array(state, 'scalars', scalars1, 1)
+      end if
 
       do L = 1, hts_max_level_used
          ratio = ishft(1, L)
@@ -1155,6 +1250,10 @@ module mpas_atm_hts
                   snap_theta(k, iCell, L) = th1(k, iCell)
                   delta_rho(k, iCell, L) = 0.0_RKIND
                   delta_theta(k, iCell, L) = 0.0_RKIND
+                  if (hts_iface_interp .and. hts_qv_ok) then
+                     snap_qv(k, iCell, L) = scalars1(hts_index_qv, k, iCell)
+                     delta_qv(k, iCell, L) = 0.0_RKIND
+                  end if
                end do
                do k = 1, hts_nVert + 1
                   snap_w(k, iCell, L) = w1(k, iCell)
@@ -1188,6 +1287,10 @@ module mpas_atm_hts
                   delta_theta(k, iCell, L) = th1(k, iCell) - snap_theta(k, iCell, L)
                   snap_rho(k, iCell, L) = rho1(k, iCell)
                   snap_theta(k, iCell, L) = th1(k, iCell)
+                  if (hts_iface_interp .and. hts_qv_ok) then
+                     delta_qv(k, iCell, L) = scalars1(hts_index_qv, k, iCell) - snap_qv(k, iCell, L)
+                     snap_qv(k, iCell, L) = scalars1(hts_index_qv, k, iCell)
+                  end if
                end do
                do k = 1, hts_nVert + 1
                   delta_w(k, iCell, L) = w1(k, iCell) - snap_w(k, iCell, L)
@@ -1230,29 +1333,27 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
-      type (mpas_pool_type), pointer :: mesh
+      type (mpas_pool_type), pointer :: mesh, state
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars1, scalars2
       integer :: L, i, iCell, iEdge, k, cell1, cell2, ratio
-      real (kind=RKIND) :: alpha, rho_here, th_here, u_here
+      real (kind=RKIND) :: alpha, rho_here, th_here, u_here, qv_here
       logical :: any
 
       if (allocated(hts_lock_edge)) hts_lock_edge(:) = .false.
+      if (hts_iface_interp .and. activeLevel == 0 .and. allocated(hts_u_kept)) hts_u_kept(:) = .false.
       if (hts_max_level_used <= activeLevel .and. .not. (hts_force_path .and. hts_max_level_used == 0)) return
 
       call mpas_timer_start('hts_apply_interpolation')
 
       ! The snapshot stored at an interval open is already the end of the
-      ! previous interval. Adding alpha*delta on rho and theta leads that
-      ! state while ring w and the locked face stay on the snapshot, so the
-      ! fine column advects a newer theta through an older mass flux. The
-      ! vertical coefficients themselves are column-local and do not read the
-      ! neighbor. Job 200144 moved the locked level-0 face to zero that
-      ! column's divergence (at most 20 m/s) and max |w| at 00:30 did not
-      ! change: 18.80 versus 18.84 m/s on cell 22181, six cells inside the
-      ! fine patch, where that face move does not act. The same run NaNed w
-      ! at 01:29. The face move is gone. Ring rho, theta, w, and the locked
-      ! wind are the last realized snapshot, and the face mass flux uses that
-      ! wind with the two cells' densities. Acoustic parents stay off. The
-      ! coarse RK still starts from the snapshot.
+      ! previous interval. alpha = (mod(tick, 2^L) + 0.5) / 2^L on rho,
+      ! theta, u, and w leads that state: job 200072 reached max |u| 160–171,
+      ! and job 200144 NaNed w at 01:29. The default keeps alpha at 0.
+      ! config_hts_interface_interp uses alpha = mod(tick, 2^L) / 2^L, the
+      ! fraction of the coarse interval already elapsed, on rho, theta_m, qv,
+      ! and coarse-edge u only. w is not ramped. The open tick is mod == 0
+      ! and is skipped below, so alpha is never a half-step lead. The coarse
+      ! column is restored afterward and its RK still starts from the snapshot.
       any = .false.
       do L = activeLevel + 1, hts_max_level_used
          if (.not. hts_hold_valid(L)) any = .true.
@@ -1264,6 +1365,12 @@ module mpas_atm_hts
                             ru, ru_save, rw, rw_save, rho_edge)
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      nullify(scalars1, scalars2, state)
+      if (hts_iface_interp .and. hts_qv_ok) then
+         call mpas_pool_get_subpool(block % structs, 'state', state)
+         call mpas_pool_get_array(state, 'scalars', scalars1, 1)
+         call mpas_pool_get_array(state, 'scalars', scalars2, 2)
+      end if
 
       do i = 1, hts_n_diag_all(activeLevel)
          iCell = hts_diag_all(i, activeLevel)
@@ -1272,9 +1379,10 @@ module mpas_atm_hts
          if (.not. hts_have_delta(L)) cycle
          ratio = ishft(1, L)
          if (mod(hts_tick, ratio) == 0) cycle
-         ! Same time as snap_w and the locked wind. alpha*delta here is a
-         ! lead past the realized state; do not apply it.
+         ! Off: alpha is 0 and this is the held snapshot. On: fraction of the
+         ! coarse interval already elapsed. w below stays on the snapshot.
          alpha = 0.0_RKIND
+         if (hts_iface_interp) alpha = hts_iface_alpha(L)
          do k = 1, hts_nVert
             rho_here = snap_rho(k, iCell, L) + alpha * delta_rho(k, iCell, L)
             th_here = snap_theta(k, iCell, L) + alpha * delta_theta(k, iCell, L)
@@ -1282,6 +1390,11 @@ module mpas_atm_hts
             rho2(k, iCell) = rho_here
             th1(k, iCell) = th_here
             th2(k, iCell) = th_here
+            if (hts_iface_interp .and. hts_qv_ok) then
+               qv_here = snap_qv(k, iCell, L) + alpha * delta_qv(k, iCell, L)
+               scalars1(hts_index_qv, k, iCell) = qv_here
+               scalars2(hts_index_qv, k, iCell) = qv_here
+            end if
             call hts_diagnostics_from_state(k, iCell, rho_here, th_here, rho_base(k, iCell), &
                  rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
                  rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
@@ -1304,8 +1417,14 @@ module mpas_atm_hts
          if (mod(hts_tick, ratio) == 0) cycle
          cell1 = cellsOnEdge(1, iEdge)
          cell2 = cellsOnEdge(2, iEdge)
+         alpha = 0.0_RKIND
+         if (hts_iface_interp) alpha = hts_iface_alpha(L)
          do k = 1, hts_nVert
-            u_here = snap_u(k, iEdge, L)
+            if (hts_iface_interp) then
+               u_here = snap_u(k, iEdge, L) + alpha * delta_u(k, iEdge, L)
+            else
+               u_here = snap_u(k, iEdge, L)
+            end if
             u1(k, iEdge) = u_here
             u2(k, iEdge) = u_here
             ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
@@ -1316,9 +1435,10 @@ module mpas_atm_hts
 
       ! Interface edges owned by this level (edge level == active) otherwise
       ! integrate tend_u_euler. Hold them on the last realized coarse wind.
-      ! The mass flux uses that wind and the two cells' densities, which the
-      ! ring write above has put back on the snapshot. Edges the coarse step
-      ! imposes are not in this set.
+      ! The mass flux uses that wind and the two cells' densities. Edges the
+      ! coarse step imposes are not in this set. With interface_interp, a
+      ! level-0 edge keeps its evolved wind on k = 1..hts_iface_kmax and the
+      ! acoustic step integrates those levels. Levels above stay on the snapshot.
       if (allocated(hts_lock_edge) .and. allocated(hts_iface_coarse) .and. allocated(hts_ru_target)) then
          do iEdge = 1, hts_nEdges
             if (hts_edge_level(iEdge) /= activeLevel) cycle
@@ -1329,9 +1449,14 @@ module mpas_atm_hts
             cell2 = cellsOnEdge(2, iEdge)
             hts_lock_edge(iEdge) = .true.
             do k = 1, hts_nVert
-               u_here = snap_u(k, iEdge, L)
-               u1(k, iEdge) = u_here
-               u2(k, iEdge) = u_here
+               if (hts_iface_interp .and. activeLevel == 0 .and. k <= hts_iface_kmax) then
+                  u_here = u1(k, iEdge)
+                  u2(k, iEdge) = u_here
+               else
+                  u_here = snap_u(k, iEdge, L)
+                  u1(k, iEdge) = u_here
+                  u2(k, iEdge) = u_here
+               end if
                ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * u_here
                ru_save(k, iEdge) = ru(k, iEdge)
                rho_edge(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
@@ -1410,7 +1535,8 @@ module mpas_atm_hts
       real (kind=RKIND), dimension(:,:), pointer :: pressure_p, exner, exner_base, rtheta_base, rho_base, zz
       real (kind=RKIND), dimension(:,:), pointer :: ru, ru_save, rw, rw_save, rho_edge
       integer, dimension(:,:), pointer :: cellsOnEdge
-      type (mpas_pool_type), pointer :: mesh
+      type (mpas_pool_type), pointer :: mesh, state
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars1, scalars2
       integer :: L, i, iCell, iEdge, k, cell1, cell2, ratio
       logical :: any
 
@@ -1432,6 +1558,12 @@ module mpas_atm_hts
                             ru, ru_save, rw, rw_save, rho_edge)
       call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      nullify(scalars1, scalars2, state)
+      if (hts_iface_interp .and. hts_qv_ok) then
+         call mpas_pool_get_subpool(block % structs, 'state', state)
+         call mpas_pool_get_array(state, 'scalars', scalars1, 1)
+         call mpas_pool_get_array(state, 'scalars', scalars2, 2)
+      end if
 
       do i = 1, hts_n_diag_all(activeLevel)
          iCell = hts_diag_all(i, activeLevel)
@@ -1445,6 +1577,10 @@ module mpas_atm_hts
             rho2(k, iCell) = snap_rho(k, iCell, L)
             th1(k, iCell) = snap_theta(k, iCell, L)
             th2(k, iCell) = snap_theta(k, iCell, L)
+            if (hts_iface_interp .and. hts_qv_ok) then
+               scalars1(hts_index_qv, k, iCell) = snap_qv(k, iCell, L)
+               scalars2(hts_index_qv, k, iCell) = snap_qv(k, iCell, L)
+            end if
             call hts_diagnostics_from_state(k, iCell, snap_rho(k, iCell, L), snap_theta(k, iCell, L), &
                  rho_base(k, iCell), rtheta_base(k, iCell), zz(k, iCell), exner_base(k, iCell), &
                  rho_p(k, iCell), rtheta_p(k, iCell), exner(k, iCell), pressure_p(k, iCell))
@@ -1483,6 +1619,11 @@ module mpas_atm_hts
             cell1 = cellsOnEdge(1, iEdge)
             cell2 = cellsOnEdge(2, iEdge)
             do k = 1, hts_nVert
+               if (hts_iface_interp .and. activeLevel == 0 .and. k <= hts_iface_kmax .and. allocated(hts_u_keep)) then
+                  hts_u_keep(k, iEdge) = u2(k, iEdge)
+                  hts_u_kept(iEdge) = .true.
+                  cycle
+               end if
                u1(k, iEdge) = snap_u(k, iEdge, L)
                u2(k, iEdge) = snap_u(k, iEdge, L)
                ru(k, iEdge) = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2)) * snap_u(k, iEdge, L)
@@ -1542,6 +1683,59 @@ module mpas_atm_hts
       call mpas_timer_stop('hts_restore_above')
 
    end subroutine atm_hts_restore_above
+
+
+   subroutine atm_hts_commit_interface_u(block)
+
+      ! The coarse recover and the mass correction replace a level-0 interface
+      ! edge with the interval-mean flux. Put k = 1..hts_iface_kmax back on the
+      ! wind the fine step integrated. Off, or a tick that saved nothing, returns
+      ! without writing.
+
+      implicit none
+
+      type (block_type), intent(in) :: block
+
+      type (mpas_pool_type), pointer :: state, diag, mesh
+      integer, dimension(:,:), pointer :: cellsOnEdge
+      real (kind=RKIND), dimension(:,:), pointer :: u1, u2, ru, ru_save, rho_edge, rho2
+      integer :: iEdge, k, cell1, cell2, ktop
+      real (kind=RKIND) :: u_here, rho_face
+
+      if (.not. hts_iface_interp) return
+      if (.not. allocated(hts_u_kept)) return
+
+      nullify(state, diag, mesh, u1, u2, ru, ru_save, rho_edge, rho2, cellsOnEdge)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_array(state, 'u', u1, 1)
+      call mpas_pool_get_array(state, 'u', u2, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho2, 2)
+      call mpas_pool_get_array(diag, 'ru', ru)
+      call mpas_pool_get_array(diag, 'ru_save', ru_save)
+      call mpas_pool_get_array(diag, 'rho_edge', rho_edge)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+
+      ktop = hts_iface_kmax
+      if (ktop > hts_nVert) ktop = hts_nVert
+      do iEdge = 1, hts_nEdges
+         if (.not. hts_u_kept(iEdge)) cycle
+         cell1 = cellsOnEdge(1, iEdge)
+         cell2 = cellsOnEdge(2, iEdge)
+         do k = 1, ktop
+            u_here = hts_u_keep(k, iEdge)
+            u1(k, iEdge) = u_here
+            u2(k, iEdge) = u_here
+            rho_face = 0.5_RKIND * (rho2(k, cell1) + rho2(k, cell2))
+            ru(k, iEdge) = rho_face * u_here
+            ru_save(k, iEdge) = ru(k, iEdge)
+            rho_edge(k, iEdge) = rho_face
+         end do
+         hts_u_kept(iEdge) = .false.
+      end do
+
+   end subroutine atm_hts_commit_interface_u
 
 
    subroutine atm_hts_sync_finer(block, activeLevel)

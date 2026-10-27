@@ -2019,6 +2019,7 @@ module atm_time_integration
          hts_impose = .false.
       end do
 
+      call atm_hts_commit_interface_u(block)
       call hts_refresh_wind()
       hts_masking = .false.
       hts_active_level = 0
@@ -4606,11 +4607,18 @@ module atm_time_integration
               if (hts_masking) then
                  if (allocated(hts_lock_edge)) then
                     if (hts_lock_edge(iEdge)) then
-                       do k = 1, nVertLevels
-                          ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
-                          ruAvg(k,iEdge) = ruAvg(k,iEdge) + ru_p(k,iEdge)
-                       end do
-                       cycle
+                       if (hts_iface_interp .and. hts_active_level == 0) then
+                          do k = hts_iface_kmax + 1, nVertLevels
+                             ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                             ruAvg(k,iEdge) = ruAvg(k,iEdge) + ru_p(k,iEdge)
+                          end do
+                       else
+                          do k = 1, nVertLevels
+                             ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                             ruAvg(k,iEdge) = ruAvg(k,iEdge) + ru_p(k,iEdge)
+                          end do
+                          cycle
+                       end if
                     end if
                  end if
                  if (hts_edge_level(iEdge) /= hts_active_level) then
@@ -4628,6 +4636,11 @@ module atm_time_integration
 !DIR$ IVDEP
               !$acc loop vector
               do k=1,nVertLevels
+#ifndef MPAS_OPENACC
+                 if (hts_iface_interp .and. hts_active_level == 0 .and. allocated(hts_lock_edge)) then
+                    if (hts_lock_edge(iEdge) .and. k > hts_iface_kmax) cycle
+                 end if
+#endif
                  pgrad = ((rtheta_pp(k,cell2)-rtheta_pp(k,cell1))*invDcEdge(iEdge) )/(.5*(zz(k,cell2)+zz(k,cell1)))
                  pgrad = cqu(k,iEdge)*0.5*c2*(exner(k,cell1)+exner(k,cell2))*pgrad
                  pgrad = pgrad + 0.5*zxu(k,iEdge)*gravity*(rho_pp(k,cell1)+rho_pp(k,cell2))
@@ -4638,6 +4651,11 @@ module atm_time_integration
 !DIR$ IVDEP
               !$acc loop vector
               do k=1,nVertLevels
+#ifndef MPAS_OPENACC
+                 if (hts_iface_interp .and. hts_active_level == 0 .and. allocated(hts_lock_edge)) then
+                    if (hts_lock_edge(iEdge) .and. k > hts_iface_kmax) cycle
+                 end if
+#endif
                  ruAvg(k,iEdge) = ruAvg(k,iEdge) + ru_p(k,iEdge)
               end do
 
@@ -4661,11 +4679,18 @@ module atm_time_integration
               if (hts_masking) then
                  if (allocated(hts_lock_edge)) then
                     if (hts_lock_edge(iEdge)) then
-                       do k = 1, nVertLevels
-                          ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
-                          ruAvg(k,iEdge) = ru_p(k,iEdge)
-                       end do
-                       cycle
+                       if (hts_iface_interp .and. hts_active_level == 0) then
+                          do k = hts_iface_kmax + 1, nVertLevels
+                             ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                             ruAvg(k,iEdge) = ru_p(k,iEdge)
+                          end do
+                       else
+                          do k = 1, nVertLevels
+                             ru_p(k,iEdge) = hts_ru_target(k,iEdge) - ru_save(k,iEdge)
+                             ruAvg(k,iEdge) = ru_p(k,iEdge)
+                          end do
+                          cycle
+                       end if
                     end if
                  end if
                  if (hts_edge_level(iEdge) /= hts_active_level) then
@@ -4683,11 +4708,21 @@ module atm_time_integration
 !DIR$ IVDEP
               !$acc loop vector
               do k=1,nVertLevels
+#ifndef MPAS_OPENACC
+                 if (hts_iface_interp .and. hts_active_level == 0 .and. allocated(hts_lock_edge)) then
+                    if (hts_lock_edge(iEdge) .and. k > hts_iface_kmax) cycle
+                 end if
+#endif
                  ru_p(k,iEdge) = dts*tend_ru(k,iEdge)
               end do
 !DIR$ IVDEP
               !$acc loop vector
               do k=1,nVertLevels
+#ifndef MPAS_OPENACC
+                 if (hts_iface_interp .and. hts_active_level == 0 .and. allocated(hts_lock_edge)) then
+                    if (hts_lock_edge(iEdge) .and. k > hts_iface_kmax) cycle
+                 end if
+#endif
                  ruAvg(k,iEdge) = ru_p(k,iEdge)
               end do
 
@@ -4976,7 +5011,9 @@ module atm_time_integration
 #ifndef MPAS_OPENACC
             if (hts_masking) then
                if (allocated(hts_lock_edge)) then
-                  if (hts_lock_edge(iEdge)) cycle
+                  if (hts_lock_edge(iEdge)) then
+                     if (.not. (hts_iface_interp .and. hts_active_level == 0)) cycle
+                  end if
                end if
                if (hts_edge_level(iEdge) /= hts_active_level) cycle
             end if
@@ -4985,6 +5022,11 @@ module atm_time_integration
 !DIR$ IVDEP
             !$acc loop vector
             do k=1,nVertLevels
+#ifndef MPAS_OPENACC
+               if (hts_iface_interp .and. hts_active_level == 0 .and. allocated(hts_lock_edge)) then
+                  if (hts_lock_edge(iEdge) .and. k > hts_iface_kmax) cycle
+               end if
+#endif
 
 !!  unscaled 3d divergence damping
 !!               divCell1 = -(rtheta_pp(k,cell1)-rtheta_pp_old(k,cell1))*rdts
