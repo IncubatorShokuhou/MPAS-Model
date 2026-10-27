@@ -21,6 +21,7 @@
 
  use mpas_atmphys_constants
  use mpas_atmphys_vars
+ use mpas_atmphys_column_mask, only: column_mask_on, column_active
  use mpas_timer, only: mpas_timer_start, mpas_timer_stop
 
  implicit none
@@ -657,6 +658,11 @@ end subroutine pre_microphysics
  do j = jts, jte
  do k = kts, kte
  do i = its, ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
     qv_p(i,k,j) = qv(k,i)
     qc_p(i,k,j) = qc(k,i)
     qr_p(i,k,j) = qr(k,i)
@@ -693,6 +699,11 @@ end subroutine pre_microphysics
        do j = jts, jte
        do k = kts, kte
        do i = its, ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
           qi_p(i,k,j) = qi(k,i)
           qs_p(i,k,j) = qs(k,i)
           qg_p(i,k,j) = qg(k,i)
@@ -717,11 +728,21 @@ end subroutine pre_microphysics
              call mpas_pool_get_array(diag_physics,'mu_c',mu_c)
              do j = jts,jte
              do i = its,ite
+                if (column_mask_on) then
+                if (.not. allocated(column_active)) cycle
+                if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                if (.not. column_active(i)) cycle
+                end if
                 muc_p(i,j) = mu_c(i)
                 ntc_p(i,j) = nt_c(i)
              enddo
              do k = kts, kte
              do i = its, ite
+                if (column_mask_on) then
+                if (.not. allocated(column_active)) cycle
+                if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                if (.not. column_active(i)) cycle
+                end if
                 ni_p(i,k,j) = ni(k,i)
                 nr_p(i,k,j) = nr(k,i)
              enddo
@@ -741,11 +762,21 @@ end subroutine pre_microphysics
                 call mpas_pool_get_array(diag_physics,'nwfa2d',nwfa2d)
                 do j = jts,jte
                 do i = its,ite
+                   if (column_mask_on) then
+                   if (.not. allocated(column_active)) cycle
+                   if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                   if (.not. column_active(i)) cycle
+                   end if
                    nifa2d_p(i,j) = nifa2d(i)
                    nwfa2d_p(i,j) = nwfa2d(i)
                 enddo
                 do k = kts, kte
                 do i = its, ite
+                   if (column_mask_on) then
+                   if (.not. allocated(column_active)) cycle
+                   if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                   if (.not. column_active(i)) cycle
+                   end if
                    nc_p(i,k,j) = nc(k,i)
                    nifa_p(i,k,j) = nifa(k,i)
                    nwfa_p(i,k,j) = nwfa(k,i)
@@ -775,6 +806,11 @@ end subroutine pre_microphysics
 
        do k = kts,kte
        do i = its,ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
           rthmpten(k,i) = theta_m(k,i)/(1._RKIND+R_v/R_d*max(0._RKIND,qv(k,i)))
           rqvmpten(k,i) = qv(k,i)
           rqcmpten(k,i) = qc(k,i)
@@ -792,6 +828,11 @@ end subroutine pre_microphysics
 
              do k = kts,kte
              do i = its,ite
+                if (column_mask_on) then
+                if (.not. allocated(column_active)) cycle
+                if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                if (.not. column_active(i)) cycle
+                end if
                 rnimpten(k,i) = ni(k,i)
                 rnrmpten(k,i) = nr(k,i)
              enddo
@@ -805,6 +846,11 @@ end subroutine pre_microphysics
 
                    do k = kts,kte
                    do i = its,ite
+                      if (column_mask_on) then
+                      if (.not. allocated(column_active)) cycle
+                      if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                      if (.not. column_active(i)) cycle
+                      end if
                       rncmpten(k,i) = nc(k,i)
                       rnifampten(k,i) = nifa(k,i)
                       rnwfampten(k,i) = nwfa(k,i)
@@ -903,6 +949,11 @@ end subroutine pre_microphysics
  do j = jts,jte
  do k = kts,mp_top_level
  do i = its,ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
 
     !initializes tendency of coupled potential temperature potential temperature, and
     !potential temperature heating rate from microphysics:
@@ -937,6 +988,11 @@ end subroutine pre_microphysics
  ! why are we not applying this to theta and qv?
  if(kte .gt. mp_top_level) then
     do i = its,ite
+       if (column_mask_on) then
+       if (.not. allocated(column_active)) cycle
+       if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+       if (.not. column_active(i)) cycle
+       end if
     do k = mp_top_level+1,kte
        qc(k,i) = 0.
        qr(k,i) = 0.
@@ -948,6 +1004,11 @@ end subroutine pre_microphysics
 !update surface pressure and calculates the surface pressure tendency:
  do j = jts,jte
  do i = its,ite
+    if (column_mask_on) then
+    if (.not. allocated(column_active)) cycle
+    if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+    if (.not. column_active(i)) cycle
+    end if
     tem1 = zgrid(2,i)-zgrid(1,i)
     tem2 = zgrid(3,i)-zgrid(2,i)
     rho1 = rho_zz(1,i) * zz(1,i) * (1. + qv_p(i,1,j))
@@ -983,6 +1044,11 @@ end subroutine pre_microphysics
        do j = jts,jte
        do k = kts,mp_top_level
        do i = its,ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
           qi(k,i) = qi_p(i,k,j)
           qs(k,i) = qs_p(i,k,j)
           qg(k,i) = qg_p(i,k,j)
@@ -999,6 +1065,11 @@ end subroutine pre_microphysics
        ! no microphysics updates above mp_top_level
        if(kte .gt. mp_top_level) then
           do i = its,ite
+             if (column_mask_on) then
+             if (.not. allocated(column_active)) cycle
+             if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+             if (.not. column_active(i)) cycle
+             end if
           do k = mp_top_level+1,kte
              qi(k,i) = 0.
              qs(k,i) = 0.
@@ -1022,6 +1093,11 @@ end subroutine pre_microphysics
              do j = jts,jte
              do k = kts,kte
              do i = its,ite
+                if (column_mask_on) then
+                if (.not. allocated(column_active)) cycle
+                if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                if (.not. column_active(i)) cycle
+                end if
                 ni(k,i) = ni_p(i,k,j)
                 nr(k,i) = nr_p(i,k,j)
              enddo
@@ -1041,11 +1117,21 @@ end subroutine pre_microphysics
                    call mpas_pool_get_array(diag_physics,'nwfa2d',nwfa2d)
                    do j = jts,jte
                    do i = its,ite
+                      if (column_mask_on) then
+                      if (.not. allocated(column_active)) cycle
+                      if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                      if (.not. column_active(i)) cycle
+                      end if
                       nifa2d(i) = nifa2d_p(i,j)
                       nwfa2d(i) = nwfa2d_p(i,j)
                    enddo
                    do k = kts, kte
                    do i = its, ite
+                      if (column_mask_on) then
+                      if (.not. allocated(column_active)) cycle
+                      if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                      if (.not. column_active(i)) cycle
+                      end if
                       nc(k,i)   = nc_p(i,k,j)
                       nifa(k,i) = nifa_p(i,k,j)
                       nwfa(k,i) = nwfa_p(i,k,j)
@@ -1074,6 +1160,11 @@ end subroutine pre_microphysics
        call mpas_pool_get_array(tend_physics,'rqgmpten',rqgmpten)
 
        do i = its,ite
+          if (column_mask_on) then
+          if (.not. allocated(column_active)) cycle
+          if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+          if (.not. column_active(i)) cycle
+          end if
        do k = kts,mp_top_level
           rthmpten(k,i) = (theta_m(k,i)/(1._RKIND+R_v/R_d*max(0._RKIND,qv(k,i)))-rthmpten(k,i))/dt_dyn
           rqvmpten(k,i) = (qv(k,i)-rqvmpten(k,i))/dt_dyn
@@ -1088,6 +1179,11 @@ end subroutine pre_microphysics
        ! no microphysics tendency above level mp_top_level
        if(kte .gt. mp_top_level) then
           do i = its, ite
+             if (column_mask_on) then
+             if (.not. allocated(column_active)) cycle
+             if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+             if (.not. column_active(i)) cycle
+             end if
           do k = mp_top_level+1, kte
              rthmpten(k,i) = 0.
              rqvmpten(k,i) = 0.
@@ -1107,6 +1203,11 @@ end subroutine pre_microphysics
 
              do k = kts,kte
              do i = its,ite
+                if (column_mask_on) then
+                if (.not. allocated(column_active)) cycle
+                if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                if (.not. column_active(i)) cycle
+                end if
                 rnimpten(k,i) = (ni(k,i)-rnimpten(k,i))/dt_dyn
                 rnrmpten(k,i) = (nr(k,i)-rnrmpten(k,i))/dt_dyn
              enddo
@@ -1120,6 +1221,11 @@ end subroutine pre_microphysics
 
                    do k = kts,kte
                    do i = its,ite
+                      if (column_mask_on) then
+                      if (.not. allocated(column_active)) cycle
+                      if (i < lbound(column_active,1) .or. i > ubound(column_active,1)) cycle
+                      if (.not. column_active(i)) cycle
+                      end if
                       rncmpten(k,i)   = (nc(k,i)-rncmpten(k,i))/dt_dyn
                       rnifampten(k,i) = (nifa(k,i)-rnifampten(k,i))/dt_dyn
                       rnwfampten(k,i) = (nwfa(k,i)-rnwfampten(k,i))/dt_dyn

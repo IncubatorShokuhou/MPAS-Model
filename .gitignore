@@ -61,3 +61,6 @@ stream_list.*
 *.i90
 
 src/core_*/inc
+
+# Local Python cache from the HTS summary script
+docs/hts/scripts/__pycache__/

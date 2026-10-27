@@ -13,6 +13,7 @@
 
  use mpas_atmphys_constants,only: cp,P0,R_d,rcp
  use mpas_atmphys_vars,only: xice_threshold
+ use mpas_atmphys_column_mask, only: column_is_active
 
 
  implicit none
@@ -41,7 +42,6 @@
 !local variables and pointers:
  character(len=StrKIND),pointer:: lsm_scheme
 
- integer,pointer:: nCellsSolve
  integer:: i
 
  real(kind=RKIND),dimension(:),pointer:: psfc
@@ -57,8 +57,6 @@
 !call mpas_log_write('--- enter subroutine atmphys_sfc_diagnostics:')
 
  call mpas_pool_get_config(configs,'config_lsm_scheme',lsm_scheme)
-
- call mpas_pool_get_dimension(mesh,'nCellsSolve',nCellsSolve)
 
  call mpas_pool_get_array(diag,'surface_pressure',psfc)
 
@@ -77,7 +75,8 @@
 
  sf_select: select case(trim(lsm_scheme))
     case("sf_noah")
-       do i = 1,nCellsSolve
+       do i = its, ite
+          if (.not. column_is_active(i)) cycle
           rho = psfc(i)/(R_d*tsk(i))
           if(cqs2(i) .lt. 1.e-5) then
              q2(i) = qsfc(i)
@@ -95,7 +94,8 @@
     case("sf_noahmp")
        call mpas_pool_get_array(output_noahmp,'q2mxy',q2mxy)
        call mpas_pool_get_array(output_noahmp,'t2mxy',t2mxy)
-       do i = 1,nCellsSolve
+       do i = its, ite
+          if (.not. column_is_active(i)) cycle
           rho = psfc(i)/(R_d*tsk(i))
           if((xland(i)-1.5 .gt. 0._RKIND) .or. (xland(i)-1.5.le.0._RKIND .and. xice(i).ge.xice_threshold)) then
              if(cqs2(i) .lt. 1.e-5) then

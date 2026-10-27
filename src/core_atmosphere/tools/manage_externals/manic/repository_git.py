@@ -791,8 +791,18 @@ class GitRepository(Repository):
 
     @staticmethod
     def _git_remote_add(name, url, dirname):
-        """Run the git remote command for the side effect of adding a remote
+        """Run the git remote command for the side effect of adding a remote.
+
+        A later checkout_externals pass (a second make) can rebuild the same
+        remote name when the stored URL string no longer compares equal.
+        git then exits with "remote already exists" and the build stops.
+        Keep the remote that is already there.
         """
+        git_output = GitRepository._git_remote_verbose(dirname)
+        for line in git_output.splitlines():
+            data = line.split()
+            if data and data[0] == name:
+                return
         cmd = 'git -C {dirname} remote add {name} {url}'.format(
             dirname=dirname, name=name, url=url).split()
         execute_subprocess(cmd)

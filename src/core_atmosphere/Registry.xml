@@ -73,8 +73,113 @@
 
                 <nml_option name="config_dt" type="real" default_value="720.0"
                      units="s"
-                     description="Model time step, seconds"
+                     description="Model time step, seconds. With hierarchical time stepping this is the fine-level step."
                      possible_values="Positive real values"/>
+
+                <nml_option name="config_hts" type="logical" default_value="false"
+                     units="-"
+                     description="Enable hierarchical time stepping. False leaves the integrator unchanged."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_max_level" type="integer" default_value="1"
+                     units="-"
+                     description="Largest power-of-two time-step level (0 = fine only). Level L advances by config_dt * 2^L."
+                     possible_values="Integers from 0 through 8"/>
+
+                <nml_option name="config_hts_moist_max_level" type="integer" default_value="2"
+                     units="-"
+                     description="Moist-physics cap on the active level. The coarse step is config_dt * 2^min(config_hts_max_level, this). Dry runs ignore it."
+                     possible_values="Integers from 0 through 8"/>
+
+                <nml_option name="config_hts_micro_substeps" type="integer" default_value="1"
+                     units="-"
+                     description="Coupled dynamics, scalar, and Kessler steps on moist levels above 0. 0 uses config_dt (2^L steps) on every such level. A positive integer is that many steps on the coarsest moist level only. 1 is one step of the level dt. The acoustic step stays config_dt / config_number_of_sub_steps."
+                     possible_values="Integers from 0 up, preferably a power of two"/>
+
+                <nml_option name="config_hts_pbl_substeps" type="integer" default_value="1"
+                     units="-"
+                     description="Surface, Noah, PBL, and GWDO calls on moist levels above 0. 1 is one call of the level dt. 0 calls them at config_dt (2^L times), folds each increment, and leaves dynamics at the level dt. That fold is not the default: on the eds land mesh it warmed the skin and blew up a level-1 surface edge. A positive integer other than 1 is that many calls on the coarsest moist level only."
+                     possible_values="Integers from 0 up, preferably a power of two"/>
+
+                <nml_option name="config_hts_kessler_substeps" type="integer" default_value="1"
+                     units="-"
+                     description="Kessler calls inside one dynamics step. 0 uses config_dt (2^L calls) on every moist level above 0. A positive integer greater than 1 is that many calls on the coarsest moist level only. 1 is one call of the level dt. Ignored when config_hts_micro_substeps is 0 or greater than 1."
+                     possible_values="Integers from 0 up"/>
+
+                <nml_option name="config_hts_debug_force_path" type="logical" default_value="false"
+                     units="-"
+                     description="With every cell at level 0, still run lists, the acoustic halo, snapshot and restore, flux accumulation, the idle-scalar copy, and HTS column physics. Requires config_hts true. A mesh that already has a coarse level ignores it."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_match_fine" type="logical" default_value="false"
+                     units="-"
+                     description="On moist levels above 0, rebuild exner, pressure, and the cell wind from the prognostics before each column-physics call, and rerun radiation on every substep while that level's radiation alarm is latched. For a level-1 run with micro_substeps = 0 and pbl_substeps = 0 this is the bundle that should move the config_dt path toward all-fine. It does not skip the idle-scalar copy, the mass correction, or the time-level promote."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_refresh_diag" type="logical" default_value="false"
+                     units="-"
+                     description="Rebuild exner, pressure_p, rho_p, rtheta_p, and the cell wind from the prognostic state before each column-physics call on levels above 0. Also set by config_hts_debug_match_fine."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_rad_every_substep" type="logical" default_value="false"
+                     units="-"
+                     description="While a coarse step takes more than one substep, do not clear a latched radiation or convection alarm until the step finishes, so each substep reruns that scheme. A single level-dt call is unchanged. Also set by config_hts_debug_match_fine."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_skip_idle_copy" type="logical" default_value="false"
+                     units="-"
+                     description="Skip both idle-scalar copies. The shift can then publish the previous scalar buffer on a column that did not step."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_skip_mass_correct" type="logical" default_value="false"
+                     units="-"
+                     description="Skip the interface mass correction after a coarse step. Interior columns are not in that loop."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_ruavg_last" type="logical" default_value="false"
+                     units="-"
+                     description="After a split dynamics step, leave ruAvg at the last substep instead of the mean. wwAvg is already rebuilt inside each substep. The mass correction then compares that last flux to the full-interval target."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_skip_promote" type="logical" default_value="false"
+                     units="-"
+                     description="Do not copy time level 2 onto time level 1 between dynamics substeps. The next SRK3 then restarts from the state the previous substep started from."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_keep_pp" type="logical" default_value="false"
+                     units="-"
+                     description="Do not zero rho_pp, rtheta_pp, and rw_p on inactive acoustic neighbors. That is the open-interface parent update from job 199953. Off by default."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_debug_probe_cell" type="integer" default_value="0"
+                     units="-"
+                     description="Fortran cell index to print every fine step (0 disables). A 0-based history id is one less: the eds cell 3177 is 3178 here. The line is wmax, its level, theta, qv, rho, t2m, skintemp, surface |u| max on the cell edges, and global max |w|."
+                     possible_values="Integers from 0 up"/>
+
+                <nml_option name="config_hts_interface_interp" type="logical" default_value="false"
+                     units="-"
+                     description="Time-interpolate the coarse halo the fine step reads. alpha = mod(tick, 2^L) / 2^L times the previous coarse increment of rho, theta_m, qv, and coarse-edge u, with no half-step lead. w stays on the snapshot. The coarse column is restored before its RK step. Levels k=1..6 of a level-0 interface edge integrate against that ramp and are kept; levels above stay on the snapshot flux. Off is the held snapshot."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_coarse_first" type="logical" default_value="false"
+                     units="-"
+                     description="Coarse-first hierarchical stepping. The coarser level advances first and saves both endpoints. Each finer level then takes its substeps with a specified zone of at least two coarser rings set by linear interpolation between those endpoints. The finer level owns interface edges and integrates the full u tendency. Mass, theta, and scalars are refluxed onto the coarse cell when the coarse interval closes. Off keeps the fine-first hold. Level smoothing and the two switches below apply only when this is true."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_buffer_rings" type="integer" default_value="2"
+                     units="-"
+                     description="When config_hts_coarse_first is true, promote a cell within this many rings of a finer neighbor down to that neighbor's level, then merge a level band thinner than about twice this width into the next finer level. Neighbors then differ by at most one level. The specified zone is max(2, this) rings of the remaining coarser cells. Ignored when coarse-first is false, so the existing binning is unchanged."
+                     possible_values="Integers from 0 through 8"/>
+
+                <nml_option name="config_hts_cf_match_acoustic" type="logical" default_value="false"
+                     units="-"
+                     description="When config_hts_coarse_first is true, multiply the acoustic substep count by 2^L, which is what the fine-first path always does. With the default integration order 2 that scales every RK stage, so the acoustic dt matches a fine step. Order 3 leaves stage 1 as one substep of dt/3. Off keeps config_number_of_sub_steps on every level. The fine-first path ignores this switch."
+                     possible_values="Logical values"/>
+
+                <nml_option name="config_hts_cf_use_moist_cap" type="logical" default_value="false"
+                     units="-"
+                     description="When config_hts_coarse_first is true, apply config_hts_moist_max_level. Off lets a moist run use config_hts_max_level. The fine-first path always applies the cap and ignores this switch. The 240 s cell-3177 failure predates the idle-column moisture fix and has not been retested with this mode."
+                     possible_values="Logical values"/>
 
                 <nml_option name="config_calendar_type" type="character" default_value="gregorian" in_defaults="false"
                      units="-"
